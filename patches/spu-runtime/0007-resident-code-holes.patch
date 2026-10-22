@@ -1,0 +1,189 @@
+SPU: a DMA into a resident code span takes over only the bytes it wrote, not the whole span.
+
+A GET from a source other than the span's own load dropped the span (spu_overlay_note_get), so every later dispatch in
+it went to the interpreter. Resistance 3's Insomniac job modules at LS 0x100 have their data, and the dispatcher's
+buffers for its smaller modules (0x6600, 0x6780, 0xDF00), inside their span: the first data DMA of a job dropped the
+module, and the rest of that job ran in the interpreter (a census of the interpreter's steps: nearly all at
+0x2D00..0x6C00 and 0x12B00 of modules whose span had been dropped). Now each span keeps the ranges other DMAs wrote
+since its load (up to SPU_RESIDENT_CODE_HOLES; more merge into the last one, which only ever covers more). Inside such
+a range the address resolves as if the span were not resident (a span loaded there, then task, overlay, image), as all
+of the span did before; elsewhere the span's lift runs, and its bytes there are still the load's. Verification of a
+verified region compares the bytes outside the ranges. A load of the span's own module clears them.
+
+Test: runtime/spu/tests/test_spu_lifted_start.c test_resident_code_holes, test_verified_with_holes and the adapted
+case in test_verified_resident_code_regions (6 checks fail without the change). Scripted run, together with 0006 and
+the buffer modules of scripts/extract_spu_raw.py: interpreter steps in gameplay about 23M/s -> 13M/s (what is left is
+mostly the position-independent modules); Home level, stick turning, two runs: 24.2 -> 26.6-26.9 fps.
+
+Upstream: not proposed yet (same problem as the code-only spans of PR #444, for spans whose code end is not known).
+
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 58930b1..33b308a 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1526,2 +1526,9 @@ int spu_have_function(uint32_t addr)
+ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
++/* Was `lsa` of this resident span overwritten by another DMA since the load? */
++static int spu_resident_hole(const spu_context* ctx, unsigned slot, uint32_t lsa)
++{
++    for (uint32_t h = 0; h < ctx->resident_code[slot].n_holes; ++h)
++        if (lsa >= ctx->resident_code[slot].holes[h][0] && lsa < ctx->resident_code[slot].holes[h][1]) return 1;
++    return 0;
++}
+ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+@@ -1529,2 +1536,6 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+     if (!ctx) return (spu_lifted_fn)spu_lookup(lsa, 0);
++    /* A span owns its LS addresses except where another DMA wrote since its
++     * load: there the bytes are not its, and the address resolves as if the
++     * span were not resident (a span loaded into it, then task, overlay and
++     * image), as all of it did when such a DMA dropped the whole span. */
+     for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+@@ -1533,2 +1544,3 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+             lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
++            if (spu_resident_hole(ctx, slot, lsa)) continue;
+             /* A region registered with its code bytes owns its span even when
+@@ -1716,4 +1728,14 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+         int match = 1;
++        /* Byte runs between the holes: what another DMA overwrote is not code
++         * of this load (spu_lifted_lookup_full does not dispatch there). */
+         for (unsigned i = 0; match && i < o->code_count; ++i)
+-            match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
++            for (uint32_t a = o->code[i].lsa, end = o->code[i].lsa + o->code[i].size; match && a < end;) {
++                uint32_t run = end;
++                for (uint32_t h = 0; h < ctx->resident_code[slot].n_holes; ++h) {
++                    const uint32_t lo = ctx->resident_code[slot].holes[h][0], hi = ctx->resident_code[slot].holes[h][1];
++                    if (a >= lo && a < hi) { run = a; a = hi; break; }
++                    if (lo > a && lo < run) run = lo;
++                }
++                if (run > a) { match = !memcmp(ctx->ls + a, o->code[i].bytes + (a - o->code[i].lsa), run - a); a = run; }
++            }
+         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+@@ -1880,3 +1902,14 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
+-                ctx->resident_code[slot].image_id = 0;
++                /* Only the bytes this DMA wrote stop being the load's. */
++                const uint32_t lo = lsa > base ? lsa : base, hi = lsa + size < end ? lsa + size : end;
++                uint32_t* n = &ctx->resident_code[slot].n_holes;
++                uint32_t (*holes)[2] = ctx->resident_code[slot].holes;
++                uint32_t h = 0;
++                while (h < *n && !(lo <= holes[h][1] && hi >= holes[h][0])) ++h;   /* touching or overlapping */
++                if (h == *n && *n == SPU_RESIDENT_CODE_HOLES) h = *n - 1;           /* full: widen the last */
++                if (h == *n) { holes[h][0] = lo; holes[h][1] = hi; ++*n; }
++                else {
++                    if (lo < holes[h][0]) holes[h][0] = lo;
++                    if (hi > holes[h][1]) holes[h][1] = hi;
++                }
+                 spu_dcache_residency_changed(ctx);
+@@ -1906,2 +1939,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                     ctx->resident_code[slot].source_index = i;
++                    ctx->resident_code[slot].n_holes = 0;
+                     spu_dcache_residency_changed(ctx);
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 8aeabfe..b024e5b 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -174,2 +174,4 @@ typedef struct spu_channel {
+ #define SPU_RESIDENT_CODE_SLOTS 16u
++/* Ranges of a resident span that another DMA overwrote since the load (spu_context.resident_code). */
++#define SPU_RESIDENT_CODE_HOLES 8u
+ 
+@@ -300,2 +302,6 @@ typedef struct spu_context {
+         int verify_state, source_index;
++        /* LS ranges [lo, hi) inside the span that a DMA from elsewhere wrote
++         * since the load (job data, another module): the lift is stale there
++         * only. More than SPU_RESIDENT_CODE_HOLES merge into the last one. */
++        uint32_t n_holes, holes[SPU_RESIDENT_CODE_HOLES][2];
+     } resident_code[SPU_RESIDENT_CODE_SLOTS];
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index 533c0f2..d2489fc 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -445,2 +445,72 @@ static void test_many_resident_code_regions(void)
+ 
++/* A DMA from elsewhere into a resident span (job data, a smaller module loaded
++ * into the bigger one's data area) takes over only the bytes it wrote: the rest
++ * of the span keeps dispatching its lift. Resistance 3's job modules at 0x100
++ * have their data and the dispatcher's module buffers inside their span; when
++ * any such DMA dropped the whole span, the module ran in the interpreter. */
++static void hole_big_a(spu_context* ctx) { ctx->gpr[3]._u32[0] = 101; }
++static void hole_big_b(spu_context* ctx) { ctx->gpr[3]._u32[0] = 102; }
++static void hole_small(spu_context* ctx) { ctx->gpr[3]._u32[0] = 103; }
++static void test_resident_code_holes(void)
++{
++    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
++    if (!ctx) { check(0, "allocate hole context"); return; }
++    spu_context_init(ctx, 0);
++    const uint32_t big = 0x30000, small = 0x34000;
++    spu_begin_image(101); spu_register_function(big + 0x100, hole_big_a); spu_register_function(big + 0x5000, hole_big_b);
++    spu_register_function(big + 0x300, hole_big_b);
++    spu_register_function(small, hole_big_a);
++    spu_begin_image(103); spu_register_function(small, hole_small);
++    spu_begin_image(0);
++    spu_overlay_register_region(0xB00000, 0x8000, 101);
++    uint8_t code[0x40];
++    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x90 + i);
++    const spu_overlay_code_segment seg = {small, sizeof code, code};
++    check(spu_overlay_register_verified_region(0xC00000, small, 0x400, 103, &seg, 1), "small module registers");
++    ctx->image_id = 100;
++    spu_overlay_note_get(ctx, 0xB00000, ctx->ls + big, 0x4000);
++    spu_overlay_note_get(ctx, 0xB04000, ctx->ls + big + 0x4000, 0x4000);
++    spu_overlay_note_get(ctx, 0x4AA00000, ctx->ls + big + 0x6000, 0x800);              /* job data */
++    check(spu_lifted_lookup(ctx, big + 0x100) == hole_big_a, "data DMA leaves the code below it resident");
++    check(spu_lifted_lookup(ctx, big + 0x5000) == hole_big_b, "and the code above it");
++    check(spu_lifted_lookup(ctx, big + 0x6100) == NULL, "the bytes it wrote are interpreted");
++    memcpy(ctx->ls + small, code, sizeof code);
++    spu_overlay_note_get(ctx, 0xC00000, ctx->ls + small, 0x400);                       /* a module in the data area */
++    check(spu_lifted_lookup(ctx, small) == hole_small, "a module loaded into the span dispatches its own lift");
++    check(spu_lifted_lookup(ctx, big + 0x100) == hole_big_a, "the big module stays resident around it");
++    for (int i = 0; i < 12; ++i)                                                       /* more holes than kept */
++        spu_overlay_note_get(ctx, 0x4AB00000u + 0x1000u * (uint32_t)i, ctx->ls + big + 0x200 + 0x100 * (uint32_t)i, 0x10);
++    check(spu_lifted_lookup(ctx, big + 0x100) == hole_big_a, "merged holes do not reach code before them");
++    check(spu_lifted_lookup(ctx, big + 0xD08) == NULL, "merged holes cover every write");
++    check(spu_lifted_lookup(ctx, big + 0x300) == NULL, "a hole hides the code it overwrote");
++    spu_overlay_note_get(ctx, 0xB00000, ctx->ls + big, 0x4000);                       /* reload */
++    check(spu_lifted_lookup(ctx, big + 0x300) == hole_big_b, "a reload of the module clears its holes");
++    g_spu_trampoline_fn = 0;
++    free(ctx);
++}
++
++/* A verified load whose data area another DMA wrote before the first dispatch
++ * still verifies: only the bytes outside the holes are compared. */
++static void test_verified_with_holes(void)
++{
++    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
++    if (!ctx) { check(0, "allocate verified hole context"); return; }
++    spu_context_init(ctx, 0);
++    const uint32_t base = 0x38000;
++    uint8_t code[0x100];
++    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x20 + i);
++    spu_begin_image(104); spu_register_function(base, hole_small);
++    spu_begin_image(0);
++    const spu_overlay_code_segment seg = {base, sizeof code, code};
++    check(spu_overlay_register_verified_region(0xD00000, base, sizeof code, 104, &seg, 1), "region registers");
++    ctx->image_id = 100;
++    memcpy(ctx->ls + base, code, sizeof code);
++    spu_overlay_note_get(ctx, 0xD00000, ctx->ls + base, sizeof code);
++    memset(ctx->ls + base + 0x80, 0xEE, 0x20);
++    spu_overlay_note_get(ctx, 0x4AC00000, ctx->ls + base + 0x80, 0x20);
++    check(spu_lifted_lookup(ctx, base) == hole_small, "bytes outside the hole verify");
++    g_spu_trampoline_fn = 0;
++    free(ctx);
++}
++
+ /* A streamed region registered with its code bytes dispatches by residency
+@@ -484,4 +554,6 @@ static void test_verified_resident_code_regions(void)
+ 
+-    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base + 0x80, 0x80);
+-    check(spu_lifted_lookup(ctx, base) != code_verified, "foreign DMA into the span clears residency");
++    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base + 0x20, 0x10);
++    check(spu_lifted_lookup(ctx, base) == code_verified, "foreign DMA beside the code leaves it resident");
++    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base, 0x10);
++    check(spu_lifted_lookup(ctx, base) != code_verified, "foreign DMA over the code drops it there");
+ 
+@@ -980,2 +1052,4 @@ int main(void)
+     test_many_resident_code_regions();
++    test_resident_code_holes();
++    test_verified_with_holes();
+     test_resident_interpreter_rejoin();

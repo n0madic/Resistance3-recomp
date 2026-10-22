@@ -13,47 +13,48 @@ test_shader_msl: a TEX on an unnormalised 3D unit gets the float3 scale and tran
 Scripted run (Home level, CHAPTER ONE view): mean brightness 7 -> 19, walls and floor lit as on the console.
 
 Upstream: PR #482.
+
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index a1a16e9..97ca2da 100644
+index 8642c40..f5db07d 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1403,3 +1403,3 @@ static u32 eng_vtex_mask(void)
+@@ -1462,3 +1462,3 @@ static u32 eng_vtex_mask(void)
   * pipeline identity (rsx_live_draw.c keys them the same way). */
 -static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
 +static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
  {
-@@ -1409,3 +1409,3 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
+@@ -1468,3 +1468,3 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
          rsx_dsp_get_texture(&g.rsx, u, &t);
 -        dim[u][0] = dim[u][1] = 0;
 +        dim[u][0] = dim[u][1] = dim[u][2] = 0;
          if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || !t.width || !t.height)
-@@ -1415,2 +1415,3 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
+@@ -1474,2 +1474,3 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
          dim[u][1] = t.height;
 +        dim[u][2] = t.depth;
      }
-@@ -1696,3 +1697,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1755,3 +1756,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
  
 -    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
 +    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
      /* Shadow helpers normalize against the bound resource themselves. Only
-@@ -1703,3 +1704,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1762,3 +1763,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          if (!(unnorm_mask & (1u << u)))
 -            unnorm_dim[u][0] = unnorm_dim[u][1] = 0;
 +            unnorm_dim[u][0] = unnorm_dim[u][1] = unnorm_dim[u][2] = 0;
  
-@@ -1780,3 +1781,4 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1842,3 +1843,4 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
 -                                                (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
 +                                                (const u32 (*)[3])unnorm_dim, cube_mask,
 +                                                vol_mask) < 0)
              fi = -1;
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
-index d3f09a5..84a343f 100644
+index 56a3748..9b9415b 100644
 --- a/libs/video/rsx_fp_decompiler.c
 +++ b/libs/video/rsx_fp_decompiler.c
-@@ -1657,6 +1657,8 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
+@@ -1659,6 +1659,8 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
   * Cube units are skipped: their coordinate is a float3 direction, and
 - * RSX_TEX_FMT_UNNORM has no meaning for one.
 + * RSX_TEX_FMT_UNNORM has no meaning for one. A volume unit (Texture3D) is
@@ -64,7 +65,7 @@ index d3f09a5..84a343f 100644
 -                              const u32 dim[][2], u32 cube_mask)
 +                              const u32 dim[][3], u32 cube_mask, u32 volume_mask)
  {
-@@ -1668,4 +1670,5 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+@@ -1670,4 +1672,5 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
          if ((cube_mask >> u) & 1u) continue;
 -        const u32 w = dim[u][0], h = dim[u][1];
 -        if (!w || !h) continue;
@@ -72,7 +73,7 @@ index d3f09a5..84a343f 100644
 +        const int volume = (volume_mask >> u) & 1u;
 +        if (!w || !h || (volume && !d)) continue;
  
-@@ -1695,4 +1698,8 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+@@ -1697,4 +1700,8 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                  char scale[80];
 -                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
 -                         1.0 / (double)w, 1.0 / (double)h);
@@ -84,7 +85,7 @@ index d3f09a5..84a343f 100644
 +                             1.0 / (double)w, 1.0 / (double)h);
                  const u32 slen = (u32)strlen(scale);
 diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
-index 3861242..4e7dd40 100644
+index b13559e..e55bcc1 100644
 --- a/libs/video/rsx_fp_decompiler.h
 +++ b/libs/video/rsx_fp_decompiler.h
 @@ -88,7 +88,8 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);

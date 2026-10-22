@@ -16,28 +16,28 @@ coordinates scaled, as the D3D12 backend's rsx_texscale does).
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 541057d..69df3be 100644
+index 402e7f0..4e81d91 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -576,2 +576,6 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
+@@ -616,2 +616,6 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  
 +/* PS3RECOMP_ENG_SURFACE_REUSE=0 (read at engine init): a clip smaller than the surface at its address recreates the
 + * surface, as before eng_surface_get reused it. Default on. */
 +static int s_surface_reuse = 1;
 +
  /* The colour target for this (location, offset), created or reallocated when
-@@ -598,3 +602,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -638,3 +642,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                  ((s->w == want_w && s->h == want_h) ||
 -                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
 +                 (s_surface_reuse && pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
                  return i;
-@@ -2947,2 +2951,4 @@ int rsx_draw_engine_init(u32 width, u32 height)
+@@ -3071,2 +3075,4 @@ int rsx_draw_engine_init(u32 width, u32 height)
        s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
 +    { const char* e = getenv("PS3RECOMP_ENG_SURFACE_REUSE");
 +      s_surface_reuse = !(e && *e == '0'); }
      g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index ce7c382..11aecbd 100644
+index 1a40f76..33ad22e 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
 @@ -505,2 +505,27 @@ static void test_surface_set(void)
@@ -68,7 +68,7 @@ index ce7c382..11aecbd 100644
 +}
 +
  /* ---- 2. surface aliasing on texture bind --------------------------------- */
-@@ -1627,2 +1652,3 @@ int main(void)
+@@ -1781,2 +1806,3 @@ int main(void)
      test_surface_set();
 +    test_surface_reuse();
      test_surface_aliasing();

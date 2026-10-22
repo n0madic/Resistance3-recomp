@@ -9,10 +9,10 @@ Upstream: not proposed.
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 9bba187..ae576bd 100644
+index 2f5fc75..402e7f0 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -2523,4 +2523,28 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+@@ -2660,4 +2660,28 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
   * the presented surface. */
 +/* RSX_ENGINE_SNAP_DIR=<dir>, RSX_ENGINE_SNAP_EVERY_S=<n>: write the presented surface to
 + * <dir>/snap_<seconds since the first present>.ppm every n seconds (default 5), for following a

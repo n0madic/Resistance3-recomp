@@ -19,38 +19,38 @@ The put word's store reaches cellGcm_on_put_store from vm_write32 (ppu_loader.cp
 The two loader fixtures that link ppu_loader.cpp (test_ppu_entry_arguments, test_loaded_image_memory) stub it, as they
 stub the other subsystems the loader reaches.
 
-Upstream: not proposed yet.
+Upstream: not proposed yet. Kept on top of upstream/pr437 (both add code above the walker).
 
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index bdd2f85..3315f3d 100644
+index afe37e3..7b2fe6f 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -401,2 +401,4 @@ if(PS3RECOMP_BUILD_TESTS)
+@@ -403,2 +403,4 @@ if(PS3RECOMP_BUILD_TESTS)
          add_subdirectory(tests/gcm_reports)
 +        # ...and the JUMP at an idle get, taken on the put store.
 +        add_subdirectory(tests/gcm_put_jump)
      endif()
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 2b47acd..c503c5c 100644
+index f06c888..5f9dd5c 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1765,2 +1765,6 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
+@@ -1776,2 +1776,6 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
  
 +/* Set on the thread running the walker: a put store it makes itself (the ring
 + * recycle) must not take the lock it already holds. */
 +static _Thread_local int t_in_fifo_walker;
 +
  void cellGcm_rsx_process_fifo(void)
-@@ -1769,3 +1773,5 @@ void cellGcm_rsx_process_fifo(void)
+@@ -1780,3 +1784,5 @@ void cellGcm_rsx_process_fifo(void)
      AcquireSRWLockExclusive(&s_gcm_fifo_lock);
 +    t_in_fifo_walker = 1;
      gcm_rsx_process_fifo_unlocked();
 +    t_in_fifo_walker = 0;
      ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
-@@ -1786,2 +1792,42 @@ static int gcm_get_eq_put(void)
- 
+@@ -1815,2 +1821,42 @@ static int gcm_get_eq_put(void)
+  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
 +/* JUMPs taken at once when put moves; a chain longer than this is left to the walker. */
 +#define GCM_PUT_STORE_JUMPS 8u
 +

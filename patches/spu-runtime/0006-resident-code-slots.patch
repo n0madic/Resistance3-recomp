@@ -1,0 +1,97 @@
+SPU: sixteen resident code spans per context instead of four (SPU_RESIDENT_CODE_SLOTS).
+
+spu_context.resident_code records which lifted image owns each streamed code span in local store. Resistance 3's job
+dispatcher keeps modules in up to nine LS buffers at once (0x100, 0x6600, 0xDF00, 0x20680, 0x21600, 0x21F00, 0x23B80,
+0x24D00 and its own code at 0x3F580; scripts/extract_spu_raw.py registers them). With four slots the fifth load found
+none free ("[spu-ovl] no free resident code span") and that module ran in the interpreter. The count is a named
+constant now; spu_context grows (the module must be rebuilt).
+
+Test: runtime/spu/tests/test_spu_lifted_start.c test_many_resident_code_regions (nine buffers resident together;
+fails with four slots).
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 363b5d2..58930b1 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1529,3 +1529,3 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+     if (!ctx) return (spu_lifted_fn)spu_lookup(lsa, 0);
+-    for (unsigned slot = 0; slot < 4; ++slot)
++    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+         if (ctx->resident_code[slot].image_id &&
+@@ -1874,3 +1874,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+     spu_ovl_dump(ctx, ea, lsa, ls, size);
+-    for (unsigned slot = 0; slot < 4; ++slot) {
++    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+         if (!ctx->resident_code[slot].image_id) continue;
+@@ -1897,3 +1897,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                 if (o->code && lsa != o->load_lsa) continue;
+-                for (unsigned slot = 0; slot < 4; ++slot) {
++                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 11abdec..8aeabfe 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -171,2 +171,6 @@ typedef struct spu_channel {
+  * -----------------------------------------------------------------------*/
++/* Code spans resident in one context at once (spu_context.resident_code). Resistance 3's job dispatcher keeps
++ * modules in up to nine LS buffers together; with four the rest fell back to the interpreter. */
++#define SPU_RESIDENT_CODE_SLOTS 16u
++
+ typedef struct spu_context {
+@@ -287,3 +291,5 @@ typedef struct spu_context {
+     /* Independently streamed code buffers can coexist with the policy overlay.
+-     * Each mapping records which translated image owns that local-store span. */
++     * Each mapping records which translated image owns that local-store span:
++     * up to SPU_RESIDENT_CODE_SLOTS of them at once (a job dispatcher may keep
++     * several modules in different LS buffers). */
+     struct {
+@@ -294,3 +300,3 @@ typedef struct spu_context {
+         int verify_state, source_index;
+-    } resident_code[4];
++    } resident_code[SPU_RESIDENT_CODE_SLOTS];
+ 
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index 1241aed..533c0f2 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -416,2 +416,31 @@ static void test_resident_code_regions(void)
+ 
++/* Nine code buffers resident together (Resistance 3's job dispatcher keeps
++ * modules in that many LS buffers): each dispatches its own lift. With four
++ * slots the fifth load found none free and its code was interpreted. */
++static void code_many(spu_context* ctx) { ctx->gpr[3]._u32[0] = 90 + (ctx->pc >> 12) % 16; }
++static void test_many_resident_code_regions(void)
++{
++    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
++    if (!ctx) { check(0, "allocate many-region context"); return; }
++    spu_context_init(ctx, 0);
++    enum { N = 9 };
++    for (int i = 0; i < N; ++i) {
++        spu_begin_image(90 + i); spu_register_function(0x20000u + 0x1000u * (uint32_t)i, code_many);
++        spu_overlay_register_region(0xA00000u + 0x10000u * (uint32_t)i, 0x400, 90 + i);
++    }
++    spu_begin_image(0);
++    ctx->image_id = 89;
++    for (int i = 0; i < N; ++i)
++        spu_overlay_note_get(ctx, 0xA00000u + 0x10000u * (uint32_t)i, ctx->ls + 0x20000u + 0x1000u * (uint32_t)i, 0x100);
++    int all = 1;
++    for (int i = 0; i < N; ++i) {
++        ctx->gpr[3]._u32[0] = 0;
++        ctx->pc = 0x20000u + 0x1000u * (uint32_t)i; spu_indirect_branch(ctx);
++        if (ctx->gpr[3]._u32[0] != 90u + (uint32_t)(0x20 + i) % 16u) all = 0;
++    }
++    check(all, "nine streamed code buffers stay resident together");
++    g_spu_trampoline_fn = 0;
++    free(ctx);
++}
++
+ /* A streamed region registered with its code bytes dispatches by residency
+@@ -950,2 +979,3 @@ int main(void)
+     test_verified_resident_code_regions();
++    test_many_resident_code_regions();
+     test_resident_interpreter_rejoin();

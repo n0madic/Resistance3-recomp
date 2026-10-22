@@ -8,24 +8,24 @@ still inside a command buffer the pass had called into, the snapshot never match
 test_gcm_get_on_release now also drives one of each NV4097 release through the walker, with and without
 GCM_GET_EQ_PUT (the stub method handler records `get` when it is handed the method).
 
-Upstream: not proposed yet (a candidate: #401 covers NV406E only).
+Upstream: not proposed yet (a candidate: #401 covers NV406E only). Kept on top of upstream/pr466 (its method filter).
 
 ---
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index efad9b9..3823d87 100644
+index f42486c..3d70d76 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -2289,2 +2289,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2323,2 +2323,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  } else if (subch == 0 || (subch == 1 && !s1_2d)) {
 +                    /* NV4097 back-end write / texture-read semaphore release: the label lands inside
 +                     * rsx_process_method, so publish `get` past the command first, as for NV406E
 +                     * RELEASE above. */
 +                    if (subch == 0 && (m == 0x1D70u || m == 0x1D74u) && !gcm_get_eq_put())
 +                        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
-                     rsx_process_method(&s_state, m, vm_read32(dea));
+                     if (legacy_state_live || gcm_legacy_method_has_effect(m))
 diff --git a/libs/video/tests/test_gcm_get_on_release.c b/libs/video/tests/test_gcm_get_on_release.c
-index 2f79ae7..5d712be 100644
+index 4503f69..7920eed 100644
 --- a/libs/video/tests/test_gcm_get_on_release.c
 +++ b/libs/video/tests/test_gcm_get_on_release.c
 @@ -45,3 +45,12 @@ void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why;
@@ -42,7 +42,7 @@ index 2f79ae7..5d712be 100644
 +    return 0;
 +}
  int  rsx_draw_engine_enabled(void) { return 0; }
-@@ -136,2 +145,8 @@ int main(int argc, char** argv)
+@@ -137,2 +146,8 @@ int main(int argc, char** argv)
      io = put_probe(io, 3);
 +    /* NV4097 back-end write release, then texture-read release. */
 +    const u32 be_val = 0x33u, tex_val = 0x44u;
@@ -51,7 +51,7 @@ index 2f79ae7..5d712be 100644
 +    io = put_cmd(io, 0, 0x1D74u, 1, &tex_val);
 +    const u32 end_tex = io;
      const u32 put = io;
-@@ -155,2 +170,9 @@ int main(int argc, char** argv)
+@@ -156,2 +171,9 @@ int main(int argc, char** argv)
      }
 +    check(sema4097_n == 2, "the NV4097 semaphore releases reached the method handler");
 +    if (!eq_put) {

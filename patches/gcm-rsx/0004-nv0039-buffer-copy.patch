@@ -32,7 +32,7 @@ index bdd2f85..afe37e3 100644
 +        add_subdirectory(tests/gcm_nv0039)
          add_subdirectory(tests/gcm_reports)
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 3823d87..b624805 100644
+index 3d70d76..f06c888 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -1249,2 +1249,57 @@ static void nv3089_blit(void)
@@ -110,7 +110,7 @@ index 3823d87..b624805 100644
 +        }
 +    }
      if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
-@@ -2259,5 +2328,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2293,5 +2362,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   * same reason the live engine does, and masks them itself. */
 +                /* Only what the 3D path takes, plus the driver methods: the engine
 +                 * strips the subchannel, so a 2D engine's state (NV0039's OFFSET_OUT

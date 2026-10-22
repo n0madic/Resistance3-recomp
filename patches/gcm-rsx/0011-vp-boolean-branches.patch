@@ -17,25 +17,26 @@ change); BRB !b3 and CLB b12 take or skip their targets for two sets of bits and
 Scripted run (Home level): no pipeline failures; the program's ~90 draws a frame in the effects pass are back (the
 glow and light shaft of Susan's lantern and the room lamps), no red polygons.
 
-Upstream: PR #485.
+Upstream: PR #485. Kept on top of upstream/pr459 (the hash line moved to eng_vp_hash).
+
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 97ca2da..cee46c4 100644
+index f5db07d..7934173 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1666,2 +1666,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1725,2 +1725,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      const u32 vtex_mask = eng_vtex_mask();
 +    /* BRB/CLB outcomes are baked into the program: the branch bits are
 +     * identity only for a program that tests them. */
 +    const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
 +    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
      rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
-@@ -1728,2 +1732,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
-         key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+@@ -1787,2 +1791,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
 +        if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
          key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-@@ -1770,2 +1775,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1832,2 +1837,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      } else {
 +        rsx_vp_set_branch_bits(vp_branch_bits);
          vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,

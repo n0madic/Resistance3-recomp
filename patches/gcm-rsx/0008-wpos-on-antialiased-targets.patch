@@ -21,10 +21,10 @@ helper).
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 69df3be..a1a16e9 100644
+index 4e81d91..8642c40 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1709,2 +1709,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1768,2 +1768,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
  
 +    /* An antialiased target is held at its sample grid; WPOS must still count
 +     * pixels (rsx_fp_apply_wpos_grid). */
@@ -34,21 +34,21 @@ index 69df3be..a1a16e9 100644
 +    const int wpos_scaled = !fixed && (wpos_grid[0] > 1u || wpos_grid[1] > 1u);
 +
      /* Identity: the vertex program's own bytes, the fragment program's
-@@ -1736,2 +1743,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1795,2 +1802,3 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
 +        if (wpos_scaled) key = eng_fnv1a(wpos_grid, sizeof wpos_grid, key);
      }
-@@ -1768,2 +1776,5 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1830,2 +1838,5 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
 +        if (fi > 0 && wpos_scaled &&
 +            rsx_fp_apply_wpos_grid(s_ps_hlsl, sizeof s_ps_hlsl, wpos_grid[0], wpos_grid[1]) < 0)
 +            fi = -1;
          if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
-index 5ce72ef..d3f09a5 100644
+index 459449a..56a3748 100644
 --- a/libs/video/rsx_fp_decompiler.c
 +++ b/libs/video/rsx_fp_decompiler.c
-@@ -1718,2 +1718,46 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+@@ -1720,2 +1720,46 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
  
 +/*
 + * WPOS on an antialiased surface (see the header).
@@ -96,7 +96,7 @@ index 5ce72ef..d3f09a5 100644
 +
  /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and
 diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
-index 670e886..3861242 100644
+index e61e770..b13559e 100644
 --- a/libs/video/rsx_fp_decompiler.h
 +++ b/libs/video/rsx_fp_decompiler.h
 @@ -94,2 +94,11 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
@@ -166,14 +166,14 @@ index 650c021..37ce797 100644
 +
      printf("\n===========================================\n");
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 11aecbd..690dd48 100644
+index 33ad22e..24d5d35 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
 @@ -16,2 +16,3 @@
  #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 +#include "rsx_test_programs.h"
  
-@@ -1431,2 +1432,69 @@ static void test_antialiased_surface(void)
+@@ -1539,2 +1540,69 @@ static void test_antialiased_surface(void)
  
 +/* A guest program pair whose fragment program reads WPOS (MOV r0, WPOS), on
 + * targets of each sample grid: WPOS must count pixels, not the samples the
@@ -243,7 +243,7 @@ index 11aecbd..690dd48 100644
 +}
 +
  /* ---- 10. a zeta or a target read in a texture format of its own --------- */
-@@ -1670,2 +1738,3 @@ int main(void)
+@@ -1826,2 +1894,3 @@ int main(void)
      test_antialiased_surface();
 +    test_antialiased_wpos();
      test_depth_read_as_color();

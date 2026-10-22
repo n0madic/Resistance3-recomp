@@ -1,0 +1,115 @@
+rsx_draw_engine: remember where each texture key was last found (open upstream PR, imported as is).
+
+Every texture bind scanned the 1024-entry texture cache linearly; sink_bind_textures is hot on Resistance 3's present thread.
+
+Measured in Resistance 3 as one batch (#437 #438 #440 #458 #459 #465 #466), Home level, stick turning, two runs each:
+22.7 -> 24.2 fps; present thread busy 640 -> 556 of 657 `sample` ticks. Frames of a scripted run unchanged.
+
+Upstream: PR #438 (drop this file when the pin contains it).
+
+---
+
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index f99986b3..dadac8ba 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1128,13 +1128,32 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                : eng_texture_span(fmt, w, h, levels, pitch, cube);
+     if (!span) return 0;
+ 
+-    for (u32 i = 0; i < g.n_textures; i++) {
+-        eng_texture* e = &g.textures[i];
+-        if (e->location != location || e->offset != offset ||
+-            e->format != fmt || e->width != w || e->height != h ||
+-            e->pitch != pitch || e->remap != remap ||
+-            e->cubemap != (u32)(cube != 0) || e->depth != depth)
+-            continue;
++    /* A scene binds the same few hundred textures every frame, and a linear
++     * scan of the whole cache per bind averaged several hundred entries.
++     * Remember where each key was last found; a remembered slot is used only
++     * if its entry still matches, otherwise the scan runs as before. Keys are
++     * unique in the cache, so the result is the same either way. */
++    static u16 s_slot_memo[4096];
++    const u32 memo = (offset >> 4 ^ offset >> 16 ^ fmt * 0x9E37u ^ w * 31u ^ h ^
++                      location << 11) & 4095u;
++#define ENG_TEXTURE_KEY_MATCHES(e) ((e)->location == location && (e)->offset == offset && \
++        (e)->format == fmt && (e)->width == w && (e)->height == h && \
++        (e)->pitch == pitch && (e)->remap == remap && \
++        (e)->cubemap == (u32)(cube != 0) && (e)->depth == depth)
++    eng_texture* hit = NULL;
++    if (s_slot_memo[memo] < g.n_textures && ENG_TEXTURE_KEY_MATCHES(&g.textures[s_slot_memo[memo]])) {
++        hit = &g.textures[s_slot_memo[memo]];
++    } else {
++        for (u32 i = 0; i < g.n_textures; i++)
++            if (ENG_TEXTURE_KEY_MATCHES(&g.textures[i])) {
++                hit = &g.textures[i];
++                s_slot_memo[memo] = (u16)i;
++                break;
++            }
++    }
++#undef ENG_TEXTURE_KEY_MATCHES
++    if (hit) {
++        eng_texture* e = hit;
+         if (e->handle && e->last_hash_frame != g.frames) {
+             /* Every cached texture used to be hashed in full every frame;
+              * in a big scene that is hundreds of MB a second for the few
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index aee6109f..5123fed1 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -667,6 +667,47 @@ static void test_texture_cache(void)
+     engine_down();
+ }
+ 
++/* The cache remembers where each key was last found. Two keys that share a
++ * remembered slot (these two offsets do, with every other field equal) must
++ * still each find their own entry, however their binds interleave. */
++#define TEX_OFFSET_SHARING_MEMO 0x00120100u
++static void test_texture_lookup_memo(void)
++{
++    printf("-- texture lookup memo\n");
++    engine_up();
++    memset(vm_base + TEX_OFFSET, 0x11, 4 * 4 * 4);
++    memset(vm_base + TEX_OFFSET_SHARING_MEMO, 0x33, 4 * 4 * 4);
++    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
++    draw_triangle();
++    const u32 a = stub.bound_tex[0];
++    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET_SHARING_MEMO);
++    draw_triangle();
++    const u32 b = stub.bound_tex[0];
++    CHECK(stub.n_texture_create == 2 && a && b && a != b,
++          "two keys sharing a memo slot are two entries (%d creates)",
++          stub.n_texture_create);
++
++    int wrong = 0;
++    for (int i = 0; i < 6; i++) {
++        if (i == 3) rsx_draw_engine_present();
++        bind_texture_unit(RSX_LOCATION_MAIN, (i & 1) ? TEX_OFFSET_SHARING_MEMO : TEX_OFFSET);
++        draw_triangle();
++        if (stub.bound_tex[0] != ((i & 1) ? b : a)) wrong++;
++    }
++    CHECK(stub.n_texture_create == 2 && wrong == 0,
++          "interleaved binds each find their own entry (%d creates, %d wrong)",
++          stub.n_texture_create, wrong);
++
++    /* A change to one is still seen through the memo. */
++    rsx_draw_engine_present();
++    memset(vm_base + TEX_OFFSET_SHARING_MEMO, 0x44, 4 * 4 * 4);
++    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET_SHARING_MEMO);
++    draw_triangle();
++    CHECK(stub.n_texture_create == 3 && stub.alive[b] == 0,
++          "changed bytes behind a memoized entry are re-decoded");
++    engine_down();
++}
++
+ /* A 128x128 A8R8G8B8 linear texture on unit 0: 64 KB, past the size that is
+  * hashed in full every frame. */
+ #define BIG_TEX_OFFSET 0x00100000u
+@@ -1609,6 +1650,7 @@ int main(void)
+     test_surface_aliasing();
+     test_mrt_set();
+     test_texture_cache();
++    test_texture_lookup_memo();
+     test_texture_sparse_rehash();
+     test_pipeline_key();
+     test_restart_expansion();

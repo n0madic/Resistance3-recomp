@@ -97,11 +97,15 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
 - **SPU**: three kinds of code, all inside the EBOOT (none in PSARC data):
   - SPU ELFs (`extract_spu_images.py`);
   - SPURS policy modules `pm_wws` / `pm_ig`, at LS 0xA00;
-  - WWS and Insomniac job modules (Insomniac ones are linked at LS 0x100).
+  - WWS and Insomniac job modules. Insomniac ones are linked at LS 0x100, except the buffer modules (a second header
+    layout) that the dispatcher loads into fixed LS buffers (0x6600, 0x20680, 0x24D00, ...) and the dispatcher itself
+    (0x3F580); their load addresses are a table in `extract_spu_raw.py` (`IG_BUFFER_MODULES`, from a census run).
 
   `scripts/extract_spu_raw.py` wraps the non-ELF code as ELFs for lifting. `build_module.py` generates
-  `spu/igjob_regions.c`, which registers each Insomniac module's span as resident code: they overwrite `pm_ig` in LS,
-  so the dispatch must follow `resident_code`. Code that is not lifted runs in the SPU interpreter.
+  `spu/igjob_regions.c`, which registers each Insomniac module's span as resident code (buffer modules as verified
+  regions with their bytes): they overwrite `pm_ig` in LS, so the dispatch must follow `resident_code`. A DMA from
+  elsewhere into a span only takes over the bytes it wrote (`spu-runtime/0007`). Code that is not lifted runs in the
+  SPU interpreter, among it three position-independent modules loaded at a new address each time.
 - **RSX/GCM**: the FIFO walker runs on the present thread. `cellGcm_on_put_store` takes JUMPs at an idle get
   immediately (the game injects command blocks at get and reuses their memory). The draw engine goes to Metal.
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,

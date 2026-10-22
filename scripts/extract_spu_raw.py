@@ -13,6 +13,10 @@ usage: extract_spu_raw.py <EBOOT.elf> --tools <sdk/tools> --images <dir> --jobmo
   size and entry, each in words). The engine's job dispatcher (igPm's code at 0xE28A00) DMAs the whole module, header
   included, to its load address and calls the entry. Each is wrapped as an SPU ELF at that address and listed in
   --ig-manifest (guest address, span) so the module build can register the span as resident code.
+* Insomniac buffer modules: the same signature with a second layout, which the dispatcher loads into fixed LS buffers
+  instead of 0x100, and the dispatcher's own code. Their load addresses are not in the header: IG_BUFFER_MODULES lists
+  them. Each is wrapped at its address and listed in the manifest with its bytes (a .bin beside the manifest), so the
+  build registers it as a verified region: it dispatches to its lift only when a load at that address matches.
 """
 from __future__ import annotations
 
@@ -37,9 +41,24 @@ PROGRAMS = (
 )
 SPU_LS_SIZE = 0x40000
 IG_SIG_WORDS = 4
-# Every module the dispatcher loads is linked for LS 0x100. Other headers with the same signature are a different
-# layout (small position-independent modules, or igPm's dispatcher itself, which igPm loads at a fixed address).
+# The job modules the dispatcher loads at LS 0x100. Other headers with the same signature are a different layout:
+# the buffer modules below, and small position-independent modules loaded at a different address each time.
 IG_MODULE_LSA = 0x100
+# (guest address, LS address) of the buffer modules, from a census of the module loads in a run of the first level
+# (Home): every DMA GET whose first 16 bytes are the signature, by source address and LS address. Only modules always
+# loaded at one address are listed: 0xDB0400, 0xDB2D80 and 0xE25B80 went to hundreds of addresses and stay interpreted,
+# 0xE45480 and 0xE47C80 to two (0x7180, 0x7200).
+# TODO: take a census on the later levels; a module missing here runs in the interpreter, as before.
+IG_BUFFER_MODULES = (
+    (0xDB7080, 0x0DF00), (0xE35F00, 0x06600), (0xE37700, 0x06780), (0xE42480, 0x06E80),
+    (0xE62280, 0x20680), (0xE62780, 0x20680), (0xE63480, 0x20680), (0xE64080, 0x20680), (0xE65280, 0x20680),
+    (0xE66080, 0x20680), (0xE69280, 0x21F00), (0xE6A980, 0x21F00), (0xE6C180, 0x21F00), (0xE74980, 0x21600),
+    (0xE75100, 0x21600), (0xE75780, 0x23B80), (0xE75E00, 0x23B80), (0xE78800, 0x23B80), (0xE7D400, 0x24D00),
+    (0xE7F100, 0x24D00), (0xE80D80, 0x24D00), (0xE82680, 0x24D00), (0xE83D80, 0x24D00), (0xE84100, 0x24D00),
+    (0xE86380, 0x24D00), (0xE89A00, 0x24D00), (0xE8A600, 0x24D00),
+)
+# igPm's dispatcher (0xE28A00): igPm loads it to the top of LS. Its layout words give no size; this is the load's.
+IG_DISPATCHER = (0xE28A00, 0x3F580, 0x510)
 
 
 def is_ila_r2(word: int) -> bool:
@@ -59,6 +78,37 @@ def find_ig_modules(elf: bytes) -> list[tuple[int, int, int, int]]:
                     and p + size <= offset + filesz:
                 found.append((p, lsa, size, entry))
     return found
+
+
+def ig_buffer_module_size(words: tuple[int, ...]) -> int:
+    """Bytes a buffer module's load copies, from its layout words (checked against the loads of a run): a small module
+    (entry word 8) is the halfword of word 7, a larger one the low halfword of word 4, in words."""
+    if words[6] & 0xFFFF == 8:
+        return ((words[7] >> 16) * 4 + 15) & ~15
+    return (words[4] & 0xFFFF) * 4
+
+
+def ig_buffer_modules(elf: bytes) -> list[tuple[int, int, int, int, bytes]]:
+    """(guest address, load address, size, entry, bytes) of the buffer modules and the dispatcher."""
+    found = []
+    for ea, lsa in IG_BUFFER_MODULES:
+        words = struct.unpack_from(">8I", elf, guest_to_file(elf, ea))
+        if not all(is_ila_r2(w) for w in words[:IG_SIG_WORDS]):
+            raise ValueError(f"no Insomniac module signature at {ea:#x}")
+        size = ig_buffer_module_size(words)
+        found.append((ea, lsa, size, lsa + (words[6] & 0xFFFF) * 4))
+    ea, lsa, size = IG_DISPATCHER
+    words = struct.unpack_from(">8I", elf, guest_to_file(elf, ea))
+    if not all(is_ila_r2(w) for w in words[:IG_SIG_WORDS]):
+        raise ValueError(f"no Insomniac module signature at {ea:#x}")
+    found.append((ea, lsa, size, lsa + (words[6] & 0xFFFF) * 4))
+    out = []
+    for ea, lsa, size, entry in found:
+        if not 0 < size <= SPU_LS_SIZE - lsa or not lsa <= entry < lsa + size:
+            raise ValueError(f"module at {ea:#x}: size {size:#x} or entry {entry:#x} does not fit LS {lsa:#x}")
+        off = guest_to_file(elf, ea)
+        out.append((ea, lsa, size, entry, elf[off:off + size]))
+    return out
 
 
 def load_segments(elf: bytes) -> list[tuple[int, int, int]]:
@@ -122,6 +172,12 @@ def main() -> int:
     if not manifest:
         LOG.error("no Insomniac job modules found")
         return 1
+    for ea, lsa, size, entry, code in ig_buffer_modules(elf):
+        name = f"igbuf_{ea:08X}"
+        (args.images / f"{name}.elf").write_bytes(wrap(code, base=lsa, entry=entry))
+        (args.ig_manifest.parent / f"{name}.bin").write_bytes(code)
+        manifest.append({"name": name, "ea": ea, "span": size, "load_lsa": lsa, "bytes": f"{name}.bin"})
+        LOG.info("ig buffer module %s: LS %#x, %d bytes, entry %#x", name, lsa, size, entry)
     args.ig_manifest.write_text(json.dumps(manifest, indent=1) + "\n")
 
     pos = n = 0
