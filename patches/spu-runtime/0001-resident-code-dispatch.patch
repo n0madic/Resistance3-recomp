@@ -1,0 +1,73 @@
+SPU: every dispatch path honours the resident code spans (resident_code), not only spu_indirect_branch.
+
+A registered code region that a DMA GET loaded owns its local-store span: inside it only that image's lift may run, and a
+miss there is interpreted. The interpreter's rejoin probe (spu_lifted_lookup) and the drain resume looked up the
+context's own image instead, so they ran that image's stale lift over the new bytes. Resistance 3's job dispatcher loads
+each job module at LS 0x100, over the policy module (igPm, 0xA00) that started it; the job's first call into 0xA00 ran
+igPm again, which went back to waiting for a signal and the job never completed.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index dbea35b..af7688b 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1489,2 +1489,4 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+ {
++    int owner = ctx ? spu_resident_code_owner(ctx, lsa) : 0;
++    if (owner) return (spu_lifted_fn)spu_lookup(lsa, owner);
+     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+@@ -1492,2 +1494,14 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+ 
++/* The image whose streamed code currently occupies `lsa`, or 0. Its lift is the only truth inside that span: the bytes
++ * of the context's own image there were overwritten (a job loaded over the policy module that dispatched it), so a
++ * miss in the owner means "interpret", never "fall back to the image underneath". Every dispatch path asks this. */
++int spu_resident_code_owner(const spu_context* ctx, uint32_t lsa)
++{
++    for (unsigned slot = 0; slot < 4; ++slot)
++        if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
++            lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
++            return ctx->resident_code[slot].image_id;
++    return 0;
++}
++
+ /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
+@@ -2252,11 +2266,4 @@ void spu_indirect_branch(spu_context* ctx)
+     spu_fn fn = NULL;
+-    int code_owner = 0;
+-    for (unsigned slot = 0; slot < 4; ++slot) {
+-        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
+-            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+-            code_owner = ctx->resident_code[slot].image_id;
+-            fn = spu_lookup(ctx->pc, code_owner);
+-            break;
+-        }
+-    }
++    int code_owner = spu_resident_code_owner(ctx, ctx->pc);
++    if (code_owner) fn = spu_lookup(ctx->pc, code_owner);
+     if (!code_owner && ctx->resident_task)
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index fa88c3f..19dd1d1 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -395,2 +395,5 @@ typedef struct spu_context {
+ 
++/* The image whose streamed code occupies `lsa` in this context (resident_code), or 0 (see spu_channels.c). */
++int spu_resident_code_owner(const spu_context* ctx, uint32_t lsa);
++
+ /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 931d3b3..1a8e5e4 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -451,4 +451,6 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             uint32_t pc = ctx->pc & SPU_LS_MASK;
+-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
++            int owner = spu_resident_code_owner(ctx, pc);
++            spu_drain_fn fn = owner ? spu_lookup(pc, owner)
++                            : ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
++            if (!fn && !owner) fn = spu_lookup(pc, ctx->image_id);
+             if (fn) {

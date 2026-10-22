@@ -1,0 +1,158 @@
+cellPad: keyboard right stick, L3/R3 and arrows-as-stick mode; PAD_FILE can hold the sticks.
+
+A first-person game cannot be played from the keyboard without a camera: the keyboard fallback left the right stick
+centred and had no L3/R3. I/J/K/L now drive the right stick and C/V press L3/R3. The arrows still press the d-pad and
+push the left stick; PAD_ARROWS_STICK_ONLY=1 makes them the left stick alone and moves the d-pad to T/F/G/H, for
+titles where the d-pad has its own actions (Resistance 3 switches weapons and gadgets on it).
+
+PAD_FILE accepts four optional stick values after the poll count ("mask polls lx ly rx ry", 0-255, 128 centred), held
+for those polls, so scripted runs can walk and turn.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 10634e8..6037b99 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -148,4 +148,7 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
+  * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
+- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
+- * so a title that reads the stick instead is playable too. */
++ * 1/2 = L2/R2, C/V = L3/R3, Enter = START, Tab = SELECT, I/J/K/L = right
++ * stick. The left stick mirrors the d-pad so a title that reads the stick
++ * instead is playable too. PAD_ARROWS_STICK_ONLY=1 makes the arrows the left
++ * stick alone and moves the d-pad to T/F/G/H: a shooter moves on the stick
++ * and gives the d-pad its own actions, which walking must not trigger. */
+ #ifdef _WIN32
+@@ -174,2 +177,12 @@ static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0;
+ #define PADKEY_TAB VK_TAB
++#define PADKEY_I 'I'
++#define PADKEY_J 'J'
++#define PADKEY_K 'K'
++#define PADKEY_L 'L'
++#define PADKEY_C 'C'
++#define PADKEY_V 'V'
++#define PADKEY_T 'T'
++#define PADKEY_F 'F'
++#define PADKEY_G 'G'
++#define PADKEY_H 'H'
+ #elif defined(__APPLE__)
+@@ -210,2 +223,12 @@ static int pad_key_down(int key)
+ #define PADKEY_TAB 48
++#define PADKEY_I 34
++#define PADKEY_J 38
++#define PADKEY_K 40
++#define PADKEY_L 37
++#define PADKEY_C 8
++#define PADKEY_V 9
++#define PADKEY_T 17
++#define PADKEY_F 3
++#define PADKEY_G 5
++#define PADKEY_H 4
+ #elif PAD_BACKEND_SDL2
+@@ -236,2 +259,12 @@ static int pad_key_down(int key)
+ #define PADKEY_TAB SDL_SCANCODE_TAB
++#define PADKEY_I SDL_SCANCODE_I
++#define PADKEY_J SDL_SCANCODE_J
++#define PADKEY_K SDL_SCANCODE_K
++#define PADKEY_L SDL_SCANCODE_L
++#define PADKEY_C SDL_SCANCODE_C
++#define PADKEY_V SDL_SCANCODE_V
++#define PADKEY_T SDL_SCANCODE_T
++#define PADKEY_F SDL_SCANCODE_F
++#define PADKEY_G SDL_SCANCODE_G
++#define PADKEY_H SDL_SCANCODE_H
+ #endif
+@@ -265,3 +298,8 @@ static void pad_poll_keyboard(void)
+         { PADKEY_RETURN, CELL_PAD_CTRL_START },   { PADKEY_TAB,   CELL_PAD_CTRL_SELECT },
++        { PADKEY_C,      CELL_PAD_CTRL_L3 },      { PADKEY_V,     CELL_PAD_CTRL_R3 },
+     };
++    static const int dpad_keys[4] = { PADKEY_T, PADKEY_G, PADKEY_F, PADKEY_H };   /* up, down, left, right */
++    static const u16 dpad_bits = CELL_PAD_CTRL_UP | CELL_PAD_CTRL_DOWN | CELL_PAD_CTRL_LEFT | CELL_PAD_CTRL_RIGHT;
++    static int arrows_stick_only = -1;
++    if (arrows_stick_only < 0) arrows_stick_only = getenv("PAD_ARROWS_STICK_ONLY") ? 1 : 0;
+ 
+@@ -270,2 +308,10 @@ static void pad_poll_keyboard(void)
+         if (pad_key_down(map[i].vk)) btns |= map[i].btn;
++    u16 arrows = btns & dpad_bits;
++    if (arrows_stick_only) {
++        btns &= (u16)~dpad_bits;
++        if (pad_key_down(dpad_keys[0])) btns |= CELL_PAD_CTRL_UP;
++        if (pad_key_down(dpad_keys[1])) btns |= CELL_PAD_CTRL_DOWN;
++        if (pad_key_down(dpad_keys[2])) btns |= CELL_PAD_CTRL_LEFT;
++        if (pad_key_down(dpad_keys[3])) btns |= CELL_PAD_CTRL_RIGHT;
++    }
+ 
+@@ -273,7 +319,8 @@ static void pad_poll_keyboard(void)
+     hs->connected = 1;
+-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+-    hs->analog_rx = hs->analog_ry = 128;
++    hs->analog_lx = (u8)((arrows & CELL_PAD_CTRL_LEFT) ? 0 :
++                         (arrows & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
++    hs->analog_ly = (u8)((arrows & CELL_PAD_CTRL_UP) ? 0 :
++                         (arrows & CELL_PAD_CTRL_DOWN) ? 255 : 128);
++    hs->analog_rx = (u8)(pad_key_down(PADKEY_J) ? 0 : pad_key_down(PADKEY_L) ? 255 : 128);
++    hs->analog_ry = (u8)(pad_key_down(PADKEY_I) ? 0 : pad_key_down(PADKEY_K) ? 255 : 128);
+     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+@@ -648,2 +695,7 @@ void cellPad_poll(void)
+ 
++/* PAD_FILE's current press (see cellPadGetData): polls left, and the sticks it holds. */
++static int s_pf_held_n;
++static int pf_stick_on;
++static u8  pf_stick[4];
++
+ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
+@@ -816,5 +868,10 @@ skip_inject: ;
+      *                            # long hold; the default is 40)
++     *   echo 0 60 128 0 128 128 > pad.txt   # left stick forward for 60 polls
++     *
++     * Four optional numbers after the poll count hold the sticks (lx ly rx ry,
++     * 0-255, 128 centred) for the same polls; the mask may then be 0. A first
++     * person game is not driven by buttons alone.
+      */
+     { static int s_pf = -1; static char pf_path[512];
+-      static unsigned held_mask = 0; static int held_n = 0;
++      static unsigned held_mask = 0;
+       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
+@@ -823,3 +880,3 @@ skip_inject: ;
+       if (s_pf && port_no == 0) {
+-          if (held_n <= 0) {
++          if (s_pf_held_n <= 0) {
+               FILE* f = fopen(pf_path, "rb");
+@@ -828,13 +885,17 @@ skip_inject: ;
+                   if (fgets(buf, sizeof buf, f)) {
+-                      char* rest;
+-                      unsigned m = (unsigned)strtoul(buf, &rest, 0);
+-                      int n = (int)strtol(rest, 0, 0);
+-                      if (m) { held_mask = m; held_n = n > 0 ? n : 40;
+-                               printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
++                      unsigned m = 0; int n = 0, st[4];
++                      const int got = sscanf(buf, "%i %i %i %i %i %i", (int*)&m, &n,
++                                             &st[0], &st[1], &st[2], &st[3]);
++                      pf_stick_on = got == 6;
++                      for (int k = 0; k < 4 && pf_stick_on; k++)
++                          pf_stick[k] = (u8)(st[k] < 0 ? 0 : st[k] > 255 ? 255 : st[k]);
++                      if (m || pf_stick_on) { held_mask = m; s_pf_held_n = n > 0 ? n : 40;
++                               printf("[cellPad] PAD_FILE press 0x%04X%s\n", m,
++                                      pf_stick_on ? " + sticks" : ""); fflush(stdout); }
+                   }
+                   fclose(f);
+-                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
++                  if (s_pf_held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+               }
+           }
+-          if (held_n > 0) { held_n--;
++          if (s_pf_held_n > 0) { s_pf_held_n--;
+               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
+@@ -891,2 +952,6 @@ skip_inject: ;
+         } } }
++    if (port_no == 0 && s_pf_held_n > 0 && pf_stick_on) {   /* PAD_FILE sticks, for the press's polls */
++        hs->analog_lx = pf_stick[0]; hs->analog_ly = pf_stick[1];
++        hs->analog_rx = pf_stick[2]; hs->analog_ry = pf_stick[3];
++    }
+     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;

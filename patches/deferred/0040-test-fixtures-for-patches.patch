@@ -1,0 +1,119 @@
+tests: make the fixtures work with patches 0001, 0005, 0012 and 0037.
+
+Four suites that pass on the pinned revision stopped building or passing once those patches were on:
+- 0012 made the blocking syscalls call ppu_thread_note_block (sys_ppu_thread.c). tests/sync_stress does not link that
+  file ("Undefined symbols: _ppu_thread_note_block"); the shim does nothing, the suite starts no runtime PPU threads.
+- 0001 resolves /dev_flash through ps3_dev_flash_path (sys_fs.c) from ppu_fs.cpp. test_fs_aio, test_fs_imports and
+  test_fs_large_file include ppu_fs.cpp without sys_fs.c; none of them opens /dev_flash.
+- 0037 reaches the peer SPU's local store through spu_thread_ls_peer (spurs_policy.c), which test_mfc_resume_elements
+  does not link; it has no SPURS instance, so the stub finds no peer.
+- 0005 reads a surface back once, whole, and serves the pieces of one picture from that copy. The draw-engine test's
+  readback stub ramped the alpha from the first row it was asked for, so a rectangle starting on row 8 came out as
+  0x88.. instead of 0x80..; the stub now ramps by surface position (g_stub_ramp_row0 marks the rectangle's row).
+
+---
+
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index ce7c382..ff586ec 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -275,24 +275,26 @@ static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
+  * as a host GPU hands them back. */
+ static const u8 g_stub_pixel16[8] = { 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 };
+ 
+-/* With g_stub_ramp set, pixel (c, r) reads back as R,G,B,A = 4c+1, 4c+2,
+- * 4c+3, 0x80+r instead, so every byte of a row is distinct. */
++/* With g_stub_ramp set, the surface pixel (X, Y) reads back as R,G,B,A = 4X+1, 4X+2, 4X+3,
++ * 0x80 + Y - g_stub_ramp_row0 instead, so every byte of a row is distinct. It is a function of the surface position
++ * whatever rectangle the engine asks for: it reads a whole surface once and serves the pieces from that copy. */
+ static int g_stub_ramp;
++static u32 g_stub_ramp_row0;
+ 
+ /* The engine asks for rows packed at the surface's own pixel size, so the
+  * pitch tells the two formats apart. */
+ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
+                           void* out, u32 pitch)
+ {
+-    (void)u; (void)s; (void)x; (void)y;
++    (void)u; (void)s;
+     const u32 bpp = pitch >= w * 8u ? 8u : 4u;
+     for (u32 r = 0; r < h; r++)
+         for (u32 c = 0; c < w; c++) {
+             u8* p = (u8*)out + (size_t)r * pitch + c * bpp;
+             if (bpp == 8u) { memcpy(p, g_stub_pixel16, 8); continue; }
+             if (!g_stub_ramp) { memcpy(p, g_stub_pixel, 4); continue; }
+-            p[0] = (u8)(4u * c + 1u); p[1] = (u8)(4u * c + 2u); p[2] = (u8)(4u * c + 3u);
+-            p[3] = (u8)(0x80u + r);
++            p[0] = (u8)(4u * (x + c) + 1u); p[1] = (u8)(4u * (x + c) + 2u); p[2] = (u8)(4u * (x + c) + 3u);
++            p[3] = (u8)(0x80u + (y + r) - g_stub_ramp_row0);
+         }
+ }
+ 
+@@ -1204,6 +1206,7 @@ static void test_transfer_rows(void)
+     u8* rd = vm_base + GUEST_LOCAL_EA + 0x40000u + 8u * 1024u;
+     for (u32 r = 0; r < 4; r++) memset(rd + r * 1024u, 0xEE, 14 * 4);
+     g_stub_ramp = 1;
++    g_stub_ramp_row0 = 8u;                   /* the rectangle starts on the surface's row 8 */
+     rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, 0x40000u + 8u * 1024u, 1024u, 13u, 3u);
+     g_stub_ramp = 0;
+     ok = 1;
+diff --git a/runtime/ppu/tests/test_fs_aio.cpp b/runtime/ppu/tests/test_fs_aio.cpp
+index 037db68..9897b44 100644
+--- a/runtime/ppu/tests/test_fs_aio.cpp
++++ b/runtime/ppu/tests/test_fs_aio.cpp
+@@ -23,6 +23,7 @@ void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); me
+ void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
+ void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
+ void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
++void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel) { (void)roots; (void)rel; if (cap) out[0] = 0; }
+ void ydkj_host_bt(const char* tag) { (void)tag; }
+ void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
+ }
+diff --git a/runtime/ppu/tests/test_fs_imports.cpp b/runtime/ppu/tests/test_fs_imports.cpp
+index 02a13b2..206aed3 100644
+--- a/runtime/ppu/tests/test_fs_imports.cpp
++++ b/runtime/ppu/tests/test_fs_imports.cpp
+@@ -24,6 +24,7 @@ void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); me
+ void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
+ void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
+ void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
++void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel) { (void)roots; (void)rel; if (cap) out[0] = 0; }
+ void ydkj_host_bt(const char* tag) { (void)tag; }
+ }
+ ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
+diff --git a/runtime/ppu/tests/test_fs_large_file.cpp b/runtime/ppu/tests/test_fs_large_file.cpp
+index 2fe7a46..b5996a1 100644
+--- a/runtime/ppu/tests/test_fs_large_file.cpp
++++ b/runtime/ppu/tests/test_fs_large_file.cpp
+@@ -26,6 +26,7 @@ void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); me
+ void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
+ void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
+ void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
++void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel) { (void)roots; (void)rel; if (cap) out[0] = 0; }
+ void ydkj_host_bt(const char* tag) { (void)tag; }
+ void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
+ }
+diff --git a/runtime/spu/tests/test_mfc_resume_elements.c b/runtime/spu/tests/test_mfc_resume_elements.c
+index 2a930b5..616db87 100644
+--- a/runtime/spu/tests/test_mfc_resume_elements.c
++++ b/runtime/spu/tests/test_mfc_resume_elements.c
+@@ -28,6 +28,7 @@ int spu_coh_is_reserved(uint32_t ea) { (void)ea;return 0; }
+ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
+ void spu_coh_notify_write_except(uint32_t ea,const void* c) { (void)ea;(void)c; }
+ void spu_lockline_lock(void) {}
++spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t n) { (void)self; (void)n; return NULL; }
+ void spu_lockline_unlock(void) {}
+ void spu_lockguard_check(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n,const char* what)
+ { (void)c;(void)ea;(void)p;(void)n;(void)what; }
+diff --git a/tests/sync_stress/test_shims.c b/tests/sync_stress/test_shims.c
+index 0638d9b..e75b009 100644
+--- a/tests/sync_stress/test_shims.c
++++ b/tests/sync_stress/test_shims.c
+@@ -55,3 +55,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
+  * never read back. */
+ uint32_t g_spu_pending_evt[3];
+ int      g_spu_pending_evt_valid;
++
++/* Called by the blocking syscalls to mark a thread as blocked (sys_ppu_thread.c, which this suite does not link).
++ * The suite starts no PPU threads through the runtime, so there is nothing to mark. */
++void ppu_thread_note_block(uint64_t tid) { (void)tid; }

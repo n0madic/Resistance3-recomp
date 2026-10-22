@@ -1,0 +1,44 @@
+cellSaveData: implement cellSaveDataUserListAutoLoad (NID 0x248BD1D8).
+
+It is cellSaveDataListAutoLoad with userId inserted after version: ten arguments, container and userdata in the
+ninth and tenth slots of the caller's parameter save area. Resistance 3 loads its profile through it from its
+"Check Thread" at boot; unresolved, the title stayed on a black screen after the Insomniac logo.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index 286bf47..2705091 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -1566,2 +1566,24 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
+ 
++/* UserListAutoLoad is ListAutoLoad with userId inserted after version, which
++ * makes it the one ten-argument entry: errDialog is in r5, setList..funcFile in
++ * r6..r10, container and userdata in the ninth and tenth slots of the caller's
++ * parameter save area. Resistance 3 loads its profile through it at boot (from
++ * its "Check Thread") and waits for the result before leaving the logo. */
++#define SAVEDATA_ARG10_SP_OFF (SAVEDATA_ARG9_SP_OFF + 8u)
++
++static void hle_cellSaveDataUserListAutoLoad(ppu_context* ctx)
++{
++    uint32_t sp = (uint32_t)ctx->gpr[1];
++    printf("[cellSaveData] UserListAutoLoad(user=%u)\n", (u32)ctx->gpr[4]);
++    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoLoad(
++        (u32)ctx->gpr[3], (u32)ctx->gpr[5],
++        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[6],
++        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[7],
++        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[8],
++        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[9],
++        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[10],
++        (u32)vm_read64(sp + SAVEDATA_ARG9_SP_OFF),
++        (void*)(uintptr_t)(u32)vm_read64(sp + SAVEDATA_ARG10_SP_OFF));
++}
++
+ void cellSaveData_register_ctx_handlers(void)
+@@ -1570,2 +1592,4 @@ void cellSaveData_register_ctx_handlers(void)
+      * before the generic table. */
++    ps3_hle_register_ctx(0x248BD1D8u, "cellSaveDataUserListAutoLoad",
++                         hle_cellSaveDataUserListAutoLoad);
+     ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",

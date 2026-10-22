@@ -1,0 +1,33 @@
+cellGem: cellGemGetState answers CELL_GEM_NOT_CONNECTED (1), not an error, for a missing controller.
+
+The SDK returns tracking results as positive values, and titles keep them as the controller status. Resistance 3
+compares the result with CELL_GEM_NOT_CONNECTED; the error code made it think a Move was connected but not
+calibrated, so it opened a "PlayStation Eye is not correctly connected" dialog that nothing closes.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/hardware/cellGem.c b/libs/hardware/cellGem.c
+index 001fd5a..1f5265a 100644
+--- a/libs/hardware/cellGem.c
++++ b/libs/hardware/cellGem.c
+@@ -57,3 +57,6 @@ s32 cellGemGetState(u32 gemNum, u32 flag, u64 timestamp, CellGemState* state)
+     if (!state) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
+-    return (s32)CELL_GEM_ERROR_NOT_CONNECTED;
++    /* Not an error code: a title keeps the result as the controller's status.
++     * Resistance 3 reads anything but CELL_GEM_NOT_CONNECTED as "a Move needs
++     * calibrating" and opens its PlayStation Eye dialog, which nothing closes. */
++    return CELL_GEM_NOT_CONNECTED;
+ }
+diff --git a/libs/hardware/cellGem.h b/libs/hardware/cellGem.h
+index 76c5505..4b048e9 100644
+--- a/libs/hardware/cellGem.h
++++ b/libs/hardware/cellGem.h
+@@ -33,2 +33,6 @@ extern "C" {
+ 
++/* Tracking results: cellGemGetState and friends return these as positive
++ * values, not as errors. */
++#define CELL_GEM_NOT_CONNECTED         1
++
+ /* Types. Layouts verified against the DWARF in the Gears of War 3 / og-LBP debug

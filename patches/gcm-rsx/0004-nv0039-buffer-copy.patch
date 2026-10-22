@@ -1,0 +1,94 @@
+cellGcmSys: run NV0039 buffer copies; keep 2D-engine state out of the draw engine's NV4097 registers.
+
+NV0039 (libgcm's memory-to-memory copy, cellGcmSetTransferData) was not implemented: on subchannel 1 it was taken for
+NV4097 state, and with GCM_SUBCH1_2D=1 it reached the 2D path, which only logged it. Resistance 3 streams its level
+textures with it, from IO-mapped main memory into local memory, so every texture lost the part the copy carried (its
+mip tail) and rendered as noise. BUFFER_NOTIFY now copies LINE_COUNT lines of LINE_LENGTH bytes between the DMA
+contexts (local frame buffer or IO-mapped host memory), as RPCS3's nv0039::buffer_notify.
+
+The register-file draw engine strips the subchannel, so it also took every 2D-engine method as NV4097 state (NV0039's
+OFFSET_OUT is BLEND_ENABLE's number). It now gets only what the 3D path takes, plus the driver methods.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 0d6dc20..155bf78 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1219,2 +1219,46 @@ static void nv3089_blit(void)
+ 
++/* NV0039 (memory-to-memory buffer copy), libgcm's subchannel 1: cellGcmSetTransferData
++ * and friends. BUFFER_NOTIFY runs the copy, LINE_COUNT lines of LINE_LENGTH bytes, each
++ * line PITCH_IN/PITCH_OUT apart (0 = packed), as RPCS3's nv0039::buffer_notify. Resistance
++ * 3 streams its textures that way, from IO-mapped main memory into local memory. */
++static struct {
++    u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, line_length, line_count, format;
++} s_nv0039;
++
++static u8* gcm_dma_ptr(u32 dma, u32 offset, u32 bytes)
++{
++    u32 ea;
++    if (dma == 0xFEED0000u) {                     /* CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER */
++        if ((u64)offset + bytes > s_config.localSize) return NULL;
++        ea = s_config.localAddress + offset;
++    } else {                                     /* host (IO-mapped main) memory */
++        ea = gcm_io2ea(offset);
++        if (!ea || gcm_io2ea(offset + (bytes ? bytes - 1 : 0)) != ea + (bytes ? bytes - 1 : 0))
++            return NULL;                         /* unmapped, or not contiguous in EA */
++    }
++    return vm_base + ea;
++}
++
++static void nv0039_buffer_notify(void)
++{
++    const u32 len = s_nv0039.line_length, lines = s_nv0039.line_count;
++    if (!len || !lines) return;
++    const u32 pin  = s_nv0039.pitch_in  ? s_nv0039.pitch_in  : len;
++    const u32 pout = s_nv0039.pitch_out ? s_nv0039.pitch_out : len;
++    const u32 span_in  = pin  * (lines - 1) + len;
++    const u32 span_out = pout * (lines - 1) + len;
++    const u8* src = gcm_dma_ptr(s_nv0039.dma_in,  s_nv0039.off_in,  span_in);
++    u8*       dst = gcm_dma_ptr(s_nv0039.dma_out, s_nv0039.off_out, span_out);
++    if (!src || !dst) {
++        static int n = 0;
++        if (n++ < 8)
++            printf("[nv0039] copy dropped: in 0x%08X:0x%08X out 0x%08X:0x%08X %ux%u%c",
++                   s_nv0039.dma_in, s_nv0039.off_in, s_nv0039.dma_out, s_nv0039.off_out,
++                   len, lines, 10);
++        return;
++    }
++    if (pin == len && pout == len) memmove(dst, src, (size_t)len * lines);
++    else for (u32 i = 0; i < lines; i++) memmove(dst + (size_t)i * pout, src + (size_t)i * pin, len);
++}
++
+ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+@@ -1249,2 +1293,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+      * headers); other versions use the classic 2 / 4. Accept both. */
++    if (subch == 1) {                        /* NV0039 buffer copy */
++        switch (method) {
++        case 0x0184: s_nv0039.dma_in      = data; return;
++        case 0x0188: s_nv0039.dma_out     = data; return;
++        case 0x030C: s_nv0039.off_in      = data; return;
++        case 0x0310: s_nv0039.off_out     = data; return;
++        case 0x0314: s_nv0039.pitch_in    = data; return;
++        case 0x0318: s_nv0039.pitch_out   = data; return;
++        case 0x031C: s_nv0039.line_length = data; return;
++        case 0x0320: s_nv0039.line_count  = data; return;
++        case 0x0324: s_nv0039.format      = data; return;
++        case 0x0328: nv0039_buffer_notify();     return;
++        }
++    }
+     if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
+@@ -2164,5 +2222,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                  * same reason the live engine does, and masks them itself. */
++                /* Only what the 3D path takes, plus the driver methods: the engine
++                 * strips the subchannel, so a 2D engine's state (NV0039's OFFSET_OUT
++                 * is 0x310) would land on an NV4097 register (BLEND_ENABLE). */
+                 { static int eng = -1;
+                   if (eng < 0) eng = rsx_draw_engine_enabled();
+-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
++                  if (eng && (subch == 0 || (subch == 1 && !s1_2d) || ((subch << 13) | m) >= 0xE000u))
++                      rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+ 

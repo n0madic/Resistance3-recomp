@@ -1,0 +1,308 @@
+cellGcm: take a JUMP waiting at the idle get when the title stores put.
+
+The RSX starts fetching the moment put moves away from get, and Resistance 3 relies on it. It runs each streamed
+texture copy at the idle get G: a JUMP to the copy block at G, a JUMP back to G after the block, put = the block's
+end; once get reaches that end it sets put back to G and reuses the block's memory shortly after. The walker only runs
+on the present thread, which can be busy for tens of milliseconds (pipeline builds at a level start), so it often
+resumed from the block's end after the reuse and read texture or game data as commands -- several FIFO derails per
+run, each ending in an unmapped JUMP/CALL and a resync. One of those garbage words once set ZSTENCIL_CLEAR_VALUE to
+a depth near the near plane: every later depth clear then culled the whole scene and the screen stayed flat yellow.
+
+cellGcm_on_put_store now follows JUMPs at get on the storing thread (at most 8, never a park or an unmapped target),
+under the walker's lock, and publishes get as the walker does. Methods are left to the walker, since they need the
+backend on the present thread. A put store made by the walker itself (the ring recycle) skips it.
+
+tests/gcm_put_jump drives that injection through the walker with no backend: get is back at G as soon as put is
+stored, and the block's memory overwritten afterwards is never executed.
+
+The put word's store reaches cellGcm_on_put_store from vm_write32 (ppu_loader.cpp).
+The two loader fixtures that link ppu_loader.cpp (test_ppu_entry_arguments, test_loaded_image_memory) stub it, as they
+stub the other subsystems the loader reaches.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bdd2f85..3315f3d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -401,2 +401,4 @@ if(PS3RECOMP_BUILD_TESTS)
+         add_subdirectory(tests/gcm_reports)
++        # ...and the JUMP at an idle get, taken on the put store.
++        add_subdirectory(tests/gcm_put_jump)
+     endif()
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 2b47acd..c503c5c 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1765,2 +1765,6 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
+ 
++/* Set on the thread running the walker: a put store it makes itself (the ring
++ * recycle) must not take the lock it already holds. */
++static _Thread_local int t_in_fifo_walker;
++
+ void cellGcm_rsx_process_fifo(void)
+@@ -1769,3 +1773,5 @@ void cellGcm_rsx_process_fifo(void)
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++    t_in_fifo_walker = 1;
+     gcm_rsx_process_fifo_unlocked();
++    t_in_fifo_walker = 0;
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+@@ -1786,2 +1792,42 @@ static int gcm_get_eq_put(void)
+ 
++/* JUMPs taken at once when put moves; a chain longer than this is left to the walker. */
++#define GCM_PUT_STORE_JUMPS 8u
++
++/* The RSX fetches as soon as put moves away from get, and a title may rely on
++ * that. Resistance 3 runs a texture copy at the idle get G: it writes a JUMP to
++ * the copy at G and a JUMP back to G after it, sets put to the copy's end, waits
++ * for get to arrive there, then sets put back to G and soon reuses the copy's
++ * memory -- by then the hardware took the JUMP back long ago. The walker runs on
++ * the present thread, which can be busy for tens of milliseconds (pipeline
++ * builds at a level start), and then read whatever replaced that JUMP as
++ * commands: texture data, one word of which once set ZSTENCIL_CLEAR_VALUE to
++ * near the near plane and left every later frame a flat yellow. Take the JUMPs
++ * at get here, on the storing thread. Only branches: methods need the backend,
++ * which stays on the present thread. */
++static void gcm_take_jumps_at_get(u32 put)
++{
++    if (t_in_fifo_walker || !vm_base) return;
++    /* Unlocked look first: a JUMP waiting at an idle get is rare, put stores are not. */
++    {
++        const u32 get = s_fifo_getoff;
++        const u32 ea = get != put ? gcm_io2ea(get) : 0;
++        if (!ea || (vm_read32(ea) >> 29) != 1u) return;
++    }
++    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++    for (u32 n = 0; n < GCM_PUT_STORE_JUMPS && s_fifo_getoff != put; n++) {
++        const u32 ea = gcm_io2ea(s_fifo_getoff);
++        if (!ea) break;
++        const u32 w = vm_read32(ea);
++        if ((w >> 29) != 1u) break;                         /* not a JUMP: the walker's work */
++        const u32 tgt = w & 0x1FFFFFFCu;
++        if (tgt == s_fifo_getoff || !gcm_io2ea(tgt)) break; /* a park, or a bad branch the walker reports */
++        s_fifo_getoff = tgt;
++        if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt);
++    }
++    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
++}
++
++/* The guest's store to the control register's put word (vm_write32 in ppu_loader.cpp calls it). */
++void cellGcm_on_put_store(u32 put) { gcm_take_jumps_at_get(put & 0x1FFFFFFCu); }
++
+ static void gcm_rsx_process_fifo_unlocked(void)
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index f54150d..16213a4 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1943,3 +1943,5 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
+        * are guest memory and the PPU reads most of them straight back. */
+-      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
++      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4);
++      /* The RSX control register's put word: the guest just published new ring commands. */
++      if ((uint32_t)a == VM_HLE_INJECT_BASE + 0x2000u) { extern void cellGcm_on_put_store(uint32_t); cellGcm_on_put_store(_v); } } }
+ void vm_write64(uint64_t a, uint64_t v) {
+diff --git a/runtime/ppu/tests/test_ppu_entry_arguments.cpp b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
+index 2cd75e0..30ed9be 100644
+--- a/runtime/ppu/tests/test_ppu_entry_arguments.cpp
++++ b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
+@@ -19,2 +19,3 @@ void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
+ void cellGcm_ref_on_poll(void) { std::abort(); }
++void cellGcm_on_put_store(uint32_t) { std::abort(); }
+ HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
+diff --git a/tests/gcm_put_jump/CMakeLists.txt b/tests/gcm_put_jump/CMakeLists.txt
+new file mode 100644
+index 0000000..6ecf412
+--- /dev/null
++++ b/tests/gcm_put_jump/CMakeLists.txt
+@@ -0,0 +1,26 @@
++# ps3recomp - tests/gcm_put_jump
++#
++# A JUMP waiting at the idle get is taken when the title stores put, so a
++# command block the title reuses right after is not read again by the walker:
++# a hand-built ring, an injected block, its memory overwritten after put moves
++# back. No graphics backend and no lifted game. Built with the runtime
++# (PS3RECOMP_BUILD_TESTS).
++#
++#   ctest --test-dir build-tests -R gcm_put_jump --output-on-failure
++
++add_executable(test_gcm_put_jump
++    main.c
++    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
++)
++target_link_libraries(test_gcm_put_jump PRIVATE ps3recomp_runtime)
++if(NOT WIN32)
++    target_link_libraries(test_gcm_put_jump PRIVATE m)
++endif()
++target_include_directories(test_gcm_put_jump PRIVATE
++    "${PROJECT_SOURCE_DIR}/libs/video"
++    "${PROJECT_SOURCE_DIR}/include"
++    "${PROJECT_SOURCE_DIR}/runtime"
++)
++# The runtime carries C++, so the C++ driver does the final link.
++set_target_properties(test_gcm_put_jump PROPERTIES LINKER_LANGUAGE CXX)
++add_test(NAME gcm_put_jump COMMAND test_gcm_put_jump)
+diff --git a/tests/gcm_put_jump/main.c b/tests/gcm_put_jump/main.c
+new file mode 100644
+index 0000000..453f88e
+--- /dev/null
++++ b/tests/gcm_put_jump/main.c
+@@ -0,0 +1,149 @@
++/*
++ * ps3recomp - tests/gcm_put_jump
++ *
++ * A JUMP waiting at the idle get is taken when the title stores put, not when
++ * the walker next runs. Resistance 3 runs a command block at the idle get G:
++ * JUMP block at G, JUMP G at the block's end, put = block end; once get reaches
++ * the end it sets put back to G and soon reuses the block's memory. The walker
++ * runs on the present thread and may not run again before that reuse; it then
++ * executed whatever replaced the JUMP back as commands.
++ *
++ *   - after put returns to G, get is G at once, with no drain in between;
++ *   - the block's memory overwritten afterwards (with a GET_REPORT into main
++ *     memory) is never executed;
++ *   - a put store with a method, not a JUMP, at get leaves get to the walker,
++ *     and the walker still executes it.
++ *
++ * Exit code 0 when every check passes.
++ */
++#include "cellGcmSys.h"
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern void cellGcm_rsx_process_fifo(void);
++extern void cellGcm_on_put_store(uint32_t put);
++extern void vm_write32(uint64_t addr, uint32_t v);
++extern uint32_t vm_read32(uint64_t addr);
++extern uint32_t ppu_vm_size;
++extern uint32_t ppu_hle_inject_base;
++
++uint8_t* vm_base = NULL;
++
++#define IO_ADDR    0x00100000u      /* command buffer + IO window, io 0 */
++#define IO_SIZE    0x00200000u
++#define CMD_SIZE   0x00010000u
++#define HEAP_BASE  0x00400000u
++
++#define BLOCK_OFF  0x8000u          /* the injected block, in the IO window */
++#define REPORT_OFF 0x50390u         /* main-memory report slot the stale block would write */
++#define REPORT2    0x503A0u         /* report slot the ring writes itself */
++#define SENTINEL   0xA5A5A5A5u
++
++#define M_REPORT_DMA 0x01A8u        /* NV4097_SET_CONTEXT_DMA_REPORT */
++#define M_GET_REPORT 0x1800u        /* NV4097_GET_REPORT */
++#define M_ZCLEAR     0x1D8Cu        /* NV4097_SET_ZSTENCIL_CLEAR_VALUE */
++#define JUMP(io)     (0x20000000u | (io))
++
++static void gw32(uint32_t ea, uint32_t v)
++{
++    uint8_t* p = vm_base + ea;
++    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
++}
++static uint32_t gr32(uint32_t ea)
++{
++    const uint8_t* p = vm_base + ea;
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++static uint32_t g_heap = HEAP_BASE;
++static u32 host_alloc(u32 size, u32 align)
++{
++    if (!align) align = 4;
++    g_heap = (g_heap + align - 1u) & ~(align - 1u);
++    u32 r = g_heap;
++    g_heap += size;
++    return r;
++}
++static void host_w32(u32 ea, u32 v) { gw32(ea, v); }
++
++/* A method with one argument at io `at`; returns the io after it. */
++static uint32_t put_method(uint32_t at, uint32_t m, uint32_t d)
++{
++    gw32(IO_ADDR + at, (1u << 18) | (m & 0x1FFCu));
++    gw32(IO_ADDR + at + 4, d);
++    return at + 8;
++}
++
++/* The title's store to put. host_stubs' vm_write32 is a plain store; the
++ * runtime's (ppu_loader.cpp) also calls the put hook for the control register. */
++static uint32_t g_ctrl;
++static void store_put(uint32_t put)
++{
++    vm_write32(g_ctrl + 0, put);
++    cellGcm_on_put_store(put);
++}
++
++static int g_fail;
++#define CHECK(c, ...) do { if (c) printf("[PASS] " __VA_ARGS__); \
++                           else { g_fail++; printf("[FAIL] " __VA_ARGS__); } printf("\n"); } while (0)
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
++    vm_base = (uint8_t*)calloc(1, vm_size);
++    if (!vm_base) { printf("[FAIL] guest VM alloc\n"); return 1; }
++    ppu_vm_size = vm_size;
++
++    u32 ctx_out = host_alloc(4, 4);
++    cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
++    const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
++    g_ctrl = ctrl;
++    for (unsigned k = 0; k < 16; k += 4) {
++        gw32(IO_ADDR + REPORT_OFF + k, SENTINEL);
++        gw32(IO_ADDR + REPORT2 + k, SENTINEL);
++    }
++
++    /* The ring runs up to G and the RSX idles there. */
++    uint32_t g = put_method(0, M_ZCLEAR, 0xFFFFFF00u);
++    store_put(g);
++    cellGcm_rsx_process_fifo();
++    CHECK(vm_read32(ctrl + 4) == g, "ring drained to the idle get G = 0x%X", g);
++
++    /* Inject: JUMP block at G, a method then JUMP G in the block, put = block end. */
++    const uint32_t block_end = put_method(BLOCK_OFF, M_ZCLEAR, 0xFFFFFF00u);
++    gw32(IO_ADDR + block_end, JUMP(g));
++    const uint32_t saved = gr32(IO_ADDR + g);
++    gw32(IO_ADDR + g, JUMP(BLOCK_OFF));
++    store_put(block_end);
++    cellGcm_rsx_process_fifo();
++    CHECK(vm_read32(ctrl + 4) == block_end, "walker ran the block and idles at its end 0x%X (get 0x%X)",
++          block_end, vm_read32(ctrl + 4));
++
++    /* Put back to G, restore G, then reuse the block's memory before any drain. */
++    store_put(g);
++    gw32(IO_ADDR + g, saved);
++    CHECK(vm_read32(ctrl + 4) == g, "the put store took the JUMP back: get 0x%X == G at once",
++          vm_read32(ctrl + 4));
++    uint32_t junk = put_method(block_end, M_REPORT_DMA, 0xFEED0001u);
++    junk = put_method(junk, M_GET_REPORT, (1u << 24) | REPORT_OFF);
++    gw32(IO_ADDR + junk, JUMP(g));
++
++    /* The title appends at G and moves put; the walker continues from G. */
++    uint32_t end = put_method(g, M_REPORT_DMA, 0xFEED0001u);
++    end = put_method(end, M_GET_REPORT, (1u << 24) | REPORT2);
++    store_put(end);
++    CHECK(vm_read32(ctrl + 4) == g, "a method at get stays for the walker (get 0x%X)", vm_read32(ctrl + 4));
++    cellGcm_rsx_process_fifo();
++    CHECK(vm_read32(ctrl + 4) == end, "walker drained to put 0x%X (get 0x%X)", end, vm_read32(ctrl + 4));
++    CHECK(gr32(IO_ADDR + REPORT2 + 8) == 0xFFFFu, "the ring's own report ran (value 0x%X)",
++          gr32(IO_ADDR + REPORT2 + 8));
++    CHECK(gr32(IO_ADDR + REPORT_OFF) == SENTINEL && gr32(IO_ADDR + REPORT_OFF + 8) == SENTINEL,
++          "the reused block was not executed (report slot 0x%08X)", gr32(IO_ADDR + REPORT_OFF + 8));
++
++    printf("[gcm_put_jump] %s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
++    free(vm_base);
++    return g_fail ? 1 : 0;
++}
+diff --git a/tests/test_loaded_image_memory.cpp b/tests/test_loaded_image_memory.cpp
+index a678053..bd21b92 100644
+--- a/tests/test_loaded_image_memory.cpp
++++ b/tests/test_loaded_image_memory.cpp
+@@ -18,2 +18,3 @@ void spu_lockline_unlock(void) { std::abort(); }
+ void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
++void cellGcm_on_put_store(uint32_t) { std::abort(); }
+ HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }

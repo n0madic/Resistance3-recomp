@@ -1,0 +1,85 @@
+Thread-local state of the PPU trampoline and the SPU context, through exported accessors.
+
+A game module built as its own loadable image (dylib/dll/so) cannot import a thread-local variable from the host: the
+Mach-O and PE linkers reject a TLS reference to a symbol in another image. With PPU_MODULE_ACCESSORS / SPU_MODULE_ACCESSORS
+the lifted code reaches g_trampoline_fn, g_spu_trampoline_fn, g_spu_pch and g_spu_pch_n through functions the host exports
+(ppu_tramp_slot, spu_tramp_slot, spu_pch_arr, spu_pch_n_slot); the SPURS job's two thread-local slots use the same
+SPU_THREAD_LOCAL macro as the rest. Without the macros the headers are unchanged.
+
+Upstream: not proposed. The loader and lifter side is shared with other ports that load their lift as a module.
+
+---
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index f54150d..b3282fa 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1986,2 +1986,5 @@ void flow_lookup_alloc(unsigned int p) {
+ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
++/* The slot for a lift built as a separate module, which cannot import a TLS variable (see PPU_MODULE_ACCESSORS
++ * in the lifter's chunk prologue). */
++extern "C" void (**ppu_tramp_slot(void))(void*) { return &g_trampoline_fn; }
+ 
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index f46d415..b1d39ae 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -772,2 +772,13 @@ void spu_indirect_branch(spu_context* ctx);
+ 
++#ifdef SPU_MODULE_ACCESSORS
++/* Lifted images built as a separate loadable module (dll/dylib/so) cannot import the thread-local
++ * variables below: the Mach-O and PE linkers reject a TLS reference to a symbol in another image.
++ * The host exports one accessor per variable (spu_drain.c) and the module reaches them through it. */
++void (**spu_tramp_slot(void))(spu_context*);
++uint32_t (*spu_pch_arr(void))[8];
++unsigned *spu_pch_n_slot(void);
++#  define g_spu_trampoline_fn (*spu_tramp_slot())
++#  define g_spu_pch           (*spu_pch_arr())
++#  define g_spu_pch_n         (*spu_pch_n_slot())
++#else
+ /* Pending cross-function transfer target; NULL when none. Thread-local: each
+@@ -781,2 +792,3 @@ extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
+ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
++#endif
+ 
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index fc3cea1..237ebec 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -23,2 +23,7 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+ 
++/* Accessors for lifted images built as a separate module (see SPU_MODULE_ACCESSORS in spu_context.h). */
++void (**spu_tramp_slot(void))(spu_context*) { return &g_spu_trampoline_fn; }
++uint32_t (*spu_pch_arr(void))[8] { return &g_spu_pch; }
++unsigned *spu_pch_n_slot(void) { return &g_spu_pch_n; }
++
+ /* yz_lockstep_tick now has its real body in spu_lockstep.c (milestone 2). */
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index bb8f122..7afffe7 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -148,4 +148,4 @@ SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
+  * expects an answer back through the completion event. */
+-SPURS_JOB_TLS uint32_t g_spurs_job_cmd;
+-SPURS_JOB_TLS int g_spurs_job_mbox_valid;
++SPU_THREAD_LOCAL uint32_t g_spurs_job_cmd;
++SPU_THREAD_LOCAL int g_spurs_job_mbox_valid;
+ /* The SPU number a job sees (cellSpursGetCurrentSpuId, kernel LS 0x1C8). A host
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 9d9df71..cc4159f 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -476,4 +476,12 @@ extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
+ /* Trampoline function pointer for cross-fragment branches (TLS).
+- * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
++ * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above.
++ * A lift built as a separate loadable module (PPU_MODULE_ACCESSORS) cannot import a thread-local
++ * variable from the host (Mach-O and PE linkers reject it), so it reaches the host's slot through
++ * an exported accessor instead. */
++#ifdef PPU_MODULE_ACCESSORS
++extern "C" void (**ppu_tramp_slot(void))(void*);
++#  define g_trampoline_fn (*ppu_tramp_slot())
++#else
+ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
++#endif
+ 

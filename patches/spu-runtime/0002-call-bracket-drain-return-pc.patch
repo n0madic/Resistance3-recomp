@@ -1,0 +1,146 @@
+spu_lifter: publish a call bracket's return pc for the whole call.
+
+The interpreter stops at ctx->drain_ret_pc when a callee's return lands mid-function, so the caller's host frame takes
+the continuation back. Only the spu_drain_call loop set that value, so while a brsl/bisl callee ran from the call
+itself it held the enclosing bracket's pc (or 0). Resistance 3's igjob_00DC0200 calls an unlifted handler through
+`bisl`; the interpreter ran on through the caller's loop into the same call, each iteration nested another host frame,
+and the depth guard halted the SPU at 2000. Its policy module then restarted on a job-overwritten local store: two
+buckets waited for a bucket signal that never comes, one took a garbage doorbell, and level start hung.
+
+Each bracket now saves the outer value, sets its own before the call and restores it after the drain. The handoff
+fixture gains the direct-call case (it covered only the queued one), and a lifter self-check pins the emitted form.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/spu/tests/test_spu_interpreter_handoff.c b/runtime/spu/tests/test_spu_interpreter_handoff.c
+index aa13676..6c01dd5 100644
+--- a/runtime/spu/tests/test_spu_interpreter_handoff.c
++++ b/runtime/spu/tests/test_spu_interpreter_handoff.c
+@@ -43,2 +43,3 @@ static void nested_entry(spu_context* c) {
+     c->gpr[0] = spu_link(0x204);
++    uint32_t dr = c->drain_ret_pc; c->drain_ret_pc = 0x204;   /* as the lifter's bracket */
+     c->host_depth++;
+@@ -49,2 +50,3 @@ static void nested_entry(spu_context* c) {
+     c->host_depth--;
++    c->drain_ret_pc = dr;
+     c->gpr[20]._u32[0]++;
+@@ -61,3 +63,3 @@ int main(int argc, char** argv) {
+     spu_register_function(0x200, helper);
+-    if (strcmp(mode, "nested-return-unlifted"))
++    if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "nested-return-direct"))
+         spu_register_function(0x204, wrong_continuation);
+@@ -77,3 +79,5 @@ int main(int argc, char** argv) {
+     } else if (!strncmp(mode, "nested-return", 13)) {
+-        entry = nested_entry; queued_call = 1;
++        /* -direct: the bracket calls the dispatcher itself, as a lifted
++         * bisl does, so the interpreter runs before spu_drain_call starts. */
++        entry = nested_entry; queued_call = strcmp(mode, "nested-return-direct") != 0;
+         word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index 7cce85a..314afd1 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -212,2 +212,16 @@ _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
+ 
++# A call bracket publishes its return pc (ctx->drain_ret_pc) for the whole
++# call, not only once spu_drain_call starts: the interpreter stops there when
++# the callee's return lands mid-function. Set only by the drain loop, it was
++# stale while the callee ran from the call itself -- Resistance 3's
++# igjob_00DC0200 calls an unlifted handler through `bisl`, the interpreter ran
++# on through the caller's loop back into the same call, and every iteration
++# nested another host frame until the depth guard halted the SPU.
++def _drain_ret_open(ret: int) -> str:
++    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = 0x{ret & 0x3FFFC:X}; "
++
++
++_DRAIN_RET_CLOSE = "ctx->drain_ret_pc = _dr; "
++
++
+ # Mnemonics that do NOT write the rt register (so we skip the post-trace).
+@@ -918,6 +932,10 @@ class SPULifter:
+                 # callee's own tail-chains so they don't grow the caller frame)
+-                # + image save/restore (adopt-on-serve cannot leak upward).
++                # + image save/restore (adopt-on-serve cannot leak upward)
++                # + the bracket's return pc published for the whole call (see
++                # _drain_ret_open).
+                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
++                        f"{_drain_ret_open(addr + 4)}"
+                         f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+-                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
++                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; "
++                        f"{_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
+             return f"{link} /* TODO spu: brsl unresolved target */;"
+@@ -984,5 +1002,6 @@ class SPULifter:
+                     f"int32_t _si = (int32_t)ctx->image_id; "
++                    f"{_drain_ret_open(addr + 4)}"
+                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
+                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
+-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
++                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
+         # bisled: set link, branch to RA only if an external event is pending.
+diff --git a/tools/test_spu_interpreter_handoff.py b/tools/test_spu_interpreter_handoff.py
+index f7699b0..3d46d99 100644
+--- a/tools/test_spu_interpreter_handoff.py
++++ b/tools/test_spu_interpreter_handoff.py
+@@ -25,3 +25,3 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
+     failed = []
+-    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-calls', 'stop-zero',
++    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-return-direct', 'nested-calls', 'stop-zero',
+                  'nested-stop', 'stop-code', 'halt', 'smc', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
+diff --git a/tools/test_spu_lifter_call_bracket.py b/tools/test_spu_lifter_call_bracket.py
+new file mode 100644
+index 0000000..8708382
+--- /dev/null
++++ b/tools/test_spu_lifter_call_bracket.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""Self-check: an SPU call bracket publishes its return pc for the whole call.
++
++The interpreter stops at ctx->drain_ret_pc when a callee's return lands
++mid-function. A bracket that set it only inside spu_drain_call left it stale
++while the callee ran from the call itself, and the interpreter ran on through
++the caller (Resistance 3: a job's loop nested a host frame per iteration until
++the depth guard halted the SPU). runtime/spu/tests covers the runtime side.
++
++Run: python tools/test_spu_lifter_call_bracket.py
++"""
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from spu_disasm import disassemble_spu  # noqa: E402
++from spu_lifter import SPULifter  # noqa: E402
++
++BASE = 0x1000
++CODE = bytes.fromhex(
++    "33000100"   # 0x1000 brsl $r0, 0x1008
++    "35200180"   # 0x1004 bisl $r0, $r3
++    "35000000"   # 0x1008 bi $r0
++)
++
++
++def check(body: str, ret: int, call: str) -> None:
++    line = next((ln for ln in body.splitlines() if call in ln), None)
++    assert line, f"no bracket calling {call!r} in:\n{body}"
++    publish = f"ctx->drain_ret_pc = 0x{ret:X};"
++    assert publish in line, f"bracket does not publish 0x{ret:X}: {line}"
++    assert line.index(publish) < line.index(call), f"published after the call: {line}"
++    restore = "ctx->drain_ret_pc = _dr;"
++    assert restore in line and line.index(restore) > line.index("spu_drain_call"), (
++        f"outer return pc not restored after the drain: {line}")
++
++
++def main() -> int:
++    insns = disassemble_spu(CODE, BASE)
++    lifter = SPULifter()
++    body = "\n".join(lifter.lift_function(insns, BASE, BASE + len(CODE)).body_lines)
++    check(body, 0x1004, "spu_func_00001008(ctx)")
++    check(body, 0x1008, "spu_indirect_branch(ctx)")
++    print("ok: brsl and bisl brackets publish their return pc for the whole call")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

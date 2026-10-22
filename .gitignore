@@ -1,0 +1,30 @@
+# Whitelist: only the port's own sources are tracked.
+# Game data (PS3_GAME/, gamedata/, cache/), lifted game code (module/), build products (build/, dist/) and logs stay out.
+/*
+!/.gitignore
+!/CLAUDE.md
+!/host/
+!/patches/
+!/scripts/
+!/tools/
+
+# Never track game files or anything derived from them, even inside the tracked directories.
+*.elf
+*.ELF
+*.self
+*.SELF
+*.bin
+*.BIN
+*.sprx
+*.SPRX
+*.sfo
+*.SFO
+*.psarc
+*.PSARC
+*.pkg
+*.edat
+*.EDAT
+*.dylib
+*.o
+__pycache__/
+.DS_Store

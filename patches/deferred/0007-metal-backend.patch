@@ -1,0 +1,252 @@
+Metal backend: menu, key events, anti-aliasing and window handling.
+
+- A main menu with Cmd+Q ("Quit <title>"); closing the window or Cmd+Q ends the process.
+- The window drops key down/up events (the pad polls the keyboard itself), so a keypress no longer plays the
+  system alert sound; Cmd shortcuts still reach the menu.
+- FXAA 3.11 in the display pass (PS3RECOMP_METAL_FXAA=0|1, default 1) and anisotropic filtering of linearly
+  filtered textures (PS3RECOMP_METAL_AF=1..16, default 16); PS3RECOMP_METAL_HEADLESS=1 with
+  PS3RECOMP_METAL_PRESENT_DUMP=<dir> writes every 120th presented frame.
+- The window is resizable without stretching: the drawable follows the window in device pixels and the display
+  pass fits the 16:9 picture into it, black elsewhere. PS3RECOMP_METAL_WINDOW=WxH sets the initial size.
+
+---
+
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index 32f0b958..d7088392 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -82,6 +82,15 @@
+ #if !TARGET_OS_IPHONE
+ static id                  s_window_close_observer;
+ #endif
++/* The window's content size in device pixels, kept current by the message pump (main thread) and read
++ * by the present path, which sizes the drawable to it. 0 until the first pump. */
++static volatile u32        s_win_px_w, s_win_px_h;
++
++/* Image quality of the old live-draw path. PS3RECOMP_METAL_AF=1..16 is the anisotropic filtering limit applied to
++ * every linearly filtered game texture there (default 16). The draw engine has the toolkit's own: FXAA and
++ * sharpening in the present (PS3_AA=fxaa, PS3_SHARPEN) and PS3_ANISO. */
++#define MTL_AF_DEFAULT   16
++static u32                 s_aniso = MTL_AF_DEFAULT;
+ static int                 s_ready;
+ static u32                 s_width  = 1280;
+ static u32                 s_height = 720;
+@@ -579,12 +588,42 @@ static void window_close_observer_start(NSWindow* window)
+         }];
+ }
+ 
++/* Cmd+Q: the window has no menu bar of its own, so the keystroke went nowhere. It asks the host to stop
++ * the way closing the window does; the pump reports it. */
++@interface RsxQuitTarget : NSObject
++- (void)quit:(id)sender;
++@end
++@implementation RsxQuitTarget
++- (void)quit:(id)sender { (void)sender; atomic_store(&s_closed, 1); }
++@end
++static RsxQuitTarget* s_quit_target;
++
+ static int create_window_impl(const char* title)
+ {
+     [NSApplication sharedApplication];
+     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++    {
++        s_quit_target = [RsxQuitTarget new];
++        NSMenu* bar = [NSMenu new];
++        NSMenuItem* appItem = [NSMenuItem new];
++        [bar addItem:appItem];
++        NSMenu* appMenu = [NSMenu new];
++        NSString* quitTitle = [@"Quit " stringByAppendingString:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
++        NSMenuItem* quit = [[NSMenuItem alloc] initWithTitle:quitTitle action:@selector(quit:) keyEquivalent:@"q"];
++        [quit setTarget:s_quit_target];
++        [appMenu addItem:quit];
++        [appItem setSubmenu:appMenu];
++        [NSApp setMainMenu:bar];
++    }
+ 
++    /* PS3RECOMP_METAL_WINDOW=<w>x<h>: initial content size in points (default: the game's size). */
+     NSRect frame = NSMakeRect(0, 0, (CGFloat)s_width, (CGFloat)s_height);
++    {
++        unsigned ww = 0, wh = 0;
++        const char* ws = getenv("PS3RECOMP_METAL_WINDOW");
++        if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 90 && ww <= 16384 && wh <= 16384)
++            frame.size = NSMakeSize((CGFloat)ww, (CGFloat)wh);
++    }
+     s_window = [[NSWindow alloc]
+         initWithContentRect:frame
+                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+@@ -643,6 +682,7 @@ static int create_placeholders(void)
+     sd.magFilter = MTLSamplerMinMagFilterLinear;
+     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
++    /* Also the draw engine's display pass samples through it (linear, clamped) when it filters or scales. */
+     s_default_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+     if (!s_default_sampler) return -1;
+ 
+@@ -1299,6 +1339,8 @@ static int samp_slot_for(const rsx_texture_state* t)
+     if (max_lod < min_lod) max_lod = min_lod;
+     sd.lodMinClamp = min_lod;
+     sd.lodMaxClamp = max_lod;
++    if (sd.minFilter == MTLSamplerMinMagFilterLinear && sd.magFilter == MTLSamplerMinMagFilterLinear)
++        sd.maxAnisotropy = s_aniso;
+     sd.sAddressMode = gcm_wrap_to_metal(t->address);
+     sd.tAddressMode = gcm_wrap_to_metal(t->address >> 8);
+     sd.rAddressMode = gcm_wrap_to_metal(t->address >> 16);
+@@ -2537,6 +2579,7 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+ /* ---- staging ------------------------------------------------------------- */
+ 
+ static void eng_encode_and_commit(id<MTLTexture> present_dst);
++static void eng_dump_presented(id<MTLTexture> dst, id<MTLTexture> raw);
+ 
+ static int eng_stage_reserve(u32 bytes, u32* out_off)
+ {
+@@ -3541,7 +3584,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+  *
+  * With PS3_AA=fxaa the surface goes through FXAA first, at its own size; with
+  * PS3_SHARPEN this pass sharpens it as it samples. Either one that is off or
+- * fails is skipped. */
++ * fails is skipped. The picture keeps its aspect ratio: it is fitted into the drawable and
++ * centred, and the rest is black (letterbox). */
+ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+                                 id<MTLTexture> dst)
+ {
+@@ -3564,13 +3608,20 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+     }
+     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+     rp.colorAttachments[0].texture     = dst;
+-    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
++    rp.colorAttachments[0].loadAction  = MTLLoadActionClear;
++    rp.colorAttachments[0].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+     if (!e) return;
++    const double dw = (double)[dst width], dh = (double)[dst height];
++    const double sw = (double)[src width], sh = (double)[src height];
++    const double fit = fmin(dw / sw, dh / sh);
++    const double vw = floor(sw * fit + 0.5), vh = floor(sh * fit + 0.5);
++    [e setViewport:(MTLViewport){floor((dw - vw) * 0.5), floor((dh - vh) * 0.5), vw, vh, 0.0, 1.0}];
+     [e setRenderPipelineState:s_eng_blit_pso];
+     [e setFragmentTexture:src atIndex:0];
+-    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
++    const int scaled = (vw != sw || vh != sh);
++    [e setFragmentSamplerState:(scaled ? s_default_sampler : s_eng_point_sampler) atIndex:0];
+     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
+      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
+      * sharpening taps are one source texel apart. */
+@@ -3608,6 +3659,14 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+             if (s_headless) {
+                 dst = s_offscreen;
+             } else {
++                /* The drawable is the window's size in device pixels, so the compositor does not
++                 * stretch it; eng_blit_to_display fits the game picture into it. */
++                const u32 ww = s_win_px_w, wh = s_win_px_h;
++                const CGSize cur = s_layer.drawableSize;
++                if (ww && wh && ((u32)cur.width != ww || (u32)cur.height != wh)) {
++                    s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
++                    fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
++                }
+                 drawable = [s_layer nextDrawable];
+                 if (!drawable) {           /* compositor is busy; skip */
+                     dispatch_semaphore_signal(s_inflight);
+@@ -3665,6 +3724,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+                     fprintf(stderr, "[rsx engine/metal] command buffer failed: %s (code %ld)\n",
+                             [[[cb error] localizedDescription] UTF8String], (long)[[cb error] code]);
+             }
++            if (present_dst) eng_dump_presented(dst, present_dst);
+         }
+ 
+         if (s_eng_dropped) {
+@@ -3678,14 +3738,10 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+     }
+ }
+ 
+-/* Opt-in readback of the game surface, useful on a locked Mac or in CI.
+- * Headless submits have completed; windowed captures fence the same queue. */
+-static void eng_dump_frame(id<MTLTexture> src)
++/* Write a BGRA8/RGBA8 texture as a PPM. Headless submits have completed; windowed
++ * captures fence the same queue. */
++static void eng_write_ppm(id<MTLTexture> src, const char* path)
+ {
+-    const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
+-    if (!path || !*path) return;
+-    static unsigned frame;
+-    if ((++frame % 120) != 0) return;
+     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
+         [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
+     size_t w = [src width], h = [src height];
+@@ -3709,11 +3765,39 @@ static void eng_dump_frame(id<MTLTexture> src)
+             fwrite(rgb, 1, 3, f);
+         }
+         fclose(f);
+-        fprintf(stderr, "[rsx engine/metal] captured frame %u to %s\n", frame, path);
++        fprintf(stderr, "[rsx engine/metal] captured %s\n", path);
+     }
+     free(rgba);
+ }
+ 
++/* Opt-in readback of the game surface, useful on a locked Mac or in CI. */
++static void eng_dump_frame(id<MTLTexture> src)
++{
++    const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
++    if (!path || !*path) return;
++    static unsigned frame;
++    if ((++frame % 120) != 0) return;
++    eng_write_ppm(src, path);
++}
++
++/* PS3RECOMP_METAL_PRESENT_DUMP=<dir> (headless only, the drawable cannot be read): every 120th
++ * presented frame as it leaves the display pass, FXAA included, to <dir>/present_<n>.ppm; with FXAA
++ * on (PS3_AA=fxaa), the unfiltered surface goes next to it as present_<n>_raw.ppm. */
++static void eng_dump_presented(id<MTLTexture> dst, id<MTLTexture> raw)
++{
++    const char* dir = getenv("PS3RECOMP_METAL_PRESENT_DUMP");
++    if (!dir || !*dir || !s_headless || !dst) return;
++    static unsigned frame;
++    if ((++frame % 120) != 0) return;
++    char path[1024];
++    snprintf(path, sizeof path, "%s/present_%05u.ppm", dir, frame);
++    eng_write_ppm(dst, path);
++    if (s_eng_fxaa > 0) {
++        snprintf(path, sizeof path, "%s/present_%05u_raw.ppm", dir, frame);
++        eng_write_ppm(raw, path);
++    }
++}
++
+ static void eng_present(void* user, u32 surface)
+ {
+     (void)user;
+@@ -3838,6 +3922,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+         const char* hl = getenv("PS3RECOMP_METAL_HEADLESS");
+         s_headless = (hl && *hl && *hl != '0');
+ 
++        const char* af = getenv("PS3RECOMP_METAL_AF");
++        if (af && *af) {
++            const long v = strtol(af, NULL, 10);
++            s_aniso = v < 1 ? 1u : v > 16 ? 16u : (u32)v;
++        }
++        fprintf(stderr, "[RSX metal] anisotropy %ux (live-draw path)\n", s_aniso);
++
+         s_dev = MTLCreateSystemDefaultDevice();
+         if (!s_dev) {
+             fprintf(stderr, "[RSX metal] no Metal device available\n");
+@@ -3982,8 +4073,21 @@ static int pump_messages_impl(void)
+                                                 inMode:NSDefaultRunLoopMode
+                                                dequeue:YES];
+             if (!ev) break;
++            /* The pad reads the keyboard by polling, so key events have no consumer here: the window would
++             * answer each with the system alert sound. Only Command shortcuts (Cmd+Q) reach the menu. */
++            if ([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) {
++                if ([ev type] == NSEventTypeKeyDown && ([ev modifierFlags] & NSEventModifierFlagCommand))
++                    [[NSApp mainMenu] performKeyEquivalent:ev];
++                continue;
++            }
+             [NSApp sendEvent:ev];
+         }
++        if (s_window) {
++            NSView* v = [s_window contentView];
++            const NSSize px = [v convertSizeToBacking:[v bounds].size];
++            s_win_px_w = (u32)px.width;
++            s_win_px_h = (u32)px.height;
++        }
+     }
+ #endif
+     return atomic_load(&s_closed) ? -1 : 0;

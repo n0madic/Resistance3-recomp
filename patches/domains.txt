@@ -1,0 +1,18 @@
+# Toolkit patches, one directory per subject area. A domain applies to the pinned toolkit revision on its own and none
+# needs another (scripts/check_patches.sh proves it); the patches inside a domain go in name order.
+# Second column: platforms the domain is for (comma separated; default: all).
+module-abi
+spurs
+spu-runtime
+savedata-trophy
+input
+lv2
+fs
+gcm-rsx
+metal               darwin
+
+# TODO: (full patches in patches/deferred/) left out because Resistance 3 on macOS showed no need for them; look again when the Windows/Linux hosts exist:
+#   SDL gamepad thread (hot-plug after start); Windows audio block pacing;
+#   MinGW GCC fixes in ppu_loader.cpp; optional LGPL-free ATRAC build; queue-ready WAIT_SIGNAL wake and taskset
+#   generations (spu_workload.c); GPU-kept resolves and whole-surface readback cache (perf, rsx_draw_engine.c);
+#   thread-priority-at-start ordering (sys_ppu_thread.c); offline NetStartDialog answer (cellNetCtl.c).

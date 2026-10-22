@@ -1,0 +1,57 @@
+cellSaveData: implement cellSaveDataUserListAutoSave (NID 0x0E091C36).
+
+The save-side twin of cellSaveDataUserListAutoLoad (0001-user-list-auto-load): same ten arguments, funcFixed picks the directory
+and the stat/file callbacks write it. Resistance 3 saves campaign progress and settings through it; unresolved, nothing
+was saved.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index 2705091..4b4e906 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -1231,2 +1231,17 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
+ 
++/* ListAutoSave mirrors ListAutoLoad: funcFixed picks the directory, then the
++ * usual stat/file callbacks write it. */
++static s32 savedata_list_auto_save(u32 version, u32 errDialog,
++                                   CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
++                                   CellSaveDataFixedCallback funcFixed,
++                                   CellSaveDataStatCallback funcStat,
++                                   CellSaveDataFileCallback funcFile,
++                                   u32 container, void* userdata)
++{
++    (void)container;
++    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
++    printf("[cellSaveData] ListAutoSave(version=%u)\n", version);
++    return savedata_fixed(1, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
++}
++
+ s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
+@@ -1588,2 +1603,19 @@ static void hle_cellSaveDataUserListAutoLoad(ppu_context* ctx)
+ 
++/* UserListAutoSave takes the same ten arguments as UserListAutoLoad. Resistance 3
++ * saves its campaign progress and settings through it. */
++static void hle_cellSaveDataUserListAutoSave(ppu_context* ctx)
++{
++    uint32_t sp = (uint32_t)ctx->gpr[1];
++    printf("[cellSaveData] UserListAutoSave(user=%u)\n", (u32)ctx->gpr[4]);
++    ctx->gpr[3] = (uint64_t)(int64_t)savedata_list_auto_save(
++        (u32)ctx->gpr[3], (u32)ctx->gpr[5],
++        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[6],
++        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[7],
++        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[8],
++        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[9],
++        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[10],
++        (u32)vm_read64(sp + SAVEDATA_ARG9_SP_OFF),
++        (void*)(uintptr_t)(u32)vm_read64(sp + SAVEDATA_ARG10_SP_OFF));
++}
++
+ void cellSaveData_register_ctx_handlers(void)
+@@ -1594,2 +1626,4 @@ void cellSaveData_register_ctx_handlers(void)
+                          hle_cellSaveDataUserListAutoLoad);
++    ps3_hle_register_ctx(0x0E091C36u, "cellSaveDataUserListAutoSave",
++                         hle_cellSaveDataUserListAutoSave);
+     ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",

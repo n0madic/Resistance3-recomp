@@ -1,0 +1,52 @@
+cellSaveData: fill listParam in the directory list from each save's PARAM.SFO.
+
+Titles tell their saves apart by SAVEDATA_LIST_PARAM. Resistance 3 keeps a counter there to pick between its two
+profile slots; with the field left empty its funcFixed answered ERR_NODATA and the profile never loaded.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index 4b4e906..8370118 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -449,2 +449,18 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
+ /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
++static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
++
++/* One dirList entry: the directory name plus the listParam its PARAM.SFO carries. Titles tell their saves apart by
++ * listParam -- Resistance 3 keeps its profile in the directory whose listParam is "1" -- so an entry without it is
++ * "nothing I want", and the game asked to install again on every boot. */
++static void fill_dir_entry(CellSaveDataDirList* entry, const char* name)
++{
++    memset(entry, 0, sizeof(*entry));
++    strncpy(entry->dirName, name, CELL_SAVEDATA_DIRNAME_SIZE - 1);
++    char path[1024];
++    snprintf(path, sizeof(path), "%s/%s", s_save_root, name);   /* adopted by the caller */
++    CellSaveDataSystemFileParam param;
++    read_param_sfo(path, &param);
++    memcpy(entry->listParam, param.listParam, sizeof(entry->listParam));
++}
++
+ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList, u32 max)
+@@ -476,7 +492,4 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
+                 continue;
+-            if (count < max && dirList) {
+-                memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
+-                strncpy(dirList[count].dirName, fd.cFileName,
+-                        CELL_SAVEDATA_DIRNAME_SIZE - 1);
+-            }
++            if (count < max && dirList)
++                fill_dir_entry(&dirList[count], fd.cFileName);
+             count++;
+@@ -503,7 +516,4 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
+                 continue;
+-            if (count < max && dirList) {
+-                memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
+-                strncpy(dirList[count].dirName, de->d_name,
+-                        CELL_SAVEDATA_DIRNAME_SIZE - 1);
+-            }
++            if (count < max && dirList)
++                fill_dir_entry(&dirList[count], de->d_name);
+             count++;

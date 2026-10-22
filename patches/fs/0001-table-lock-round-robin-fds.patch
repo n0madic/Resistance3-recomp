@@ -1,0 +1,108 @@
+cellFs: serialize the descriptor tables; hand descriptors out round-robin.
+
+Every handler looked an fd up in g_files and then used the FILE* unlocked. Resistance 3's FIOS threads open and close
+one descriptor hundreds of times per level while others seek and read on it, and a close landing between the lookup
+and the use crashed in ftello on the freed stream. The handlers now hold one recursive lock while they touch the
+tables (the AIO completion callback runs outside it). Descriptors are also allocated round-robin instead of
+lowest-free, so a late call on a number that was just closed cannot reach a file that reopened it at once.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 44cd4ee..6536b12 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -26,2 +26,3 @@
+ #include <atomic>
++#include <mutex>
+ #include <sys/stat.h>
+@@ -211,11 +212,34 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir
+ 
+-static int fd_alloc_file(FILE* f)
++/* The tables are shared by every guest thread. A title's I/O threads open and
++ * close descriptors while others seek and read (Resistance 3's FIOS scheduler
++ * and media threads cycle one fd hundreds of times a level), so a lookup and
++ * its use must not straddle a close: that dereferenced a freed FILE. Recursive,
++ * because the handlers call one another's helpers. */
++static std::recursive_mutex g_fs_lock;
++#define FS_LOCKED() std::lock_guard<std::recursive_mutex> fs_guard_(g_fs_lock)
++
++/* Hand descriptors out round-robin rather than lowest-free: a late call on a
++ * just-closed number would otherwise reach whatever file reopened it at once. */
++static int fd_alloc_slot(void)
+ {
+-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
++    static int next = 3;
++    for (int k = 0; k < FS_MAX - 3; k++) {
++        const int i = 3 + (next - 3 + k) % (FS_MAX - 3);
++        if (!g_files[i] && !g_dirs[i]) { next = i + 1 < FS_MAX ? i + 1 : 3; return i; }
++    }
+     return -1;
+ }
++static int fd_alloc_file(FILE* f)
++{
++    FS_LOCKED();
++    const int i = fd_alloc_slot();
++    if (i >= 0) g_files[i] = f;
++    return i;
++}
+ static int fd_alloc_dir(DIR* d)
+ {
+-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = d; return i; }
+-    return -1;
++    FS_LOCKED();
++    const int i = fd_alloc_slot();
++    if (i >= 0) g_dirs[i] = d;
++    return i;
+ }
+@@ -395,2 +419,3 @@ static void cellFsClose(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd = (int)(uint32_t)ctx->gpr[3];
+@@ -429,2 +454,3 @@ static void cellFsRead(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+@@ -499,2 +525,3 @@ static void cellFsWrite(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+@@ -562,2 +589,3 @@ static void cellFsFGetBlockSize(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd = (int)(uint32_t)ctx->gpr[3];
+@@ -579,2 +607,3 @@ static void cellFsLseek(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd        = (int)(uint32_t)ctx->gpr[3];
+@@ -634,2 +663,3 @@ static void cellFsFstat(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd      = (int)(uint32_t)ctx->gpr[3];
+@@ -679,2 +709,3 @@ static void cellFsReaddir(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+@@ -704,2 +735,3 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     const uint32_t fd = (uint32_t)ctx->gpr[3];
+@@ -753,2 +785,3 @@ static void cellFsClosedir(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd = (int)(uint32_t)ctx->gpr[3];
+@@ -797,2 +830,3 @@ static void cellFsFsync(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     int fd = (int)(uint32_t)ctx->gpr[3];
+@@ -891,2 +925,4 @@ static void cellFsAioRead(ppu_context* ctx)
+     int32_t err = CELL_FS_ENOENT;
++    {
++    FS_LOCKED();   /* the table, not the completion: the guest callback runs unlocked */
+     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+@@ -910,2 +946,3 @@ static void cellFsAioRead(ppu_context* ctx)
+     }
++    }
+     if (getenv("PS3_FSLOG"))

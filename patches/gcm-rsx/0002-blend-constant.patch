@@ -1,0 +1,151 @@
+rsx engine: honour the blend constant (CONSTANT_COLOR/ALPHA factors).
+
+The Metal backend mapped the 0x8001-0x8004 blend factors to ONE and never set a blend colour. Resistance 3 adds its film
+grain with CONSTANT_ALPHA as the weight, so the grain texture landed at full strength and the whole picture was buried
+in coloured noise. The engine now decodes SET_BLEND_COLOR (and SET_BLEND_COLOR2 on an FP16 target, as RPCS3's
+rsx_decode.h) before every draw and hands it to an optional backend hook; Metal sets it on the encoder and maps the
+constant factors. Dynamic state, so it is not part of the pipeline key.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index bb7675c..9bba187 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -20,2 +20,3 @@
+ 
++#include <math.h>
+ #include <stdio.h>
+@@ -69,2 +70,3 @@ extern u32 ppu_vm_size;
+ #define M_STENCIL_MASK        0x032C
++#define M_BLEND_COLOR         0x031C
+ #define M_STENCIL_FUNC        0x0330
+@@ -80,2 +82,3 @@ extern u32 ppu_vm_size;
+ #define M_BACK_STENCIL_OP_ZPASS 0x0364
++#define M_BLEND_COLOR2        0x037C
+ #define M_DEPTH_BOUNDS_ENABLE 0x0380
+@@ -302,2 +305,27 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
+ 
++static float eng_half_to_float(u32 h)
++{
++    const u32 sign = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
++    float v;
++    if (exp == 0)          v = ldexpf((float)man, -24);              /* zero, subnormal */
++    else if (exp == 0x1F)  v = man ? NAN : INFINITY;
++    else                   v = ldexpf((float)(man | 0x400u), (int)exp - 25);
++    return sign ? -v : v;
++}
++
++void rsx_draw_engine_decode_blend_color(u32 color, u32 color2, u32 rt_fp16, float rgba[4])
++{
++    if (rt_fp16) {
++        rgba[0] = eng_half_to_float(color & 0xFFFFu);
++        rgba[1] = eng_half_to_float(color >> 16);
++        rgba[2] = eng_half_to_float(color2 & 0xFFFFu);
++        rgba[3] = eng_half_to_float(color2 >> 16);
++    } else {
++        rgba[0] = (float)((color >> 16) & 0xFFu) / 255.0f;
++        rgba[1] = (float)((color >>  8) & 0xFFu) / 255.0f;
++        rgba[2] = (float)( color        & 0xFFu) / 255.0f;
++        rgba[3] = (float)((color >> 24) & 0xFFu) / 255.0f;
++    }
++}
++
+ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
+@@ -2709,2 +2737,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     }
++    /* The blend constant, for the CONSTANT_COLOR/ALPHA factors: A8R8G8B8 in
++     * SET_BLEND_COLOR, or on an FP16 target half-float R,G there and B,A in
++     * SET_BLEND_COLOR2 (RPCS3 rsx_decode.h). Resistance 3 weights its film
++     * grain by CONSTANT_ALPHA; taken as ONE, the grain covered the frame. */
++    if (g.be->set_blend_color) {
++        float c[4];
++        rsx_draw_engine_decode_blend_color(rsx_dsp_reg(&g.rsx, M_BLEND_COLOR),
++                               rsx_dsp_reg(&g.rsx, M_BLEND_COLOR2), rs.rt_fp16, c);
++        g.be->set_blend_color(g.be->user, c);
++    }
+ 
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index 4dec1d6..dc60a62 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -203,2 +203,6 @@ typedef struct rsx_draw_backend {
+     void (*set_depth_bounds)(void* user, float min, float max);
++    /* Optional: the blend constant (SET_BLEND_COLOR/SET_BLEND_COLOR2) for the
++     * next draw, already decoded to floats; dynamic state like the stencil
++     * reference. A backend that leaves this NULL has no constant blend. */
++    void (*set_blend_color)(void* user, const float rgba[4]);
+     /* One draw. `indices` is NULL for a non-indexed one. Everything the
+@@ -331,2 +335,4 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
+                                          rsx_be_render_state* out);
++/* SET_BLEND_COLOR (and SET_BLEND_COLOR2 on an FP16 target) as RGBA floats. */
++void rsx_draw_engine_decode_blend_color(u32 color, u32 color2, u32 rt_fp16, float rgba[4]);
+ 
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index 32f0b95..00a737d 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -1800,2 +1800,7 @@ static MTLBlendFactor blend_factor_to_metal(u32 f)
+     case 0x0308: return MTLBlendFactorSourceAlphaSaturated;
++    /* The constant factors take the encoder's blend colour (setBlendColor). */
++    case 0x8001: return MTLBlendFactorBlendColor;
++    case 0x8002: return MTLBlendFactorOneMinusBlendColor;
++    case 0x8003: return MTLBlendFactorBlendAlpha;
++    case 0x8004: return MTLBlendFactorOneMinusBlendAlpha;
+     default:     return MTLBlendFactorOne;
+@@ -2267,2 +2272,3 @@ static void release_surfaces(void)
+     u32   stencil_ref;
++    float blend_color[4];       /* SET_BLEND_COLOR; encoder state, not pipeline */
+     float clear_rgba[4];
+@@ -3142,2 +3148,5 @@ static void eng_set_stencil_ref(void* user, u32 ref)
+ 
++static void eng_set_blend_color(void* user, const float rgba[4])
++{ (void)user; memcpy(s_eng_pending.blend_color, rgba, sizeof s_eng_pending.blend_color); }
++
+ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3211,2 +3220,4 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+     [enc setStencilReferenceValue:r->stencil_ref];
++    [enc setBlendColorRed:r->blend_color[0] green:r->blend_color[1]
++                     blue:r->blend_color[2] alpha:r->blend_color[3]];
+     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
+@@ -3822,2 +3833,3 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+     .set_stencil_ref      = eng_set_stencil_ref,
++    .set_blend_color      = eng_set_blend_color,
+     .draw                 = eng_draw,
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index aee6109..ce7c382 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -92,2 +92,3 @@ typedef struct {
+     u32 stencil_ref;
++    float blend_color[4];
+     float depth_bounds[2];
+@@ -223,2 +224,4 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
+ static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
++static void stub_blend_color(void* u, const float c[4])
++{ (void)u; memcpy(stub.blend_color, c, sizeof stub.blend_color); }
+ static void stub_depth_bounds(void* u, float lo, float hi)
+@@ -348,2 +351,3 @@ static const rsx_draw_backend g_stub_backend = {
+     .set_stencil_ref = stub_stencil_ref,
++    .set_blend_color = stub_blend_color,
+     .set_depth_bounds = stub_depth_bounds,
+@@ -855,2 +859,17 @@ static void test_pipeline_key(void)
+ 
++    /* The blend constant is encoder state too, decoded from A8R8G8B8. */
++    const int pipelines_before_blend_color = stub.n_pipeline_create;
++    m(0x031C, 0x40FF8000u);                  /* SET_BLEND_COLOR */
++    draw_triangle();
++    CHECK(stub.n_pipeline_create == pipelines_before_blend_color && stub.blend_color[0] == 1.0f &&
++          stub.blend_color[1] == 128.0f / 255.0f && stub.blend_color[2] == 0.0f &&
++          stub.blend_color[3] == 64.0f / 255.0f,
++          "the blend colour reaches the encoder (%g %g %g %g)", stub.blend_color[0],
++          stub.blend_color[1], stub.blend_color[2], stub.blend_color[3]);
++    /* On an FP16 target: half R,G in SET_BLEND_COLOR, B,A in SET_BLEND_COLOR2. */
++    float c[4];
++    rsx_draw_engine_decode_blend_color(0x3C003800u, 0x00003400u, 1, c);
++    CHECK(c[0] == 0.5f && c[1] == 1.0f && c[2] == 0.25f && c[3] == 0.0f,
++          "an FP16 blend colour decodes as half floats (%g %g %g %g)", c[0], c[1], c[2], c[3]);
++
+     engine_down();
