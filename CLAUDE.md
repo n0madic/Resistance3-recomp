@@ -67,7 +67,7 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   savedata-trophy, input, lv2, fs, gcm-rsx, metal), listed in `patches/domains.txt` (second column: platforms the domain
   is for). Patches inside a domain go in name order and may depend on each other; **domains never depend on each other**:
   each applies to the pinned revision on its own, and any order of them gives the same tree.
-  `patches/upstream/*.patch` (empty now) holds open upstream PRs imported as they are, applied first.
+  `patches/upstream/*.patch` holds open upstream PRs imported as they are (header + the PR's diff), applied first.
   `patches/deferred/` keeps the full patches that were left out (not applied; see its README) so nothing is lost.
 - **What may be in a patch.** Only what this game needs: the header names the symptom in Resistance 3 and the test (or
   scripted run) that shows it. Nothing is carried over because another port has it. If upstream already offers the
@@ -101,21 +101,32 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   so the dispatch must follow `resident_code`. Code that is not lifted runs in the SPU interpreter.
 - **RSX/GCM**: the FIFO walker runs on the present thread. `cellGcm_on_put_store` takes JUMPs at an idle get
   immediately (the game injects command blocks at get and reuses their memory). The draw engine goes to Metal.
-  `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_ARROWS_STICK_ONLY=1`,
+  `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
   Voice packs present: English and Russian. Switching language makes the game ask once to install data again.
 
 ## Running/debugging knobs
 
-- **Keyboard**:
-  - arrows walk, I/J/K/L camera;
-  - Z/X/A/S = cross/circle/square/triangle;
-  - Q/W = L1/R1, 1/2 = L2/R2, C/V = L3/R3;
-  - T/F/G/H = d-pad, Enter = start, Tab = select.
+- **Keyboard and mouse** (cellPad's fps layout, `patches/input/0004`; the game never reads cellMouse. In play the
+  mouse turns the hero's orientation matrix directly, `host/r3_input.cpp` via `patches/input/0006`; in menus and
+  cutscenes it moves the right stick, capped at the game's top stick rate):
+  - WASD walk, mouse look (cursor captured while the window is in front; Cmd+Tab frees it);
+  - left button = R1 (fire), right = L1 (aim), middle or V = R3 (melee), wheel or Q = triangle (weapons);
+  - Space = cross (jump), C/Ctrl/Backspace = circle (crouch, back), E/R = square (reload, use);
+  - G/F = L2/R2 (grenade, secondary fire), Shift = L3 (sprint);
+  - arrows or 1/2/3/4 = d-pad, Tab = select;
+  - Enter/Esc = cross/circle (select, back) in menus and start elsewhere (Press START, pause, skip); the host tells
+    menus apart by the game's own flags (`host/r3_input.cpp`, `patches/input/0005`);
+  - `PAD_MOUSE_SENS` = degrees per point, `PAD_MOUSE_AIM_SCALE` = its factor while aiming (defaults in
+    `host/main.cpp`); `PAD_KEYBOARD_LAYOUT=pad` gives the pad-shaped layout (arrows, I/J/K/L camera, Z/X/A/S face
+    buttons).
 - **Scripted input**: `PAD_FILE=<file>`, where the file holds `mask polls [lx ly rx ry]`, e.g. `echo "0x4000 8" > f`
   presses cross.
 - **Screenshots**: `RSX_ENGINE_SNAP_DIR=<dir> RSX_ENGINE_SNAP_EVERY_S=5`; per-pass dumps: `RSX_ENGINE_PASS_DUMP`.
+- **Logs**: `PS3_VERBOSE=1` brings back the toolkit's per-wait lines (`[WAIT] ...`); the host turns them off because
+  the toolkit enables them whenever stderr is redirected. Other traces have their own variables (`PS3_FSLOG`,
+  `SPU_CH_BLOCK_TRACE`, `SPURS_PM_TRACE`).
 - **Store tracing**:
   - `PPU_WWATCH=<addr>` logs PPU stores to a guest address, with the guest function;
   - `SPU_WATCHEA=<hex>` logs SPU DMA to an EA.

@@ -1,0 +1,28 @@
+spu_channels: [ch-block] print only with SPU_CH_BLOCK_TRACE.
+
+Resistance 3's SPURS kernels idle in `rdch SPU_RdEventStat` waiting for a lost reservation (Lr, event mask 0x400)
+whenever they have no work, and spu_ch_wait printed the first 50 such blocks and every 512th after: in play that is
+a "[ch-block] spu=0 pc=... evmask=0x400" line every few frames, for the whole session. Blocking there is the normal
+idle path, not a fault. The print now needs SPU_CH_BLOCK_TRACE=1.
+
+Test: scripted run (boot, Continue, gameplay): no [ch-block] lines without the variable; with it the same lines as
+before.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index f9433e9..7d4b8cd 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1012,4 +1012,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+ 
+-    { static unsigned long bn = 0; unsigned long n = ++bn;
+-      if (n <= 50 || (n % 512) == 0)
++    /* SPU_CH_BLOCK_TRACE: a SPURS kernel idles here (Lr event) all the time,
++     * so the sampled print is still a line every few frames. */
++    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_CH_BLOCK_TRACE") ? 1 : 0;
++      static unsigned long bn = 0; unsigned long n = ++bn;
++      if (s_t && (n <= 50 || (n % 512) == 0))
+         fprintf(stderr, "[ch-block] spu=%X pc=0x%05X op=%s ch=%u evstat=0x%X evmask=0x%X\n",

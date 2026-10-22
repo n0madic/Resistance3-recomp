@@ -2,7 +2,8 @@
 #
 # patches/upstream/*.patch are open pull requests of the toolkit, imported as they are (dropped once the pinned revision
 # contains them); they go on first. Then come the domains of patches/domains.txt for this platform, each one's patches in
-# name order. A domain is one subject area and applies to the pinned revision on its own: no domain needs another.
+# name order. A domain is one subject area and applies to the pinned revision plus those PRs on its own: our patches
+# are kept on top of the PRs (rebased when one changes), and no domain needs another.
 
 r3_platform() {
   case "$(uname -s)" in Darwin) echo darwin ;; Linux) echo linux ;; *) echo windows ;; esac

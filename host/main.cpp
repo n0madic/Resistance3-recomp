@@ -79,6 +79,8 @@ void     ps3_load_prx_modules(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 void     cellGame_init_from_paramsfo(const char* sfo_path);   /* title id, CATEGORY, versions */
+const char* cellGame_get_title(void);                       /* PARAM.SFO TITLE, "" without one */
+void     r3_input_register(void);         /* r3_input.cpp: what the keyboard layout asks the game */
 
 /* The status the guest handed to sys_process_exit. A title that exits that way
  * never returns through ppu_run, so this is only read on the path where the
@@ -271,6 +273,16 @@ static int rsx_backend_init(uint32_t w, uint32_t h, const char* title)
  * that all allocators skip, and log loudly on any overlap. */
 #define R3_HLE_INJECT_BASE 0x5F000000u
 #define R3_HDD0_ROOT  "./gamedata/dev_hdd0"   /* host dir of /dev_hdd0: installed data, saves */
+/* The game's view turn rate (degrees per second) against right-stick deflection from the centre (0-127), at the
+ * default look sensitivity, measured on the first level by holding the stick and reading the camera matrix
+ * (guest 0x0105B4A0) every poll. A dead zone to 23, a slow span to 96 and a steep one to the top rate. */
+#define R3_MOUSE_CURVE_X "23:0,24:0.3,26:0.94,28:1.61,32:2.99,36:4.54,40:6.16,44:7.92,48:9.8,56:13.4,64:18.6," \
+                         "72:24.2,80:30.7,88:37.3,96:46.5,104:80.6,108:100.8,112:120.8,116:139.1,120:161.9," \
+                         "124:194.4,127:206"
+#define R3_MOUSE_CURVE_Y "23:0,24:0.14,28:0.75,32:1.45,36:2.24,40:3.09,48:5.01,56:7.16,64:9.53,72:12.06,80:14.58," \
+                         "88:17.19,96:20.08,104:29.87,112:36.39,116:39.2,120:53.19,127:60"
+#define R3_MOUSE_SENS    "0.25"  /* degrees per point of mouse motion */
+#define R3_MOUSE_AIM_SCALE "0.5" /* times that while aiming (right button): the zoomed view turns slower */
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 
@@ -353,7 +365,9 @@ static void wait_for_rsx_start(void)
 
 static DWORD WINAPI frame_clock(LPVOID)
 {
+    /* Window caption: PS3_TITLE, else the game's name from PARAM.SFO (read before this thread starts). */
     const char* title = getenv("PS3_TITLE");
+    if (!title || !*title) title = cellGame_get_title();
     if (!title || !*title) title = "ps3recomp";
 
     int rsx_ok = (rsx_backend_init(WINDOW_WIDTH, WINDOW_HEIGHT, title) == 0);
@@ -437,6 +451,10 @@ static DWORD WINAPI frame_clock(LPVOID)
              * present freely, so the window is not blank during boot. */
             unsigned fc = cellGcm_flip_request_count();
             if (fc != last_flip && FLIP_ALLOWED()) {
+                /* This flip's pending flag goes with it: left set, the next vblank presented the same frame again,
+                 * and the guest's next flip, finished within that vblank, waited for the one after it (frames
+                 * alternated about 8 and 40 ms apart). */
+                (void)cellGcm_take_flip_pending();
                 present_guest_frame();
                 presented_vblank = vblanks;
                 last_flip = fc;
@@ -596,9 +614,20 @@ int main(int argc, char** argv)
      * memory. The toolkit's default treats subchannel 1 as 3D (another title binds NV4097 there), which dropped
      * every copy and wrote its offsets over the blend registers. */
     set_default_env("GCM_SUBCH1_2D", "1");
-    /* Keyboard play: the arrows walk (left stick) without also pressing the d-pad, which switches weapons and
-     * gadgets in this game; the d-pad moves to T/F/G/H and the camera is I/J/K/L. */
-    set_default_env("PAD_ARROWS_STICK_ONLY", "1");
+    /* The toolkit logs every guest wait ("[WAIT] event_queue_receive ...", about 10k lines a minute here) whenever
+     * stderr is not a terminal, so a run with --log filled the file with them and paid for the writes on every guest
+     * thread. PS3_VERBOSE=1 brings them back for debugging. */
+    set_default_env("PS3_VERBOSE", "0");
+    /* Keyboard and mouse like a PC shooter (cellPad's fps layout): WASD walk, the mouse looks. The game initialises
+     * cellMouse but never reads it. In play the mouse turns the hero directly (r3_input.cpp); elsewhere it moves
+     * the right stick, inverting the game's own stick curve. */
+    set_default_env("PAD_KEYBOARD_LAYOUT", "fps");
+    set_default_env("PAD_MOUSE_CURVE_X", R3_MOUSE_CURVE_X);
+    set_default_env("PAD_MOUSE_CURVE_Y", R3_MOUSE_CURVE_Y);
+    set_default_env("PAD_MOUSE_SENS", R3_MOUSE_SENS);
+    set_default_env("PAD_MOUSE_AIM_SCALE", R3_MOUSE_AIM_SCALE);
+    /* Enter/Esc confirm and go back in the game's menus, and press START elsewhere; the mouse turns the hero. */
+    r3_input_register();
 
     /* The engine keeps a larger colour surface for a smaller clip on the same pitch (toolkit v0.17). Resistance 3
      * alternates 960x640 and 960x704 clips at one address and samples those surfaces with descriptors of their own

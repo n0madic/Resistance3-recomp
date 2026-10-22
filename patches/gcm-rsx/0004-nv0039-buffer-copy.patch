@@ -9,15 +9,33 @@ contexts (local frame buffer or IO-mapped host memory), as RPCS3's nv0039::buffe
 The register-file draw engine strips the subchannel, so it also took every 2D-engine method as NV4097 state (NV0039's
 OFFSET_OUT is BLEND_ENABLE's number). It now gets only what the 3D path takes, plus the driver methods.
 
+The copy's span (PITCH * (LINE_COUNT - 1) + LINE_LENGTH) and the end of the DMA range are computed in 64 bits: in 32
+bits a derailed FIFO's pitch and line count wrapped them to a few bytes, the range passed the bounds check and the copy
+then ran the real offsets gigabytes past the guest window into host memory. Such a copy is now dropped like one from an
+unmapped context, and so is a range past the guest memory the host backs.
+
+tests/gcm_nv0039 (ctest gcm_nv0039) runs a packed and a pitched copy through the FIFO walker, and four that must be
+dropped (a strided and a packed span wrapping 32 bits, a range wrapping the IO space, local memory past the guest
+window), each in a child process: without these checks all four run and die on SIGSEGV/SIGBUS.
+
 Upstream: not proposed yet.
 
 ---
 
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bdd2f85..afe37e3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -400,2 +400,4 @@ if(PS3RECOMP_BUILD_TESTS)
+     if(UNIX)
++        # ...NV0039 buffer copies, and the spans they must not run past.
++        add_subdirectory(tests/gcm_nv0039)
+         add_subdirectory(tests/gcm_reports)
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 0d6dc20..155bf78 100644
+index 3823d87..b624805 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1219,2 +1219,46 @@ static void nv3089_blit(void)
+@@ -1249,2 +1249,57 @@ static void nv3089_blit(void)
  
 +/* NV0039 (memory-to-memory buffer copy), libgcm's subchannel 1: cellGcmSetTransferData
 + * and friends. BUFFER_NOTIFY runs the copy, LINE_COUNT lines of LINE_LENGTH bytes, each
@@ -27,17 +45,28 @@ index 0d6dc20..155bf78 100644
 +    u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, line_length, line_count, format;
 +} s_nv0039;
 +
-+static u8* gcm_dma_ptr(u32 dma, u32 offset, u32 bytes)
++/* Host pointer to `bytes` (1 .. 4 GB) at `offset` in a DMA context, or NULL when the
++ * range leaves the context or the backed guest window. All ends are computed in 64
++ * bits: a derailed FIFO's line count and pitch must fail here, not wrap past it. */
++static u8* gcm_dma_ptr(u32 dma, u32 offset, u64 bytes)
 +{
 +    u32 ea;
++    if (!bytes || bytes > VM_TOTAL_SIZE) return NULL;
++    const u64 last = (u64)offset + bytes - 1;
 +    if (dma == 0xFEED0000u) {                     /* CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER */
-+        if ((u64)offset + bytes > s_config.localSize) return NULL;
++        if (last >= s_config.localSize) return NULL;
 +        ea = s_config.localAddress + offset;
 +    } else {                                     /* host (IO-mapped main) memory */
++        /* TODO: only the first and the last IO page are looked up; a range over
++         * three or more pages whose middle pages map elsewhere copies the wrong
++         * (in-window) guest memory. */
++        if (last > 0xFFFFFFFFu) return NULL;
 +        ea = gcm_io2ea(offset);
-+        if (!ea || gcm_io2ea(offset + (bytes ? bytes - 1 : 0)) != ea + (bytes ? bytes - 1 : 0))
++        if (!ea || gcm_io2ea((u32)last) != (u64)ea + bytes - 1)
 +            return NULL;                         /* unmapped, or not contiguous in EA */
 +    }
++    /* POSIX hosts back ppu_vm_size bytes of guest memory, others all 4 GB (0). */
++    if ((u64)ea + bytes > (ppu_vm_size ? ppu_vm_size : VM_TOTAL_SIZE)) return NULL;
 +    return vm_base + ea;
 +}
 +
@@ -47,8 +76,8 @@ index 0d6dc20..155bf78 100644
 +    if (!len || !lines) return;
 +    const u32 pin  = s_nv0039.pitch_in  ? s_nv0039.pitch_in  : len;
 +    const u32 pout = s_nv0039.pitch_out ? s_nv0039.pitch_out : len;
-+    const u32 span_in  = pin  * (lines - 1) + len;
-+    const u32 span_out = pout * (lines - 1) + len;
++    const u64 span_in  = (u64)pin  * (lines - 1) + len;   /* no wrap: < 2^64 */
++    const u64 span_out = (u64)pout * (lines - 1) + len;
 +    const u8* src = gcm_dma_ptr(s_nv0039.dma_in,  s_nv0039.off_in,  span_in);
 +    u8*       dst = gcm_dma_ptr(s_nv0039.dma_out, s_nv0039.off_out, span_out);
 +    if (!src || !dst) {
@@ -64,7 +93,7 @@ index 0d6dc20..155bf78 100644
 +}
 +
  static void gcm_2d_method(u32 subch, u32 method, u32 data)
-@@ -1249,2 +1293,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+@@ -1279,2 +1334,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
       * headers); other versions use the classic 2 / 4. Accept both. */
 +    if (subch == 1) {                        /* NV0039 buffer copy */
 +        switch (method) {
@@ -81,7 +110,7 @@ index 0d6dc20..155bf78 100644
 +        }
 +    }
      if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
-@@ -2164,5 +2222,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2259,5 +2328,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   * same reason the live engine does, and masks them itself. */
 +                /* Only what the 3D path takes, plus the driver methods: the engine
 +                 * strips the subchannel, so a 2D engine's state (NV0039's OFFSET_OUT
@@ -92,3 +121,248 @@ index 0d6dc20..155bf78 100644
 +                  if (eng && (subch == 0 || (subch == 1 && !s1_2d) || ((subch << 13) | m) >= 0xE000u))
 +                      rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
  
+diff --git a/tests/gcm_nv0039/CMakeLists.txt b/tests/gcm_nv0039/CMakeLists.txt
+new file mode 100644
+index 0000000..074f49d
+--- /dev/null
++++ b/tests/gcm_nv0039/CMakeLists.txt
+@@ -0,0 +1,25 @@
++# ps3recomp - tests/gcm_nv0039
++#
++# NV0039 buffer copies (subchannel 1, GCM_SUBCH1_2D=1) through the cellGcm FIFO
++# walker, with no graphics backend and no lifted game: copies that fit land line
++# by line, copies whose span wraps 32 bits or leaves the guest window are
++# dropped. Built with the runtime (PS3RECOMP_BUILD_TESTS).
++#
++#   ctest --test-dir build-tests -R gcm_nv0039 --output-on-failure
++
++add_executable(test_gcm_nv0039
++    main.c
++    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
++)
++target_link_libraries(test_gcm_nv0039 PRIVATE ps3recomp_runtime)
++if(NOT WIN32)
++    target_link_libraries(test_gcm_nv0039 PRIVATE m)
++endif()
++target_include_directories(test_gcm_nv0039 PRIVATE
++    "${PROJECT_SOURCE_DIR}/libs/video"
++    "${PROJECT_SOURCE_DIR}/include"
++    "${PROJECT_SOURCE_DIR}/runtime"
++)
++# The runtime carries C++, so the C++ driver does the final link.
++set_target_properties(test_gcm_nv0039 PROPERTIES LINKER_LANGUAGE CXX)
++add_test(NAME gcm_nv0039 COMMAND test_gcm_nv0039)
+diff --git a/tests/gcm_nv0039/main.c b/tests/gcm_nv0039/main.c
+new file mode 100644
+index 0000000..c7cdde3
+--- /dev/null
++++ b/tests/gcm_nv0039/main.c
+@@ -0,0 +1,208 @@
++/*
++ * ps3recomp - tests/gcm_nv0039
++ *
++ * NV0039 (memory-to-memory buffer copy, libgcm's subchannel 1) through the
++ * cellGcm FIFO walker, with GCM_SUBCH1_2D=1 and no graphics backend. A small
++ * command ring is built in guest memory and drained with cellGcm_rsx_process_fifo.
++ *
++ *   - a packed and a pitched copy between IO-mapped main memory land, line by
++ *     line, and touch nothing past the last line;
++ *   - copies whose span does not fit are dropped, not run: a line count and pitch
++ *     whose span wraps 32 bits (strided and packed), a range whose end wraps the
++ *     32-bit IO space, and local memory the test's guest window does not back.
++ *     Each of these runs in a child process: a copy that is not dropped runs
++ *     gigabytes past the guest window and kills it, which reads as a FAIL here
++ *     instead of a crash of the whole test.
++ *
++ * Exit code 0 when every check passes.
++ */
++#include "cellGcmSys.h"
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++extern void cellGcm_rsx_process_fifo(void);
++extern void vm_write32(uint64_t addr, uint32_t v);
++extern uint32_t vm_read32(uint64_t addr);
++extern uint32_t ppu_vm_size;
++extern uint32_t ppu_hle_inject_base;
++
++uint8_t* vm_base = NULL;
++
++#define IO_ADDR    0x00100000u      /* command buffer + IO window, io 0 */
++#define IO_SIZE    0x00200000u
++#define CMD_SIZE   0x00010000u
++#define HEAP_BASE  0x00400000u
++
++#define MAIN_DMA   0xFEED0001u      /* CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER */
++#define LOCAL_DMA  0xFEED0000u      /* CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER */
++#define SRC_OFF    0x00020000u      /* IO offsets of the copies, inside the window */
++#define DST_OFF    0x00090000u
++#define SENTINEL   0xA5u
++
++static void gw32(uint32_t ea, uint32_t v)
++{
++    uint8_t* p = vm_base + ea;
++    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
++}
++
++static uint32_t g_heap = HEAP_BASE;
++static u32 host_alloc(u32 size, u32 align)
++{
++    if (!align) align = 4;
++    g_heap = (g_heap + align - 1u) & ~(align - 1u);
++    u32 r = g_heap;
++    g_heap += size;
++    return r;
++}
++static void host_w32(u32 ea, u32 v) { gw32(ea, v); }
++
++static uint32_t g_head, g_cdata, g_ctrl;
++static void emit_word(uint32_t v) { gw32(IO_ADDR + g_head, v); g_head += 4; }
++static void emit1(uint32_t m, uint32_t d)          /* one subchannel-1 method */
++{
++    emit_word((1u << 18) | (1u << 13) | (m & 0x1FFCu));
++    emit_word(d);
++}
++
++static int g_fail;
++#define CHECK(c, ...) do { if (c) printf("[PASS] " __VA_ARGS__); \
++                           else { g_fail++; printf("[FAIL] " __VA_ARGS__); } printf("\n"); } while (0)
++
++typedef struct {
++    uint32_t dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, len, lines;
++} copy_t;
++
++static void emit_copy(const copy_t* c)
++{
++    emit1(0x0184, c->dma_in);
++    emit1(0x0188, c->dma_out);
++    emit1(0x030C, c->off_in);
++    emit1(0x0310, c->off_out);
++    emit1(0x0314, c->pitch_in);
++    emit1(0x0318, c->pitch_out);
++    emit1(0x031C, c->len);
++    emit1(0x0320, c->lines);
++    emit1(0x0324, 0x101u);                           /* FORMAT: 1-byte in/out */
++    emit1(0x0328, 0);                                /* BUFFER_NOTIFY: run it */
++}
++
++/* Hands the ring up to g_head to the walker and drains it. */
++static void run_ring(void)
++{
++    gw32(g_cdata + 0x8, IO_ADDR + g_head);           /* context current */
++    vm_write32(g_ctrl + 0, g_head);                  /* put */
++    cellGcm_rsx_process_fifo();
++}
++
++static void fill_src(void)
++{
++    for (uint32_t i = 0; i < 0x10000u; i++) vm_base[IO_ADDR + SRC_OFF + i] = (uint8_t)(i * 7u + 1u);
++}
++static void fill_dst(void) { memset(vm_base + IO_ADDR + DST_OFF, SENTINEL, IO_SIZE - DST_OFF); }
++
++/* dst line i: the source's line i, then sentinel bytes up to the next line. */
++static int copied(const copy_t* c, uint32_t extent)
++{
++    const uint32_t pin = c->pitch_in ? c->pitch_in : c->len, pout = c->pitch_out ? c->pitch_out : c->len;
++    const uint8_t* d = vm_base + IO_ADDR + DST_OFF;
++    const uint8_t* s = vm_base + IO_ADDR + SRC_OFF;
++    for (uint32_t o = 0; o < extent; o++) {
++        const uint32_t line = o / pout, col = o % pout;
++        const uint8_t want = (line < c->lines && col < c->len) ? s[line * pin + col] : SENTINEL;
++        if (d[o] != want) return 0;
++    }
++    return 1;
++}
++
++static int dst_untouched(uint32_t extent)
++{
++    const uint8_t* d = vm_base + IO_ADDR + DST_OFF;
++    for (uint32_t o = 0; o < extent; o++) if (d[o] != SENTINEL) return 0;
++    return 1;
++}
++
++/* A copy that must be dropped, run in a child: it exits 0 when the walker drained
++ * the ring and the destination (as far as the window goes) still holds sentinels. */
++static void check_dropped(const char* what, const copy_t* c)
++{
++    fill_dst();
++    const uint32_t head0 = g_head;
++    emit_copy(c);
++    const uint32_t put = g_head;
++    g_head = head0;                                  /* the parent's ring stays where it was */
++    const pid_t pid = fork();
++    if (pid == 0) {
++        g_head = put;
++        run_ring();
++        const int ok = vm_read32(g_ctrl + 4) == put && dst_untouched(IO_SIZE - DST_OFF);
++        _exit(ok ? 0 : 1);
++    }
++    int st = 0;
++    if (pid < 0 || waitpid(pid, &st, 0) != pid) { g_fail++; printf("[FAIL] %s: fork/wait\n", what); return; }
++    if (WIFSIGNALED(st))
++        CHECK(0, "%s: dropped (the copy ran and the walker died on signal %d)", what, WTERMSIG(st));
++    else
++        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "%s: dropped, destination untouched (child exit %d)",
++              what, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
++}
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    setenv("GCM_SUBCH1_2D", "1", 1);                 /* subchannel 1 = the 2D engines */
++    /* Up to the HLE inject window, where cellGcmSetupContext puts the control
++     * register and the offset tables; calloc is lazy, so this costs address
++     * space rather than memory. Local memory (0xC0000000) is past its end. */
++    const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
++    vm_base = (uint8_t*)calloc(1, vm_size);
++    if (!vm_base) { printf("[FAIL] guest VM alloc\n"); return 1; }
++    ppu_vm_size = vm_size;
++
++    u32 ctx_out = host_alloc(4, 4);
++    g_cdata = cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
++    g_ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
++    g_head = 0;
++
++    /* Copies that fit: packed, then pitched (in 0x30, out 0x50). */
++    const copy_t packed  = { MAIN_DMA, MAIN_DMA, SRC_OFF, DST_OFF, 0, 0, 0x40, 8 };
++    const copy_t pitched = { MAIN_DMA, MAIN_DMA, SRC_OFF, DST_OFF, 0x30, 0x50, 0x20, 6 };
++    fill_src();
++    fill_dst();
++    emit_copy(&packed);
++    run_ring();
++    CHECK(vm_read32(g_ctrl + 4) == g_head, "packed copy: walker drained the ring (get 0x%X, put 0x%X)",
++          vm_read32(g_ctrl + 4), g_head);
++    CHECK(copied(&packed, 0x40 * 8 + 0x100), "packed copy: 8 lines of 0x40, nothing past them");
++    fill_dst();
++    emit_copy(&pitched);
++    run_ring();
++    CHECK(copied(&pitched, 0x50 * 6 + 0x100), "pitched copy: 6 lines of 0x20, pitch 0x30 -> 0x50");
++
++    /* Spans past 4 GB that wrap to a few bytes in 32 bits: 0x10000 * 0x10000 + 0x10 = 0x10, and
++     * 0x100 * 0x1000000 = 0. */
++    check_dropped("strided span wrapping 32 bits",
++                  &(copy_t){ MAIN_DMA, MAIN_DMA, SRC_OFF, DST_OFF, 0x10000, 0x10000, 0x10, 0x10001 });
++    check_dropped("packed span wrapping 32 bits",
++                  &(copy_t){ MAIN_DMA, MAIN_DMA, SRC_OFF, DST_OFF, 0, 0, 0x100, 0x1000000 });
++    /* A span that fits in 32 bits but runs off the end of IO space: offset + 0xFFFFFFF0 - 1
++     * wraps to an offset in the same mapped page, at the same distance from the start. */
++    check_dropped("IO range wrapping the 32-bit IO space",
++                  &(copy_t){ MAIN_DMA, MAIN_DMA, SRC_OFF, DST_OFF, 0, 0, 0xFFFFFFF0u, 1 });
++    /* Local memory is in range of its context but not backed here (past ppu_vm_size). */
++    check_dropped("local memory past the backed guest window",
++                  &(copy_t){ MAIN_DMA, LOCAL_DMA, SRC_OFF, 0x1000, 0, 0, 0x100, 4 });
++
++    /* The parent's walker still copies after the dropped ones were only ever run in children. */
++    fill_dst();
++    emit_copy(&pitched);
++    run_ring();
++    CHECK(copied(&pitched, 0x50 * 6 + 0x100), "pitched copy again after the dropped ones");
++
++    printf("[gcm_nv0039] %s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
++    free(vm_base);
++    return g_fail ? 1 : 0;
++}

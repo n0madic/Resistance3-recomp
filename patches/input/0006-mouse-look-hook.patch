@@ -1,0 +1,163 @@
+cellPad: a host look hook for the fps layout, so the mouse turns the view past the stick's top rate.
+
+The fps layout turns mouse motion into right-stick deflection. A stick only asks the title for a turn rate, and the
+title caps it: in Resistance 3 at about 206 degrees/s across and 60 up and down, so a fast swipe turns less than the
+mouse moved and looking behind takes several swipes. cellPad_set_mouse_look(fn) registers a host function that turns
+the view itself, by degrees: yaw > 0 right, pitch > 0 up, the motion times PAD_MOUSE_SENS, times PAD_MOUSE_AIM_SCALE
+(new, default 1) while the right button (aim) is held. If it returns non-zero the right stick stays centred; if it
+returns 0 (the title's view cannot be turned now: menu, cutscene) the motion moves the stick as before. Without a hook
+nothing changes. PAD_MOUSE_SENS is now read in one place for both paths.
+
+Test: libs/input/tests/test_pad_keyboard_fps.c test_mouse_look_hook (degrees and signs, aim scale, no call without
+motion, declined -> stick, no hook). Scripted run: the host's hook turns the hero (host/r3_input.cpp).
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 2572ba5..7617caa 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -400,2 +400,18 @@ static void pad_mouse_curve_env(const char* name, PadStickCurve* c)
+ 
++/* A positive number from the environment, else `def`. */
++static double pad_env_positive(const char* name, double def)
++{
++    const char* e = getenv(name);
++    const double v = e ? strtod(e, NULL) : 0;
++    return v > 0 ? v : def;
++}
++
++/* PAD_MOUSE_SENS: the turn per point of mouse motion, in the curves' rate unit (degrees with a look hook). */
++static double pad_mouse_sens(void)
++{
++    static double sens;
++    if (!sens) sens = pad_env_positive("PAD_MOUSE_SENS", 1.0);
++    return sens;
++}
++
+ /* Mouse motion `dx`, `dy` (points) over `dt` seconds -> right stick. */
+@@ -405,3 +421,2 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+     static PadStickCurve cx, cy;
+-    static double sens = 1.0;
+     if (!init) {
+@@ -410,4 +425,2 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+         pad_mouse_curve_env("PAD_MOUSE_CURVE_Y", &cy);
+-        const char* e = getenv("PAD_MOUSE_SENS");
+-        if (e && strtod(e, NULL) > 0) sens = strtod(e, NULL);
+     }
+@@ -415,2 +428,3 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+     if (dt > PAD_MOUSE_MAX_DT_S) dt = PAD_MOUSE_MAX_DT_S;
++    const double sens = pad_mouse_sens();
+     const double vx = dx * sens / dt, vy = dy * sens / dt;
+@@ -425,5 +439,23 @@ void cellPad_set_menu_query(int (*in_menu)(void)) { s_menu_query = in_menu; }
+ 
++static int (*s_mouse_look)(double yaw_deg, double pitch_deg);
++void cellPad_set_mouse_look(int (*look)(double yaw_deg, double pitch_deg)) { s_mouse_look = look; }
++
++/* Mouse motion -> the view: through the host's look hook if it takes it, else the right stick. */
++static void pad_mouse_view(const PadMouseInput* m, double dt, PadHostState* hs)
++{
++    static double aim_scale;
++    if (!aim_scale) aim_scale = pad_env_positive("PAD_MOUSE_AIM_SCALE", 1.0);
++    if (s_mouse_look && (m->dx || m->dy)) {
++        const double deg = pad_mouse_sens() * ((m->buttons & PAD_MOUSE_RIGHT) ? aim_scale : 1.0);
++        if (s_mouse_look(m->dx * deg, -m->dy * deg)) {
++            hs->analog_rx = hs->analog_ry = 128;
++            return;
++        }
++    }
++    pad_mouse_stick(m->dx, m->dy, dt, &hs->analog_rx, &hs->analog_ry);
++}
++
+ /* PAD_KEYBOARD_LAYOUT=fps: a PC shooter's keyboard and mouse in place of the
+- * pad-shaped layout above. WASD = left stick, mouse = right stick (see
+- * pad_mouse_stick), left/right/middle button = R1/L1/R3, wheel = TRIANGLE,
++ * pad-shaped layout above. WASD = left stick, mouse = the view (see
++ * pad_mouse_view), left/right/middle button = R1/L1/R3, wheel = TRIANGLE,
+  * Space = CROSS, C/Ctrl/Backspace = CIRCLE, E/R = SQUARE, Q = TRIANGLE,
+@@ -475,3 +507,3 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+     const double now = pad_now_s();
+-    pad_mouse_stick(m.dx, m.dy, last_s ? now - last_s : PAD_MOUSE_MAX_DT_S, &hs->analog_rx, &hs->analog_ry);
++    pad_mouse_view(&m, last_s ? now - last_s : PAD_MOUSE_MAX_DT_S, hs);
+     last_s = now;
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+index 42761fc..2cec2c7 100644
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -207,2 +207,9 @@ void cellPad_set_menu_query(int (*in_menu)(void));
+ 
++/* Host hook for the shooter layout: turns the title's view straight by the mouse's motion, so the turn is not capped
++ * at the stick's top rate. `yaw_deg` > 0 turns right, `pitch_deg` > 0 looks up: the motion times PAD_MOUSE_SENS,
++ * times PAD_MOUSE_AIM_SCALE while the right button (aim) is held. Returns non-zero if it turned the view (the right
++ * stick then stays centred) and 0 if it cannot now (menu, cutscene), when the motion moves the stick as without a
++ * hook. Called from the pad poll, on the thread that reads the pad, for each poll with motion. */
++void cellPad_set_mouse_look(int (*look)(double yaw_deg, double pitch_deg));
++
+ #ifdef __cplusplus
+diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
+index 4448758..1f179d8 100644
+--- a/libs/input/tests/test_pad_keyboard_fps.c
++++ b/libs/input/tests/test_pad_keyboard_fps.c
+@@ -2,3 +2,4 @@
+  * mouse-button map, WASD on the left stick, and mouse motion turned into
+- * right-stick deflection through the title's stick curve (PAD_MOUSE_CURVE_*).
++ * right-stick deflection through the title's stick curve (PAD_MOUSE_CURVE_*) or
++ * handed to the host's look hook.
+  *
+@@ -179,2 +180,46 @@ static void test_menu_keys(void)
+ 
++/* Motion goes to the look hook in degrees (PAD_MOUSE_SENS, PAD_MOUSE_AIM_SCALE with the right button) and the
++ * stick stays centred; when the hook declines, the stick moves as without one. */
++static int s_look_ok, s_look_calls;
++static double s_yaw, s_pitch;
++static int fake_look(double yaw_deg, double pitch_deg)
++{
++    s_look_calls++;
++    s_yaw = yaw_deg;
++    s_pitch = pitch_deg;
++    return s_look_ok;
++}
++static void test_mouse_look_hook(void)
++{
++    PadHostState hs;
++    memset(&hs, 0, sizeof hs);
++    memset(s_keys, 0, sizeof s_keys);
++    cellPad_set_mouse_look(fake_look);
++
++    s_look_ok = 1;
++    s_mouse.dx = 100;                                    /* right and up: 0.5 degrees per point */
++    s_mouse.dy = -20;
++    pad_keyboard_fps(&hs);
++    assert(s_look_calls == 1 && s_yaw == 50 && s_pitch == 10);
++    assert(hs.analog_rx == 128 && hs.analog_ry == 128);
++
++    s_mouse.dx = 10;                                     /* aiming: times PAD_MOUSE_AIM_SCALE */
++    s_mouse.buttons = PAD_MOUSE_RIGHT;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_L1);
++    assert(s_look_calls == 2 && s_yaw == 1.25 && s_pitch == 0);
++
++    pad_keyboard_fps(&hs);                               /* no motion: not asked */
++    assert(s_look_calls == 2);
++
++    s_look_ok = 0;                                       /* declined: the stick */
++    s_mouse.dx = 100;
++    pad_keyboard_fps(&hs);
++    assert(s_look_calls == 3 && hs.analog_rx == 255);
++
++    cellPad_set_mouse_look(NULL);
++    s_mouse.dx = 100;
++    pad_keyboard_fps(&hs);
++    assert(s_look_calls == 3 && hs.analog_rx == 255);
++}
++
+ /* The whole poll, unfocused (no window here): everything released, the mouse too. */
+@@ -195,2 +240,3 @@ int main(void)
+     setenv("PAD_MOUSE_SENS", "0.5", 1);
++    setenv("PAD_MOUSE_AIM_SCALE", "0.25", 1);
+     test_curve_parse();
+@@ -201,2 +247,3 @@ int main(void)
+     test_menu_keys();
++    test_mouse_look_hook();
+     test_unfocused_releases_mouse();

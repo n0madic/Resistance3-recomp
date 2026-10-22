@@ -1,0 +1,21 @@
+ppu_fs: the "[fs] open" line only with PS3_FSLOG, like the other per-call file traces.
+
+cellFsOpen printed every successful open. Resistance 3 opens sound banks, level chunks and streamed data throughout
+play, so the log fills with "[fs] open '/dev_hdd0/.../resident_sound.dat' -> fd 68" lines. stat, opendir and mkdir
+already print only with PS3_FSLOG; open now does too. Failed opens and FS_CALLER output are unchanged.
+
+Test: scripted run (boot, Continue, gameplay): no "[fs] open" lines without PS3_FSLOG; with it the same lines as before.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 430de13..da178b1 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -320,3 +320,3 @@ static void cellFsOpen(ppu_context* ctx)
+           } }
+-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
++      else if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {

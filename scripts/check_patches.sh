@@ -3,12 +3,13 @@
 #
 #   scripts/check_patches.sh [rev]       rev: a commit or tag of the toolkit clone (default: the pin in build_host.sh)
 #
-# For each patch, against the unpatched revision:
+# First the imported upstream PRs (patches/upstream, in name order) against the revision, then each domain's patches
+# against the revision with those PRs on (the base our own patches are kept on):
 #   INCLUDED  the revision already has this change (reverse-applies): drop the patch
-#   APPLIES   applies after the earlier patches of its domain
+#   APPLIES   applies after the earlier patches (upstream PRs: the earlier PRs; domains: the PRs and its domain's own)
 #   CONFLICT  neither: the revision changed the same code; rebase the patch, or drop the part upstream now has
-# Then the independence of the domains: each applies on its own, and all of them in three different orders give the
-# same tree. Every patch header must carry an "Upstream:" line. Exit status 1 when anything is wrong.
+# Then the independence of the domains: each applies to the base on its own, and all of them in three different orders
+# give the same tree. Every patch header must carry an "Upstream:" line. Exit status 1 when anything is wrong.
 # Only needs git and the toolkit clone in build/ps3recomp (git fetch --tags there for a newer revision).
 set -euo pipefail
 
@@ -28,28 +29,35 @@ git -c advice.detachedHead=false checkout -q -f "$REV"
 REV="$(git rev-parse HEAD)"
 bad=0
 
-reset() { git checkout -q -f "$REV"; git clean -fdq; }
+# classify <patch>: print its state against the current tree and apply it if it applies
+classify() {
+  local p="$1" name="${1#"$PATCHES"/}"
+  if git apply --check -R "$p" 2>/dev/null && ! git apply --check "$p" 2>/dev/null; then
+    echo "  INCLUDED  $name"; bad=1
+  elif git apply --check "$p" 2>/dev/null; then
+    git apply "$p"; echo "  APPLIES   $name"
+  else
+    echo "  CONFLICT  $name"; bad=1
+  fi
+  grep -q '^Upstream:' "$p" || { echo "  NO Upstream: LINE  $name"; bad=1; }
+}
 
 echo "toolkit $REV"
+echo "== upstream PRs"
+for p in "$PATCHES"/upstream/*.patch; do [[ -f "$p" ]] && classify "$p"; done
+git add -A
+BASE="$(git -c user.name=check -c user.email=check@localhost commit -q --allow-empty -m "upstream PRs" && git rev-parse HEAD)"
+
+reset() { git checkout -q -f "$BASE"; git clean -fdq; }
 echo "== patches (platform $(r3_platform))"
 domains=()
 while read -r dom plats; do
   domains+=("$dom")
   reset
-  while IFS= read -r p; do
-    name="${p#"$PATCHES"/}"
-    if git apply --check -R "$p" 2>/dev/null && ! git apply --check "$p" 2>/dev/null; then
-      echo "  INCLUDED  $name"; bad=1
-    elif git apply --check "$p" 2>/dev/null; then
-      git apply "$p"; echo "  APPLIES   $name"
-    else
-      echo "  CONFLICT  $name"; bad=1
-    fi
-    grep -q '^Upstream:' "$p" || { echo "  NO Upstream: LINE  $name"; bad=1; }
-  done < <(r3_domain_patches "$PATCHES" "$dom")
+  while IFS= read -r p; do classify "$p"; done < <(r3_domain_patches "$PATCHES" "$dom")
 done < <(r3_domains "$PATCHES")
 
-# applies every patch of the given domains, in order, onto the clean revision; prints the tree
+# applies every patch of the given domains, in order, onto the base; prints the tree
 tree_of() {
   reset
   local dom p

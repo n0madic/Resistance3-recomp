@@ -11,8 +11,10 @@
 # Needs dist/host/r3_host (scripts/build_host.sh), module/game.dylib (scripts/build_module.py) and the decrypted
 # game in PS3_GAME/ (PARAM.SFO and USRDIR/EBOOT.elf). Other environment variables are passed through to the host.
 #
-# Keyboard: arrows walk, I/J/K/L camera, Z/X/A/S cross/circle/square/triangle, Q/W L1/R1, 1/2 L2/R2,
-# C/V L3/R3, T/F/G/H d-pad, Enter start, Tab select.
+# Keyboard and mouse: WASD walk, mouse look, left/right button fire/aim, middle or V melee, wheel or Q weapons,
+# Space jump, C/Ctrl crouch, E/R reload/use, G grenade, F secondary fire, Shift sprint, arrows or 1-4 d-pad,
+# Tab select; Enter/Esc select/back in menus and start/pause elsewhere.
+# PAD_MOUSE_SENS=<degrees per point> sets the mouse speed, PAD_MOUSE_AIM_SCALE=<factor> its share while aiming.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,7 +32,7 @@ while [ $# -gt 0 ]; do
         --lang)
             [ $# -gt 0 ] || { echo "--lang needs a language code (see --help)" >&2; exit 2; }
             export PS3_LANG="$1"; shift ;;
-        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
     esac
 done

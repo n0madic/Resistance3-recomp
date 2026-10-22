@@ -99,6 +99,7 @@ add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
     r3_hle.cpp
+    r3_input.cpp
     spurs_lfqueue.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}

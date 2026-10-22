@@ -1,0 +1,114 @@
+cellPad: Enter/Esc confirm and go back in menus (fps layout), from a host menu query.
+
+On a PC Enter confirms and Esc goes back in a menu, and Esc pauses in the game. Resistance 3's menus confirm with CROSS
+and go back with CIRCLE, and START there means "player 2 join"; only the "Press START" screen and the game itself want
+START. The keyboard cannot tell these apart, so the host says: cellPad_set_menu_query(fn) registers a function that is
+non-zero while the title shows a menu (the host reads the game's own flags for it). In a menu Enter = CROSS and
+Esc = CIRCLE; elsewhere both press START. A key keeps the button it got when it went down until it is released: Esc
+pauses, the pause menu opens while the key is still held, and it must not become CIRCLE there and close the menu again
+(the same for Enter starting a level). Without a query nothing changes.
+
+Test: libs/input/tests/test_pad_keyboard_fps.c test_menu_keys (both keys in and out of a menu, held across a context
+change, no hook). Scripted run: the host's query follows the title screen, menus, pause and gameplay.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 276d768..2572ba5 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -422,2 +422,5 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+ 
++static int (*s_menu_query)(void);
++void cellPad_set_menu_query(int (*in_menu)(void)) { s_menu_query = in_menu; }
++
+ /* PAD_KEYBOARD_LAYOUT=fps: a PC shooter's keyboard and mouse in place of the
+@@ -427,3 +430,4 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+  * G/F = L2/R2, Shift = L3, V = R3, arrows and 1/2/3/4 = d-pad (up, right,
+- * down, left), Esc/Enter = START, Tab = SELECT. What a button does is the
++ * down, left), Enter/Esc = CROSS/CIRCLE in a menu and START elsewhere,
++ * Tab = SELECT. What a button does is the
+  * title's; this follows the usual shooter one (R1 fires, L1 aims, L3 sprints,
+@@ -443,3 +447,2 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+         { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_4,      CELL_PAD_CTRL_LEFT },
+-        { PADKEY_ESCAPE, CELL_PAD_CTRL_START },   { PADKEY_RETURN, CELL_PAD_CTRL_START },
+         { PADKEY_TAB,    CELL_PAD_CTRL_SELECT },
+@@ -451,2 +454,15 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+ 
++    /* Enter and Esc confirm and go back in a menu (cellPad_set_menu_query) and press START (start, pause, skip)
++     * elsewhere. A key keeps the button it got when it went down until it is released: Esc pauses, the pause menu
++     * opens while the key is still held, and it must not turn into CIRCLE there and close the menu again. */
++    static const struct { int vk; u16 menu_btn; } ctx_keys[] = {
++        { PADKEY_RETURN, CELL_PAD_CTRL_CROSS }, { PADKEY_ESCAPE, CELL_PAD_CTRL_CIRCLE },
++    };
++    static u16 ctx_held[sizeof ctx_keys / sizeof ctx_keys[0]];
++    for (unsigned i = 0; i < sizeof ctx_keys / sizeof ctx_keys[0]; i++) {
++        if (!pad_key_down(ctx_keys[i].vk)) ctx_held[i] = 0;
++        else if (!ctx_held[i]) ctx_held[i] = s_menu_query && s_menu_query() ? ctx_keys[i].menu_btn : CELL_PAD_CTRL_START;
++        btns |= ctx_held[i];
++    }
++
+     const int lx = pad_key_down(PADKEY_D) - pad_key_down(PADKEY_A);
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+index 89c58ab..42761fc 100644
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -202,2 +202,7 @@ void cellPad_poll(void);
+ 
++/* Host hook for the keyboard fallback's shooter layout (PAD_KEYBOARD_LAYOUT=fps): non-zero while the title shows a
++ * menu, where Enter confirms (CROSS) and Esc goes back (CIRCLE) instead of pressing START. Called from the pad poll,
++ * on the thread that reads the pad. Without one (the default) there is never a menu. */
++void cellPad_set_menu_query(int (*in_menu)(void));
++
+ #ifdef __cplusplus
+diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
+index 5b5f340..4448758 100644
+--- a/libs/input/tests/test_pad_keyboard_fps.c
++++ b/libs/input/tests/test_pad_keyboard_fps.c
+@@ -141,2 +141,40 @@ static void test_fps_layout(void)
+ 
++/* Enter and Esc follow the host's menu query, and keep the button they got until released. */
++static int s_menu;
++static int fake_menu(void) { return s_menu; }
++static void test_menu_keys(void)
++{
++    PadHostState hs;
++    memset(&hs, 0, sizeof hs);
++    memset(s_keys, 0, sizeof s_keys);
++    cellPad_set_menu_query(fake_menu);
++
++    s_menu = 1;
++    s_keys[PADKEY_RETURN] = 1;                           /* confirm in a menu */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CROSS);
++    s_menu = 0;                                          /* it started the game: still CROSS while held */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CROSS);
++    s_keys[PADKEY_RETURN] = 0;
++    assert(pad_keyboard_fps(&hs) == 0);
++
++    s_keys[PADKEY_ESCAPE] = 1;                           /* pause in the game */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_START);
++    s_menu = 1;                                          /* the pause menu opened: still START while held */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_START);
++    s_keys[PADKEY_ESCAPE] = 0;
++    assert(pad_keyboard_fps(&hs) == 0);
++    s_keys[PADKEY_ESCAPE] = 1;                           /* pressed again in the menu: back */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CIRCLE);
++    s_keys[PADKEY_RETURN] = 1;                           /* both at once */
++    assert(pad_keyboard_fps(&hs) == (CELL_PAD_CTRL_CIRCLE | CELL_PAD_CTRL_CROSS));
++
++    memset(s_keys, 0, sizeof s_keys);
++    pad_keyboard_fps(&hs);
++    cellPad_set_menu_query(NULL);
++    s_keys[PADKEY_RETURN] = 1;                           /* no hook: never a menu */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_START);
++    memset(s_keys, 0, sizeof s_keys);
++    pad_keyboard_fps(&hs);
++}
++
+ /* The whole poll, unfocused (no window here): everything released, the mouse too. */
+@@ -162,2 +200,3 @@ int main(void)
+     test_fps_layout();
++    test_menu_keys();
+     test_unfocused_releases_mouse();

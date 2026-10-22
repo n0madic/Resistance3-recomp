@@ -1,0 +1,670 @@
+cellPad: PAD_KEYBOARD_LAYOUT=fps, a shooter's keyboard and mouse (mouse look on macOS).
+
+The pad-shaped keyboard layout cannot aim in Resistance 3: keys hold the right stick at full deflection, so the view
+only turns at the game's top rate. The game initialises cellMouse but never reads it (no cellMouseGetData import), so
+the mouse has to come in through the pad.
+
+With PAD_KEYBOARD_LAYOUT=fps: WASD = left stick, mouse = right stick, left/right/middle button = R1/L1/R3, wheel =
+TRIANGLE, Space = CROSS, C/Ctrl/Backspace = CIRCLE, E/R = SQUARE, Q = TRIANGLE, G/F = L2/R2, Shift = L3, V = R3,
+arrows and 1-4 = d-pad, Esc/Enter = START, Tab = SELECT. Each poll the right stick gets the deflection at which the
+title turns as fast as the mouse moved since the previous poll: PAD_MOUSE_CURVE_X/_Y give the title's turn rate against
+deflection ("deflection:rate,...", the dead zone and curve included), PAD_MOUSE_SENS the rate per point of motion.
+The view then turns by a fixed angle per point, up to the title's top stick rate. The macOS mouse
+(pad_mouse_macos.m: a local NSEvent monitor, cursor hidden and detached from the mouse while the window is in the
+foreground, released on focus loss) is the only host mouse so far; other hosts get the keyboard part (TODO in cellPad.c).
+
+Test: libs/input/tests/test_pad_keyboard_fps.c (curve parsing and inversion, stick bytes, the key and button map,
+release on focus loss; build line in the file). test_pad_rumble stubs the new mouse call. Scripted run: walking and
+turning in the first level with the layout on.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9e468f3..29583a1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -71,2 +71,4 @@ if(APPLE)
+     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
++    # The pad's host mouse (pad_mouse.h), also Objective-C.
++    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_mouse_macos.m")
+ endif()
+@@ -175,2 +177,3 @@ if(APPLE)
+         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
++        "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_mouse_macos.m"
+         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index ed4e454..276d768 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -21,2 +21,3 @@
+ #include "ps3emu/log_first.h"
++#include "pad_mouse.h"
+ 
+@@ -182,2 +183,14 @@ static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0;
+ #define PADKEY_V 'V'
++#define PADKEY_D 'D'
++#define PADKEY_E 'E'
++#define PADKEY_R 'R'
++#define PADKEY_F 'F'
++#define PADKEY_G 'G'
++#define PADKEY_3 '3'
++#define PADKEY_4 '4'
++#define PADKEY_SPACE VK_SPACE
++#define PADKEY_ESCAPE VK_ESCAPE
++#define PADKEY_BACKSPACE VK_BACK
++#define PADKEY_SHIFT VK_LSHIFT
++#define PADKEY_CTRL VK_LCONTROL
+ #elif defined(__APPLE__)
+@@ -224,2 +237,14 @@ static int pad_key_down(int key)
+ #define PADKEY_V 9
++#define PADKEY_D 2
++#define PADKEY_E 14
++#define PADKEY_R 15
++#define PADKEY_F 3
++#define PADKEY_G 5
++#define PADKEY_3 20
++#define PADKEY_4 21
++#define PADKEY_SPACE 49
++#define PADKEY_ESCAPE 53
++#define PADKEY_BACKSPACE 51
++#define PADKEY_SHIFT 56
++#define PADKEY_CTRL 59
+ #elif PAD_BACKEND_SDL2
+@@ -256,2 +281,14 @@ static int pad_key_down(int key)
+ #define PADKEY_V SDL_SCANCODE_V
++#define PADKEY_D SDL_SCANCODE_D
++#define PADKEY_E SDL_SCANCODE_E
++#define PADKEY_R SDL_SCANCODE_R
++#define PADKEY_F SDL_SCANCODE_F
++#define PADKEY_G SDL_SCANCODE_G
++#define PADKEY_3 SDL_SCANCODE_3
++#define PADKEY_4 SDL_SCANCODE_4
++#define PADKEY_SPACE SDL_SCANCODE_SPACE
++#define PADKEY_ESCAPE SDL_SCANCODE_ESCAPE
++#define PADKEY_BACKSPACE SDL_SCANCODE_BACKSPACE
++#define PADKEY_SHIFT SDL_SCANCODE_LSHIFT
++#define PADKEY_CTRL SDL_SCANCODE_LCTRL
+ #endif
+@@ -259,2 +296,175 @@ static int pad_key_down(int key)
+ #if defined(_WIN32) || defined(__APPLE__) || PAD_BACKEND_SDL2
++#ifndef __APPLE__
++/* TODO: a host mouse on Windows and the SDL hosts (pad_mouse.h); until then the
++ * fps layout there has the keyboard part only. */
++void pad_mouse_poll(int capture, PadMouseInput* out) { (void)capture; memset(out, 0, sizeof *out); }
++#endif
++
++static double pad_now_s(void)
++{
++#ifdef _WIN32
++    return (double)GetTickCount64() / 1000.0;
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
++#endif
++}
++
++/* Mouse look for the fps layout. A title turns the view at a rate that is some
++ * function of the stick's deflection, usually with a dead zone and a curve.
++ * PAD_MOUSE_CURVE_X / PAD_MOUSE_CURVE_Y describe that function as points
++ * "deflection:rate,..." (deflection 0-127 from the centre, increasing; rate in
++ * any unit per second, non-decreasing, the first one 0), and PAD_MOUSE_SENS is
++ * that unit per point of mouse motion. Each poll the stick gets the deflection
++ * whose rate matches the mouse's speed since the previous poll, so the view
++ * turns by PAD_MOUSE_SENS per point -- up to the title's top rate, which a stick
++ * cannot exceed. Without a curve the stick is linear and full at
++ * PAD_MOUSE_DEFAULT_FULL_RATE points per second. */
++#define PAD_MOUSE_MAX_POINTS        32
++#define PAD_MOUSE_DEFAULT_FULL_RATE 1000.0
++/* The mouse's speed is its motion over the time since the previous poll, with
++ * that time clamped: two polls close together must not turn a twitch into a
++ * full deflection, and a title that stopped polling for a while (loading) must
++ * not see the motion spread over seconds as a crawl. */
++#define PAD_MOUSE_MIN_DT_S          0.008
++#define PAD_MOUSE_MAX_DT_S          0.1
++/* A wheel click holds TRIANGLE this long, so a title polling at a few frames a
++ * second still sees it. */
++#define PAD_MOUSE_WHEEL_HOLD_S      0.1
++
++typedef struct {
++    int    n;
++    double defl[PAD_MOUSE_MAX_POINTS];
++    double rate[PAD_MOUSE_MAX_POINTS];
++} PadStickCurve;
++
++/* Parses "deflection:rate,..."; 0 (and *c untouched) if it is not a valid curve. */
++static int pad_curve_parse(const char* s, PadStickCurve* c)
++{
++    PadStickCurve t;
++    t.n = 0;
++    while (s && *s) {
++        char* end;
++        const double d = strtod(s, &end);
++        if (end == s || *end != ':') return 0;
++        s = end + 1;
++        const double r = strtod(s, &end);
++        if (end == s || t.n == PAD_MOUSE_MAX_POINTS) return 0;
++        if (d < 0 || d > 127 || r < 0) return 0;
++        if (t.n == 0 ? r != 0 : (d <= t.defl[t.n - 1] || r < t.rate[t.n - 1])) return 0;
++        t.defl[t.n] = d;
++        t.rate[t.n] = r;
++        t.n++;
++        s = end;
++        while (*s == ',' || *s == ' ') s++;
++    }
++    if (t.n < 2 || t.rate[t.n - 1] <= 0) return 0;
++    *c = t;
++    return 1;
++}
++
++/* The deflection (0-127) at which the curve turns at `rate` (>= 0); the last
++ * point's beyond the top rate. No motion is the centre, not the dead zone's edge. */
++static double pad_curve_deflection(const PadStickCurve* c, double rate)
++{
++    if (rate <= 0) return 0;
++    for (int i = 1; i < c->n; i++) {
++        if (rate <= c->rate[i]) {
++            const double span = c->rate[i] - c->rate[i - 1];
++            const double f = span > 0 ? (rate - c->rate[i - 1]) / span : 1.0;
++            return c->defl[i - 1] + f * (c->defl[i] - c->defl[i - 1]);
++        }
++    }
++    return c->defl[c->n - 1];
++}
++
++/* -127..127 from the centre -> the stick byte; full left is 0, full right 255. */
++static u8 pad_stick_byte(double defl)
++{
++    const double v = defl < 0 ? 128.0 + defl * (128.0 / 127.0) : 128.0 + defl;
++    const long b = lround(v);
++    return (u8)(b < 0 ? 0 : b > 255 ? 255 : b);
++}
++
++static void pad_mouse_curve_env(const char* name, PadStickCurve* c)
++{
++    c->n = 2;
++    c->defl[0] = 0;   c->rate[0] = 0;
++    c->defl[1] = 127; c->rate[1] = PAD_MOUSE_DEFAULT_FULL_RATE;
++    const char* e = getenv(name);
++    if (e && *e && !pad_curve_parse(e, c))
++        printf("[cellPad] %s=\"%s\" is not a curve (\"deflection:rate,...\", both increasing, "
++               "first rate 0): the stick stays linear\n", name, e);
++}
++
++/* Mouse motion `dx`, `dy` (points) over `dt` seconds -> right stick. */
++static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
++{
++    static int init;
++    static PadStickCurve cx, cy;
++    static double sens = 1.0;
++    if (!init) {
++        init = 1;
++        pad_mouse_curve_env("PAD_MOUSE_CURVE_X", &cx);
++        pad_mouse_curve_env("PAD_MOUSE_CURVE_Y", &cy);
++        const char* e = getenv("PAD_MOUSE_SENS");
++        if (e && strtod(e, NULL) > 0) sens = strtod(e, NULL);
++    }
++    if (dt < PAD_MOUSE_MIN_DT_S) dt = PAD_MOUSE_MIN_DT_S;
++    if (dt > PAD_MOUSE_MAX_DT_S) dt = PAD_MOUSE_MAX_DT_S;
++    const double vx = dx * sens / dt, vy = dy * sens / dt;
++    const double ax = pad_curve_deflection(&cx, fabs(vx));
++    const double ay = pad_curve_deflection(&cy, fabs(vy));
++    *rx = pad_stick_byte(vx < 0 ? -ax : ax);
++    *ry = pad_stick_byte(vy < 0 ? -ay : ay);
++}
++
++/* PAD_KEYBOARD_LAYOUT=fps: a PC shooter's keyboard and mouse in place of the
++ * pad-shaped layout above. WASD = left stick, mouse = right stick (see
++ * pad_mouse_stick), left/right/middle button = R1/L1/R3, wheel = TRIANGLE,
++ * Space = CROSS, C/Ctrl/Backspace = CIRCLE, E/R = SQUARE, Q = TRIANGLE,
++ * G/F = L2/R2, Shift = L3, V = R3, arrows and 1/2/3/4 = d-pad (up, right,
++ * down, left), Esc/Enter = START, Tab = SELECT. What a button does is the
++ * title's; this follows the usual shooter one (R1 fires, L1 aims, L3 sprints,
++ * R3 melees). The cursor is captured while the window is in the foreground. */
++static u16 pad_keyboard_fps(PadHostState* hs)
++{
++    static const struct { int vk; u16 btn; } map[] = {
++        { PADKEY_SPACE,  CELL_PAD_CTRL_CROSS },   { PADKEY_C,      CELL_PAD_CTRL_CIRCLE },
++        { PADKEY_CTRL,   CELL_PAD_CTRL_CIRCLE },  { PADKEY_BACKSPACE, CELL_PAD_CTRL_CIRCLE },
++        { PADKEY_E,      CELL_PAD_CTRL_SQUARE },  { PADKEY_R,      CELL_PAD_CTRL_SQUARE },
++        { PADKEY_Q,      CELL_PAD_CTRL_TRIANGLE },
++        { PADKEY_G,      CELL_PAD_CTRL_L2 },      { PADKEY_F,      CELL_PAD_CTRL_R2 },
++        { PADKEY_SHIFT,  CELL_PAD_CTRL_L3 },      { PADKEY_V,      CELL_PAD_CTRL_R3 },
++        { PADKEY_UP,     CELL_PAD_CTRL_UP },      { PADKEY_1,      CELL_PAD_CTRL_UP },
++        { PADKEY_RIGHT,  CELL_PAD_CTRL_RIGHT },   { PADKEY_2,      CELL_PAD_CTRL_RIGHT },
++        { PADKEY_DOWN,   CELL_PAD_CTRL_DOWN },    { PADKEY_3,      CELL_PAD_CTRL_DOWN },
++        { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_4,      CELL_PAD_CTRL_LEFT },
++        { PADKEY_ESCAPE, CELL_PAD_CTRL_START },   { PADKEY_RETURN, CELL_PAD_CTRL_START },
++        { PADKEY_TAB,    CELL_PAD_CTRL_SELECT },
++    };
++    static double last_s, wheel_until;
++    u16 btns = 0;
++    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
++        if (pad_key_down(map[i].vk)) btns |= map[i].btn;
++
++    const int lx = pad_key_down(PADKEY_D) - pad_key_down(PADKEY_A);
++    const int ly = pad_key_down(PADKEY_S) - pad_key_down(PADKEY_W);
++    hs->analog_lx = (u8)(lx < 0 ? 0 : lx > 0 ? 255 : 128);
++    hs->analog_ly = (u8)(ly < 0 ? 0 : ly > 0 ? 255 : 128);
++
++    PadMouseInput m;
++    pad_mouse_poll(1, &m);
++    const double now = pad_now_s();
++    pad_mouse_stick(m.dx, m.dy, last_s ? now - last_s : PAD_MOUSE_MAX_DT_S, &hs->analog_rx, &hs->analog_ry);
++    last_s = now;
++    if (m.buttons & PAD_MOUSE_LEFT)   btns |= CELL_PAD_CTRL_R1;
++    if (m.buttons & PAD_MOUSE_RIGHT)  btns |= CELL_PAD_CTRL_L1;
++    if (m.buttons & PAD_MOUSE_MIDDLE) btns |= CELL_PAD_CTRL_R3;
++    if (m.wheel) wheel_until = now + PAD_MOUSE_WHEEL_HOLD_S;
++    if (now < wheel_until) btns |= CELL_PAD_CTRL_TRIANGLE;
++    return btns;
++}
++
+ static void pad_poll_keyboard(void)
+@@ -265,2 +475,5 @@ static void pad_poll_keyboard(void)
+ 
++    static int fps = -1;
++    if (fps < 0) { const char* e = getenv("PAD_KEYBOARD_LAYOUT"); fps = e && !strcmp(e, "fps"); }
++
+     PadHostState* hs = &s_host_state[0];
+@@ -269,3 +482,4 @@ static void pad_poll_keyboard(void)
+         /* Release everything on focus loss, or a key held while alt-tabbing
+-         * would stay down forever. */
++         * would stay down forever. The mouse goes back to the desktop. */
++        if (fps) { PadMouseInput m; pad_mouse_poll(0, &m); }
+         hs->buttons = 0;
+@@ -277,2 +491,8 @@ static void pad_poll_keyboard(void)
+ 
++    u16 btns = 0;
++    if (fps) {
++        btns = pad_keyboard_fps(hs);
++        goto done;
++    }
++
+     static const struct { int vk; u16 btn; } map[] = {
+@@ -288,3 +508,2 @@ static void pad_poll_keyboard(void)
+ 
+-    u16 btns = 0;
+     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+@@ -292,4 +511,2 @@ static void pad_poll_keyboard(void)
+ 
+-    hs->buttons   = btns;
+-    hs->connected = 1;
+     hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+@@ -300,2 +517,5 @@ static void pad_poll_keyboard(void)
+     hs->analog_ry = (u8)(pad_key_down(PADKEY_I) ? 0 : pad_key_down(PADKEY_K) ? 255 : 128);
++done:
++    hs->buttons   = btns;
++    hs->connected = 1;
+     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+diff --git a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+new file mode 100644
+index 0000000..5029b9c
+--- /dev/null
++++ b/libs/input/pad_mouse.h
+@@ -0,0 +1,39 @@
++/*
++ * ps3recomp - host mouse for the cellPad keyboard fallback
++ *
++ * The keyboard fallback's shooter layout (PAD_KEYBOARD_LAYOUT=fps in cellPad.c)
++ * turns mouse motion into right-stick deflection and the mouse buttons into pad
++ * buttons. This is the host side of it: relative motion with the cursor held in
++ * the game window. Implemented for macOS in pad_mouse_macos.m; other hosts have
++ * no mouse yet and cellPad.c compiles a stub there.
++ *
++ * Plain C on purpose: cellPad.c cannot include the system headers (see the
++ * macOS keyboard block there).
++ */
++#ifndef PS3RECOMP_PAD_MOUSE_H
++#define PS3RECOMP_PAD_MOUSE_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PAD_MOUSE_LEFT   1u
++#define PAD_MOUSE_RIGHT  2u
++#define PAD_MOUSE_MIDDLE 4u
++
++typedef struct PadMouseInput {
++    double   dx, dy;    /* motion since the previous call, in points; +x right, +y down */
++    int      wheel;     /* wheel clicks since the previous call; + = away from the user */
++    unsigned buttons;   /* PAD_MOUSE_* held now */
++} PadMouseInput;
++
++/* Captures the mouse while `capture` is non-zero (cursor hidden and held over the
++ * game window) and releases it otherwise. Fills `out` with what happened since the
++ * previous call; all zero while released. Safe to call from any thread. */
++void pad_mouse_poll(int capture, PadMouseInput* out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3RECOMP_PAD_MOUSE_H */
+diff --git a/libs/input/pad_mouse_macos.m b/libs/input/pad_mouse_macos.m
+new file mode 100644
+index 0000000..ce81301
+--- /dev/null
++++ b/libs/input/pad_mouse_macos.m
+@@ -0,0 +1,136 @@
++/*
++ * ps3recomp - host mouse for the cellPad keyboard fallback, macOS
++ *
++ * A local NSEvent monitor sees the mouse events the RSX backend's message pump
++ * hands to NSApp. While captured, the cursor is hidden and detached from the
++ * mouse (CGAssociateMouseAndMouseCursorPosition), so it stays over the game
++ * window and mouse events carry only motion in deltaX/deltaY -- the way SDL's
++ * relative mode works on macOS. Capture follows what cellPad asks for on every
++ * poll: on while this process is in the foreground, off when it is not, so
++ * Cmd+Tab gives the cursor back.
++ *
++ * The monitor and the cursor live on the main thread; the pad polls from a guest
++ * thread. They share the accumulators under a lock.
++ */
++#import <AppKit/AppKit.h>
++#include <os/lock.h>
++#include <stdatomic.h>
++
++#include "pad_mouse.h"
++
++/* Trackpads report the wheel in points, not clicks: this many make one click. */
++#define PAD_MOUSE_PRECISE_POINTS_PER_CLICK 12.0
++/* A capture asked for while no window is key yet (start-up) is asked for again this often. */
++#define PAD_MOUSE_RETRY_S 0.5
++
++static os_unfair_lock s_lock = OS_UNFAIR_LOCK_INIT;
++static double   s_dx, s_dy, s_wheel;   /* under s_lock */
++static unsigned s_buttons;             /* under s_lock: pressed while captured */
++
++static atomic_int s_captured;          /* written on the main thread */
++static id         s_monitor;           /* main thread */
++
++static unsigned button_bit(NSEvent* ev)
++{
++    switch ([ev buttonNumber]) {
++    case 0:  return PAD_MOUSE_LEFT;
++    case 1:  return PAD_MOUSE_RIGHT;
++    case 2:  return PAD_MOUSE_MIDDLE;
++    default: return 0;
++    }
++}
++
++static void install_monitor(void)
++{
++    const NSEventMask mask =
++        NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged |
++        NSEventMaskOtherMouseDragged | NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp |
++        NSEventMaskRightMouseDown | NSEventMaskRightMouseUp | NSEventMaskOtherMouseDown |
++        NSEventMaskOtherMouseUp | NSEventMaskScrollWheel;
++    s_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent*(NSEvent* ev) {
++        const int captured = atomic_load(&s_captured);
++        os_unfair_lock_lock(&s_lock);
++        switch ([ev type]) {
++        case NSEventTypeLeftMouseDown:
++        case NSEventTypeRightMouseDown:
++        case NSEventTypeOtherMouseDown:
++            /* The click that brings the window to the front is not a shot. */
++            if (captured) s_buttons |= button_bit(ev);
++            break;
++        case NSEventTypeLeftMouseUp:
++        case NSEventTypeRightMouseUp:
++        case NSEventTypeOtherMouseUp:
++            s_buttons &= ~button_bit(ev);
++            break;
++        case NSEventTypeScrollWheel:
++            if (captured)
++                s_wheel += [ev hasPreciseScrollingDeltas]
++                         ? [ev scrollingDeltaY] / PAD_MOUSE_PRECISE_POINTS_PER_CLICK
++                         : [ev scrollingDeltaY];
++            break;
++        default:   /* moved / dragged */
++            if (captured) { s_dx += [ev deltaX]; s_dy += [ev deltaY]; }
++            break;
++        }
++        os_unfair_lock_unlock(&s_lock);
++        return ev;
++    }];
++}
++
++static void set_capture(int on)
++{
++    if (on == atomic_load(&s_captured)) return;
++    if (on) {
++        NSWindow* w = [NSApp keyWindow];
++        if (!w) return;   /* asked again after PAD_MOUSE_RETRY_S */
++        if (!s_monitor) install_monitor();
++        [w setAcceptsMouseMovedEvents:YES];
++        /* Park the cursor in the middle of the window first: detached, it stays
++         * where it is, and clicks land wherever that is. Quartz global
++         * coordinates start at the top left of the primary screen. */
++        const NSRect r = [w convertRectToScreen:[[w contentView] frame]];
++        const CGFloat top = NSMaxY([[NSScreen screens][0] frame]);
++        CGWarpMouseCursorPosition(CGPointMake(NSMidX(r), top - NSMidY(r)));
++        CGAssociateMouseAndMouseCursorPosition(false);
++        [NSCursor hide];
++        os_unfair_lock_lock(&s_lock);
++        s_dx = s_dy = s_wheel = 0;
++        s_buttons = 0;
++        os_unfair_lock_unlock(&s_lock);
++    } else {
++        CGAssociateMouseAndMouseCursorPosition(true);
++        [NSCursor unhide];
++        os_unfair_lock_lock(&s_lock);
++        s_buttons = 0;
++        os_unfair_lock_unlock(&s_lock);
++    }
++    atomic_store(&s_captured, on);
++}
++
++void pad_mouse_poll(int capture, PadMouseInput* out)
++{
++    static atomic_int s_asked = -1;    /* the last request sent to the main thread */
++    static double     s_asked_at;
++    capture = capture != 0;
++    const double now = [NSProcessInfo processInfo].systemUptime;
++    if (capture != atomic_load(&s_captured) &&
++        (capture != atomic_load(&s_asked) || now - s_asked_at >= PAD_MOUSE_RETRY_S)) {
++        atomic_store(&s_asked, capture);
++        s_asked_at = now;
++        dispatch_async(dispatch_get_main_queue(), ^{ set_capture(capture); });
++    }
++
++    os_unfair_lock_lock(&s_lock);
++    out->dx = s_dx;
++    out->dy = s_dy;
++    out->wheel = (int)s_wheel;           /* whole clicks; the rest waits for more */
++    s_wheel -= out->wheel;
++    out->buttons = s_buttons;
++    s_dx = s_dy = 0;
++    os_unfair_lock_unlock(&s_lock);
++    if (!atomic_load(&s_captured)) {
++        out->dx = out->dy = 0;
++        out->wheel = 0;
++        out->buttons = 0;
++    }
++}
+diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
+new file mode 100644
+index 0000000..5b5f340
+--- /dev/null
++++ b/libs/input/tests/test_pad_keyboard_fps.c
+@@ -0,0 +1,166 @@
++/* The keyboard fallback's shooter layout (PAD_KEYBOARD_LAYOUT=fps): the key and
++ * mouse-button map, WASD on the left stick, and mouse motion turned into
++ * right-stick deflection through the title's stick curve (PAD_MOUSE_CURVE_*).
++ *
++ *   clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" \
++ *         libs/input/tests/test_pad_keyboard_fps.c $(sdl2-config --libs) -o /tmp/test_pad_keyboard_fps \
++ *         && /tmp/test_pad_keyboard_fps
++ *
++ * The keyboard and the mouse are fakes: the test defines the call pad_key_down
++ * makes on this host and pad_mouse_poll (pad_mouse.h).
++ */
++#include "../cellPad.c"
++#include <assert.h>
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++u32 cellGcm_flip_request_count(void) { return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++
++/* The fake keyboard, indexed by this host's PADKEY_* codes. */
++static unsigned char s_keys[512];
++#ifdef __APPLE__
++unsigned char CGEventSourceKeyState(int stateID, unsigned short key) { (void)stateID; return s_keys[key & 511]; }
++#else
++const Uint8* SDL_GetKeyboardState(int* n) { if (n) *n = 512; return s_keys; }
++#endif
++
++/* The fake mouse: what the next poll returns, and what the last one asked for. */
++static PadMouseInput s_mouse;
++static int s_capture = -1;
++void pad_mouse_poll(int capture, PadMouseInput* out)
++{
++    s_capture = capture;
++    *out = s_mouse;
++    memset(&s_mouse, 0, sizeof s_mouse);
++}
++
++static void sleep_s(double s)
++{
++    struct timespec ts = { (time_t)s, (long)((s - (double)(time_t)s) * 1e9) };
++    nanosleep(&ts, NULL);
++}
++
++static void test_curve_parse(void)
++{
++    PadStickCurve c;
++    assert(pad_curve_parse("22:0, 28:1.6,127:206", &c) && c.n == 3);
++    assert(c.defl[1] == 28 && c.rate[1] == 1.6 && c.defl[2] == 127 && c.rate[2] == 206);
++    c.n = 99;
++    assert(!pad_curve_parse("", &c));
++    assert(!pad_curve_parse("0:0", &c));                 /* one point is no curve */
++    assert(!pad_curve_parse("10:5,20:6", &c));           /* the first rate must be 0 (no motion) */
++    assert(!pad_curve_parse("20:0,10:5", &c));           /* deflection must increase */
++    assert(!pad_curve_parse("0:0,20:5,30:4", &c));       /* rate must not fall */
++    assert(!pad_curve_parse("0:0,200:5", &c));           /* deflection is 0-127 */
++    assert(!pad_curve_parse("0:0,50", &c));
++    assert(!pad_curve_parse("0:0,50:0", &c));            /* never turns */
++    assert(c.n == 99);                                    /* left alone on failure */
++}
++
++static void test_curve_deflection(void)
++{
++    PadStickCurve c;
++    assert(pad_curve_parse("22:0,28:1.6,96:46.5,127:206", &c));
++    assert(pad_curve_deflection(&c, 0) == 0);            /* no motion: centred, not at the dead zone's edge */
++    assert(fabs(pad_curve_deflection(&c, 0.8) - 25) < 1e-9);   /* inside the first span */
++    assert(fabs(pad_curve_deflection(&c, 1.6) - 28) < 1e-9);
++    assert(fabs(pad_curve_deflection(&c, 46.5) - 96) < 1e-9);
++    assert(fabs(pad_curve_deflection(&c, 126.25) - 111.5) < 1e-9);
++    assert(pad_curve_deflection(&c, 1000) == 127);       /* past the top rate: full */
++}
++
++static void test_stick_byte(void)
++{
++    assert(pad_stick_byte(0) == 128);
++    assert(pad_stick_byte(127) == 255);
++    assert(pad_stick_byte(-127) == 0);                   /* full left reaches 0 */
++    assert(pad_stick_byte(10) == 138);
++    assert(pad_stick_byte(-63.5) == 64);                 /* left is scaled by 128/127 */
++}
++
++/* Needs PAD_MOUSE_* set before the first call (read once). */
++static void test_mouse_stick(void)
++{
++    u8 rx, ry;
++    /* x: dead zone 22, then linear to 105/s at full; y: no curve (linear, full at 1000/s); 0.5 per point */
++    pad_mouse_stick(10, -5, 0.05, &rx, &ry);             /* x 100/s -> 22 + 100 = 122; y -50/s -> -6.35 */
++    assert(rx == 250 && ry == 122);
++    pad_mouse_stick(0, 0, 0.05, &rx, &ry);
++    assert(rx == 128 && ry == 128);
++    pad_mouse_stick(-1000, 1000, 0.05, &rx, &ry);        /* beyond the top rate */
++    assert(rx == 0 && ry == 255);
++    pad_mouse_stick(0.08, 0, 0.001, &rx, &ry);           /* a gap under the minimum counts as the minimum: 5/s */
++    assert(rx == 155);
++    pad_mouse_stick(1, 0, 5.0, &rx, &ry);                /* and one over the maximum as the maximum: 5/s */
++    assert(rx == 155);
++}
++
++static void test_fps_layout(void)
++{
++    PadHostState hs;
++    memset(&hs, 0, sizeof hs);
++    memset(s_keys, 0, sizeof s_keys);
++
++    s_keys[PADKEY_W] = s_keys[PADKEY_D] = 1;
++    s_keys[PADKEY_SPACE] = s_keys[PADKEY_SHIFT] = s_keys[PADKEY_ESCAPE] = 1;
++    s_mouse.buttons = PAD_MOUSE_LEFT | PAD_MOUSE_RIGHT;
++    u16 b = pad_keyboard_fps(&hs);
++    assert(s_capture == 1);
++    assert(b == (CELL_PAD_CTRL_CROSS | CELL_PAD_CTRL_L3 | CELL_PAD_CTRL_START |
++                 CELL_PAD_CTRL_R1 | CELL_PAD_CTRL_L1));
++    assert(hs.analog_lx == 255 && hs.analog_ly == 0);    /* forward and right */
++    assert(hs.analog_rx == 128 && hs.analog_ry == 128);  /* the mouse did not move */
++
++    memset(s_keys, 0, sizeof s_keys);
++    s_keys[PADKEY_A] = s_keys[PADKEY_S] = s_keys[PADKEY_W] = 1;   /* W and S cancel */
++    s_keys[PADKEY_2] = s_keys[PADKEY_LEFT] = s_keys[PADKEY_E] = s_keys[PADKEY_CTRL] = 1;
++    s_mouse.buttons = PAD_MOUSE_MIDDLE;
++    s_mouse.wheel = -1;
++    b = pad_keyboard_fps(&hs);
++    assert(b == (CELL_PAD_CTRL_RIGHT | CELL_PAD_CTRL_LEFT | CELL_PAD_CTRL_SQUARE | CELL_PAD_CTRL_CIRCLE |
++                 CELL_PAD_CTRL_R3 | CELL_PAD_CTRL_TRIANGLE));
++    assert(hs.analog_lx == 0 && hs.analog_ly == 128);
++
++    memset(s_keys, 0, sizeof s_keys);
++    b = pad_keyboard_fps(&hs);                           /* the wheel click is still held... */
++    assert(b == CELL_PAD_CTRL_TRIANGLE);
++    sleep_s(PAD_MOUSE_WHEEL_HOLD_S + 0.02);
++    assert(pad_keyboard_fps(&hs) == 0);                  /* ...for PAD_MOUSE_WHEEL_HOLD_S */
++
++    s_mouse.dx = 100;                                    /* fast to the right: full */
++    pad_keyboard_fps(&hs);
++    assert(hs.analog_rx == 255);
++}
++
++/* The whole poll, unfocused (no window here): everything released, the mouse too. */
++static void test_unfocused_releases_mouse(void)
++{
++    s_capture = -1;
++    s_keys[PADKEY_SPACE] = 1;
++    s_host_state[0].buttons = 0xFFFF;
++    pad_poll_keyboard();
++    assert(s_capture == 0);
++    assert(s_host_state[0].buttons == 0 && s_host_state[0].analog_rx == 128);
++}
++
++int main(void)
++{
++    setenv("PAD_KEYBOARD_LAYOUT", "fps", 1);
++    setenv("PAD_MOUSE_CURVE_X", "22:0,127:105", 1);
++    setenv("PAD_MOUSE_SENS", "0.5", 1);
++    test_curve_parse();
++    test_curve_deflection();
++    test_stick_byte();
++    test_mouse_stick();
++    test_fps_layout();
++    test_unfocused_releases_mouse();
++    printf("test_pad_keyboard_fps: ok\n");
++    return 0;
++}
+diff --git a/libs/input/tests/test_pad_rumble.c b/libs/input/tests/test_pad_rumble.c
+index b5dec8a..85972a8 100644
+--- a/libs/input/tests/test_pad_rumble.c
++++ b/libs/input/tests/test_pad_rumble.c
+@@ -24,2 +24,5 @@ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
++#ifdef __APPLE__
++void pad_mouse_poll(int capture, PadMouseInput* out) { (void)capture; memset(out, 0, sizeof *out); }   /* pad_mouse_macos.m */
++#endif
+ 

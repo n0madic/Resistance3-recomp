@@ -1,0 +1,33 @@
+sys_net offline model: receives return the EWOULDBLOCK code (0x80010223), not -1.
+
+Resistance 3's network thread polls a non-blocking UDP socket (SO_NBIO) with recvmsg. Its wrapper (0x8B8D7C) takes only
+0x80010223 as "no packet"; any other negative result is a failure, which it logs ("Error receiving incoming packets: no
+error") and retries at once: hundreds of thousands of log lines in a few minutes. Libnet returns the error code
+itself, as the host-socket path (sysNet.c) already does and its test checks; errno stays 35.
+
+Test: scripted run (boot, Continue, gameplay): no such line, 278k before.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 1a393fd..c470b59 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -524,4 +524,9 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
+  * every receive/poll would-block. errno lives in a guest scratch cell since
+- * _sys_net_errno_loc returns a POINTER the game dereferences. */
++ * _sys_net_errno_loc returns a POINTER the game dereferences. The return value
++ * is the error code itself, as on hardware and in the host-socket path
++ * (sysNet.c): Resistance 3's receive wrapper treats only 0x80010223 as "no
++ * packet" and anything else negative as a failure, which it logs and retries
++ * at once -- -1 here made that thousands of log lines a second. */
+ #define SYS_NET_EWOULDBLOCK_V 35
++#define SYS_NET_ERROR_EWOULDBLOCK (0x80010200u | SYS_NET_EWOULDBLOCK_V)
+ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
+@@ -540,3 +545,3 @@ static void hle_net_wouldblock(ppu_context* ctx)
+     if (g_net_errno_ea) vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
+-    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)-1;
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)SYS_NET_ERROR_EWOULDBLOCK;
+ }
