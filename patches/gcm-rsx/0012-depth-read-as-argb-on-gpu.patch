@@ -1,8 +1,8 @@
 rsx draw engine + metal: a Z24S8 zeta read as A8R8G8B8 is converted on the GPU, not stored through guest memory.
 
-Resistance 3 rebuilds depth from the bytes of its depth buffers five times a frame: the 1920x640 Z24S8 zeta at
-0x00E00000 twice and the 960x640 one at 0x01380000 three times (two crossbars), each read as a linear unnormalized
-A8R8G8B8 texture of the zeta's own pitch. The engine served each read by storing the depth target into guest memory
+Resistance 3 rebuilds depth from the bytes of its depth buffers several times a frame: the 1920x704 Z24S8 zeta at
+0x00E00000 and the 960x704 one at 0x01380000 (two crossbars), each read as a linear unnormalized A8R8G8B8 texture of
+the zeta's own pitch; the 960x704 one twice a frame while it is still the bound zeta (depth writes off). The engine served each read by storing the depth target into guest memory
 (eng_zdepth_to_guest: submit_and_wait, a GPU readback, a CPU conversion), then hashing and decoding the texture again:
 2.1 GB of decode per 120 frames for those two addresses, more than half of the FIFO/present thread.
 
@@ -10,24 +10,28 @@ The backend now has an optional depth_as_argb(depth, w, h): a recorded pass, in 
 that writes an R8G8B8A8 texture with what the store plus the decode would give (R = depth bits 15..8, G = 7..0,
 B = 0 for the stencil byte, A = 23..16; round(d * 0xFFFFFF) taken exactly with 64-bit integers, as the double
 store takes it). The unit samples a surface_view of it with its crossbar. The engine uses it for a texture at the
-zeta's address that is A8R8G8B8 linear, 2D, one level, of the zeta's pitch, inside the written clip, while that zeta
-is not the bound one; it keeps one conversion per zeta and makes a new one after the next depth write or clear.
+zeta's address that is A8R8G8B8 linear, 2D, one level, of the zeta's pitch, inside the written clip, the bound zeta
+included (the conversion takes the depth the draws so far left, as the store reads it back); it keeps one conversion per zeta and makes a new one after the next depth write or clear.
 Anything else, a backend without the hook, or PS3RECOMP_ENG_DEPTH_VIA_GUEST=1, stores through guest memory as before.
 Guest memory is not refreshed for these reads (guest_dirty stays set for any other reader).
 TODO: the stencil byte is 0, as the store writes it; Z16 read as a colour format still goes through guest memory.
 
 test_rsx_draw_engine: the read goes to the hook with no readback, store or upload; the same texture until the next
-depth write, then a new one with the old released; another pitch and a refusing backend take the store as before.
+depth write, then a new one with the old released; the zeta still bound is converted too and reused while no draw writes
+depth (3 checks fail with the bound zeta excluded); another pitch and a refusing backend take the store as before.
 test_metal_depth_as_argb (new): edge depths (0, 1, subnormal, rounding ties) convert byte for byte as the store plus
 rsx_texture_decode, and the 0xAA93 view samples as the uploaded texture does.
 Measured (scripted run, Home level, stick turn, 2 runs each): 26.1-26.5 -> 29.4-29.5 fps, standing 30.0 (the game's
-cap); present thread busy 652 -> ~430 samples of 6 s. Frames match the store path (Susan's lantern, shadows, light).
+cap); present thread busy 652 -> ~430 samples of 6 s. The bound zeta was left to the store at first: that kept
+692 MB of A8R8G8B8 decode per 120 frames (two reads a frame); with it converted too, ~1 MB, eng_texture_slot
+~700 -> ~280 ms per 120 frames, turn 29.4 -> 29.9 fps, sink_bind_textures 264-331 -> 130-143 samples of 6 s. Frames match the store path (Susan's lantern, shadows, light).
 
-Upstream: not proposed yet.
+Upstream: PR #499 (same change, generic wording; drop this patch when the pin has it).
+
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 7934173..0c15e21 100644
+index 7934173..30066d5 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -121,2 +121,5 @@ typedef struct {
@@ -41,7 +45,7 @@ index 7934173..0c15e21 100644
 +    if (z->argb) g.be->texture_release(g.be->user, z->argb);
 +    z->argb = 0;
      z->location = location; z->offset = offset;
-@@ -979,2 +984,42 @@ static u32 eng_zdepth_snapshot(u32 slot)
+@@ -979,2 +984,45 @@ static u32 eng_zdepth_snapshot(u32 slot)
  
 +/* PS3RECOMP_ENG_DEPTH_VIA_GUEST=1 (read at engine init): a depth target read
 + * as A8R8G8B8 goes through guest memory even when the backend can convert it
@@ -55,14 +59,17 @@ index 7934173..0c15e21 100644
 + * a frame, more than half of the FIFO thread. The backend converts it on the
 + * GPU instead, in command order, into the texels the decode would give, and
 + * the unit samples a view of that with its own crossbar. Guest memory is left
-+ * as it was (guest_dirty stays set for any other reader). Returns the view, or
-+ * 0 for the store through guest memory. */
-+static u32 eng_zdepth_argb(u32 slot, u32 current_zslot, const rsx_dsp_texture* t)
++ * as it was (guest_dirty stays set for any other reader). That holds for the
++ * zeta still bound too: Resistance 3 reads its half-size depth twice a frame
++ * without unbinding it, and the conversion, in command order, takes the depth
++ * as the draws so far left it, which is what the store reads back. Returns
++ * the view, or 0 for the store through guest memory. */
++static u32 eng_zdepth_argb(u32 slot, const rsx_dsp_texture* t)
 +{
 +    eng_zdepth* z = &g.zdepths[slot];
 +    const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
 +    if (s_depth_via_guest || !g.be->depth_as_argb || !g.be->surface_view ||
-+        slot == current_zslot || !z->handle || z->zfmt == 1u /* Z16 */ ||
++        !z->handle || z->zfmt == 1u /* Z16 */ ||
 +        base_fmt != RSX_TEX_FMT_A8R8G8B8 || !(t->format & RSX_TEX_FMT_LINEAR) ||
 +        rsx_texture_argb_is_rgba() || t->cubemap || t->dimension == 3 || t->mipmaps > 1)
 +        return 0;
@@ -84,17 +91,17 @@ index 7934173..0c15e21 100644
 +}
 +
  /* ---- textures ------------------------------------------------------------ */
-@@ -2297,2 +2342,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2297,2 +2345,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              }
-+            const u32 argb = eng_zdepth_argb((u32)zsrc, current_zslot, &t);
++            const u32 argb = eng_zdepth_argb((u32)zsrc, &t);
 +            if (argb) { textures[u] = argb; continue; }
              if (eng_zdepth_to_guest((u32)zsrc)) {
-@@ -3096,2 +3143,4 @@ int rsx_draw_engine_init(u32 width, u32 height)
+@@ -3096,2 +3146,4 @@ int rsx_draw_engine_init(u32 width, u32 height)
        s_surface_reuse = !(e && *e == '0'); }
 +    { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
 +      s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
      g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
-@@ -3134,4 +3183,6 @@ void rsx_draw_engine_shutdown(void)
+@@ -3134,4 +3186,6 @@ void rsx_draw_engine_shutdown(void)
      }
 -    for (u32 i = 0; i < g.n_zdepths; i++)
 +    for (u32 i = 0; i < g.n_zdepths; i++) {
@@ -103,10 +110,10 @@ index 7934173..0c15e21 100644
 +    }
      if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index dc60a62..40af48d 100644
+index dc60a62..1daae8f 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
-@@ -250,2 +250,12 @@ typedef struct rsx_draw_backend {
+@@ -250,2 +250,14 @@ typedef struct rsx_draw_backend {
                                u32 w, u32 h, const void* src, u32 row_bytes);
 +
 +    /* Optional. A depth target's top-left w x h read as an A8R8G8B8 texture
@@ -115,8 +122,10 @@ index dc60a62..40af48d 100644
 +     * Z24S8 and decoded, gives -- R = depth bits 15..8, G = bits 7..0, B = 0
 +     * (the stencil byte), A = bits 23..16, with depth * 0xFFFFFF rounded as
 +     * eng_zdepth_to_guest rounds it. Made in command order, like
-+     * depth_snapshot, so no wait; the engine owns the handle. 0 when the
-+     * backend cannot; NULL keeps the store through guest memory. */
++     * depth_snapshot, so no wait, and from the depth the draws so far left,
++     * which may be the target the current pass still attaches; the engine
++     * owns the handle. 0 when the backend cannot; NULL keeps the store
++     * through guest memory. */
 +    u32  (*depth_as_argb)(void* user, u32 depth, u32 w, u32 h);
  } rsx_draw_backend;
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
@@ -429,10 +438,10 @@ index 0000000..40df14b
 +    }
 +}
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 24d5d35..91ff059 100644
+index 24d5d35..b651cef 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -1653,2 +1653,82 @@ static void test_depth_read_as_color(void)
+@@ -1653,2 +1653,97 @@ static void test_depth_read_as_color(void)
  
 +/* depth_as_argb: the zeta's bytes made on the GPU, no store to guest memory. */
 +static int g_argb_calls, g_argb_fail;
@@ -446,8 +455,9 @@ index 24d5d35..91ff059 100644
 +}
 +
 +/* A Z24S8 pass at ZETA_OFFSET (256 x 256, pitch 1024), then the zeta moved
-+ * away and the unit set to read it as a linear 4x4 A8R8G8B8 of `pitch`. */
-+static void depth_pass_then_read(u32 pitch)
++ * away (or, with `keep_zeta`, left bound with depth writes off) and the unit
++ * set to read it as a linear 4x4 A8R8G8B8 of `pitch`. */
++static void depth_pass_then_read_ex(u32 pitch, int keep_zeta)
 +{
 +    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
 +    m(M_SURFACE_FORMAT, 8u | (2u << 5));
@@ -458,13 +468,15 @@ index 24d5d35..91ff059 100644
 +    m(M_DEPTH_WRITE, 1u);
 +    m(M_TEX_UNIT + 0x0C, 0u);                  /* the pass samples nothing */
 +    draw_triangle();
-+    m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
++    if (!keep_zeta) m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
 +    m(M_COLOR_MASK, 0x01010101u);
 +    m(M_DEPTH_TEST, 0u);
 +    m(M_DEPTH_WRITE, 0u);
 +    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
 +    m(0x1840 /* control3: pitch */, pitch);
 +}
++
++static void depth_pass_then_read(u32 pitch) { depth_pass_then_read_ex(pitch, 0); }
 +
 +static void test_depth_read_as_argb_on_gpu(void)
 +{
@@ -502,11 +514,23 @@ index 24d5d35..91ff059 100644
 +          "a texture of another pitch goes through guest memory (%d calls, %d readbacks)",
 +          g_argb_calls, stub.n_depth_readback);
 +
++    /* The zeta still bound, depth writes off: converted all the same, and
++     * kept while no draw writes depth. */
++    depth_pass_then_read_ex(256u * 4u, 1);
++    draw_triangle();
++    const u32 bound = stub.bound_tex[0];
++    CHECK(g_argb_calls == 3 && stub.n_depth_readback == 1 && bound,
++          "the bound zeta is converted too, not read back (%d calls, %d readbacks)",
++          g_argb_calls, stub.n_depth_readback);
++    draw_triangle();
++    CHECK(g_argb_calls == 3 && stub.bound_tex[0] == bound,
++          "and reused while no draw wrote depth (%d calls)", g_argb_calls);
++
 +    /* A backend that cannot: guest memory as before. */
 +    g_argb_fail = 1;
 +    depth_pass_then_read(256u * 4u);
 +    draw_triangle();
-+    CHECK(g_argb_calls == 3 && stub.n_depth_readback == 2 &&
++    CHECK(g_argb_calls == 4 && stub.n_depth_readback == 2 &&
 +          stub.bound_tex[0] == stub.last_created_texture &&
 +          z[0] == 0x80 && z[1] == 0x00 && z[2] == 0x00 && z[3] == 0x00,
 +          "refused: depth 0.5 stored as Z24S8 and decoded (%d readbacks, %02X %02X %02X %02X)",
@@ -515,7 +539,7 @@ index 24d5d35..91ff059 100644
 +}
 +
  static void test_color_read_as_float(void)
-@@ -1896,2 +1976,3 @@ int main(void)
+@@ -1896,2 +1991,3 @@ int main(void)
      test_depth_read_as_color();
 +    test_depth_read_as_argb_on_gpu();
      test_color_read_as_float();

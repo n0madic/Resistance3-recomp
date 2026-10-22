@@ -108,8 +108,13 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   SPU interpreter, among it three position-independent modules loaded at a new address each time.
 - **RSX/GCM**: the FIFO walker runs on the present thread. `cellGcm_on_put_store` takes JUMPs at an idle get
   immediately (the game injects command blocks at get and reuses their memory). The draw engine goes to Metal.
-  The game reads its Z24S8 depth buffers as A8R8G8B8 five times a frame; the backend converts them on the GPU
-  (`gcm-rsx/0012`; `PS3RECOMP_ENG_DEPTH_VIA_GUEST=1` brings back the store through guest memory, which cost ~3 fps).
+  The game reads its Z24S8 depth buffers as A8R8G8B8 several times a frame (one of them while it is still the
+  bound zeta), and its Z16 shadow maps as DEPTH16; the backend converts both on the GPU (`depth_as_color`,
+  `gcm-rsx/0012` + `0013`; `PS3RECOMP_ENG_DEPTH_VIA_GUEST=1` brings back the store through guest memory, which cost
+  ~3 fps).
+  Lamp shadows need `gcm-rsx/0014`: the light shaders read the DEPTH16 maps through crossbar 0xA900 (depth formats
+  present depth on every lane), and the engine's 64-entry surface/zeta tables evict the least recently used entry
+  (before, the maps Home renders at load got no depth target). The compare order is PR #424's (depth FUNC ref).
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
