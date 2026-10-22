@@ -66,8 +66,11 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
 - **Layout.** `patches/<domain>/NNNN-*.patch`, one directory per subject area (module-abi, spurs, spu-runtime,
   savedata-trophy, input, lv2, fs, gcm-rsx, metal), listed in `patches/domains.txt` (second column: platforms the domain
   is for). Patches inside a domain go in name order and may depend on each other; **domains never depend on each other**:
-  each applies to the pinned revision on its own, and any order of them gives the same tree.
-  `patches/upstream/*.patch` holds open upstream PRs imported as they are (header + the PR's diff), applied first.
+  each applies to the base on its own, and any order of them gives the same tree.
+  `patches/upstream/*.patch` holds open upstream PRs imported as they are (header + the PR's diff), applied first, in
+  name order. **The base is the pin plus those PRs**: our own patches go last and are rebased onto an imported PR
+  (as upstream will have to be the starting point anyway once it merges, or after a pin move). An imported PR's header
+  still names the Resistance 3 symptom; a perf PR needs a measurement here.
   `patches/deferred/` keeps the full patches that were left out (not applied; see its README) so nothing is lost.
 - **What may be in a patch.** Only what this game needs: the header names the symptom in Resistance 3 and the test (or
   scripted run) that shows it. Nothing is carried over because another port has it. If upstream already offers the
@@ -80,9 +83,9 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
 - `build_host.sh` resets `build/ps3recomp` to a clean checkout and re-applies everything whenever the revision or any
   patch changes (stamp in `.git/r3-patches`). **Uncommitted edits in `build/ps3recomp` are wiped by that**: turn them
   into a patch first.
-- **Making a patch.** In a scratch clone of the pinned revision, put the change on top of the *domain's* earlier patches
-  only (not of other domains), commit it, and write `header, "---", blank, git diff -U1` (narrow context keeps domains
-  independent and survives upstream churn). Files here have mixed CRLF/LF lines: edit them byte-safe (a text-mode
+- **Making a patch.** In a scratch clone of the pinned revision with the `patches/upstream` PRs applied, put the change
+  on top of the *domain's* earlier patches only (not of other domains), commit it, and write
+  `header, "---", blank, git diff -U1` (narrow context keeps domains independent and survives upstream churn). Files here have mixed CRLF/LF lines: edit them byte-safe (a text-mode
   Python rewrite normalises the endings and the patch then carries hundreds of spurious lines; `check_patches.sh` does
   not catch that, `git diff --ignore-cr-at-eol --stat` does). New behaviour gets a test inside the patch.
 
