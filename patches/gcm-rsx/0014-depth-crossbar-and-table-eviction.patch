@@ -29,7 +29,8 @@ Scripted run (Home, CHAPTER ONE view, then a camera turn): the lamp shadows as o
 in the turn's frames; 3 surface and 1 zeta evictions logged by then. fps against 0012+0013 (2 runs each): standing
 29.9-30.0 vs 30.0, turning 29.8-29.9 vs 30.0 (the game's cap; the shadowed lights now compare real depth).
 
-Upstream: not proposed yet (both changes are generic; to send with the user's OK).
+Upstream: the crossbar part is PR #501 (https://github.com/sp00nznet/ps3recomp/pull/501); the table eviction is
+PR #499's fourth commit (https://github.com/sp00nznet/ps3recomp/pull/499).
 
 ---
 

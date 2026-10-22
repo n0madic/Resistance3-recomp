@@ -25,7 +25,7 @@ test_metal_depth_as_argb.m is now test_metal_depth_as_color.m: the DEPTH16 conve
 values either side of 16-bit rounding ties, matches readback + Z16 store + rsx_texture_decode byte for byte, and its
 view samples as the uploaded R16 texture (both fail with the float formula in the shader); 21 checks.
 
-Upstream: not proposed yet (extends PR #499: the hook it adds becomes depth_as_color; to follow it).
+Upstream: PR #499 (https://github.com/sp00nznet/ps3recomp/pull/499), its third commit.
 
 ---
 
