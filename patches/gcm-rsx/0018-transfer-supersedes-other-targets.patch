@@ -1,0 +1,225 @@
+rsx draw engine: a 2D transfer over a target it does not update makes guest memory the newer copy.
+
+Resistance 3: badly hurt, the screen went black but for a few blurred blobs (user report) instead of the blurred,
+washed-out view. A pass dump of such a frame (RSX_ENGINE_PASS_DUMP, a draw per pass at the composite target, NV3089
+copies logged between draws) shows the damage path: the frame at 0x019C0000 (pitch 4096) is copied with NV3089 to
+0x01DA8800 at pitch 3840, and the next draw samples 0x01DA8800 as a 960x704 texture. That address also holds a
+240x176 bloom target drawn at pitch 960 earlier in the frame and a shadow map's zeta. The transfer lands in neither
+(guest_wrote updates only a surface laid out at its own pitch), so the engine still bound the bloom target, stretched,
+for the copy.
+Now guest_wrote marks every target its rectangle covers and does not update as older than guest memory (guest_newer),
+until the target is created, drawn or cleared again. A texture unit skips marked targets (colour, zeta, the DEPTH24
+snapshot fallback) and reads the guest bytes; a later transfer does not write a marked target back over them
+(eng_surface_at skips it). A stateless rule (a linear texture whose pitch differs from the target's reads guest
+memory) also fixed the frame but contradicts gcm-rsx/0012: a zeta written after the guest bytes must be stored and
+re-read at the texture's pitch.
+
+test_rsx_draw_engine, new test_transfer_supersedes_other_targets: a transfer at the target's own pitch keeps it
+sampled; one at another pitch makes the unit upload from guest memory, keeps a later transfer from writing the old
+pixels back, and a draw into the target makes it sampled again; a zeta covered by the transfer is not read back. Three
+of its checks fail without the change. test_transfer_coherence wrote at another pitch over its surface before
+checking that a transfer reads that surface's pixels; the two steps swap, every check kept. Checked with scripted
+runs (Continue, stand in the Haven fight): the hurt frames show the blurred scene.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index ff003f5..dba53c9 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -107,2 +107,3 @@ typedef struct {
+     int guest_dirty;        /* rendered since guest memory last got a copy   */
++    int guest_newer;        /* a 2D transfer wrote over it since it was last drawn */
+     u32 last_use;           /* g.frames when last bound, sampled or presented */
+@@ -120,2 +121,3 @@ typedef struct {
+     int guest_dirty;       /* written since guest memory last got a copy     */
++    int guest_newer;       /* a 2D transfer wrote over it since it was last drawn */
+     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
+@@ -721,2 +723,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     s->guest_dirty = 0;
++    s->guest_newer = 0;
+     s->last_use = g.frames;
+@@ -802,3 +805,3 @@ static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* xb, u32* y)
+         const eng_surface* s = &g.surfaces[i];
+-        if (!s->handle || s->location != location || offset < s->offset) continue;
++        if (!s->handle || s->guest_newer || s->location != location || offset < s->offset) continue;
+         const u32 bpp = eng_transfer_bpp(s->fmt);
+@@ -918,9 +921,43 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+ 
++/* The guest bytes a colour target's rows cover; a swizzled target (its pitch register below a row) is packed. */
++static u64 eng_rows_span(u32 pitch, u32 w, u32 h, u32 bpp)
++{
++    if (!w || !h) return 0;
++    return pitch >= w * bpp ? (u64)pitch * (h - 1u) + (u64)w * bpp : (u64)w * h * bpp;
++}
++
++/* A 2D transfer wrote [offset, end) in guest memory: every target there it does not land in (another pitch, or
++ * not a format a transfer can update) now holds older pixels than the guest's bytes until it is drawn into again.
++ * Resistance 3, badly hurt, copies its frame with NV3089 to 0x01DA8800 at pitch 3840 and samples the copy; a
++ * 240x176 bloom target drawn there at pitch 960 and a shadow map's zeta kept outranking the copy, and the screen went
++ * black but for the stretched bloom. */
++static void eng_mark_guest_newer(u32 location, u32 offset, u64 end, u32 keep)
++{
++    for (u32 i = 0; i < g.n_surfaces; i++) {
++        eng_surface* s = &g.surfaces[i];
++        if (i == keep || !s->handle || s->location != location) continue;
++        const u32 bpp = eng_transfer_bpp(s->fmt) ? eng_transfer_bpp(s->fmt) : 4u;
++        if (s->offset < end && (u64)s->offset + eng_rows_span(s->pitch, s->w, s->h, bpp) > offset)
++            s->guest_newer = 1;
++    }
++    for (u32 i = 0; i < g.n_zdepths; i++) {
++        eng_zdepth* z = &g.zdepths[i];
++        if (!z->handle || !z->depth_serial || z->location != location) continue;
++        const u32 bpp = z->zfmt == 1u ? 2u : 4u;
++        const u64 span = z->swizzled ? (u64)z->used_w * z->used_h * bpp
++                                     : eng_rows_span(z->pitch, z->used_w, z->used_h, bpp);
++        if (z->offset < end && (u64)z->offset + span > offset) z->guest_newer = 1;
++    }
++}
++
+ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+ {
+-    if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
++    if (!g.ready || !pitch || !w || !h) return;
+     u32 x = 0, y = 0;
+-    const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
++    u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
+     /* color_target_write takes R,G,B,A bytes: an A8R8G8B8 surface only. */
+-    if (slot == ENG_INVALID || g.surfaces[slot].fmt != RSX_BE_FMT_R8G8B8A8) {
++    if (slot != ENG_INVALID && (g.surfaces[slot].fmt != RSX_BE_FMT_R8G8B8A8 || !g.be->color_target_write))
++        slot = ENG_INVALID;
++    eng_mark_guest_newer(location, offset, (u64)offset + (u64)pitch * (h - 1u) + (u64)w * 4u, slot);
++    if (slot == ENG_INVALID) {
+         if (eng_coherence_log())
+@@ -1011,2 +1048,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+     z->guest_dirty = 0;
++    z->guest_newer = 0;
+     z->last_use = g.frames;
+@@ -1539,2 +1577,3 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+     z->guest_dirty = 1;
++    z->guest_newer = 0;
+     z->zfmt = sf->depth_format;
+@@ -1552,2 +1591,3 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+         g.surfaces[targets[i]].guest_dirty = 1;
++        g.surfaces[targets[i]].guest_newer = 0;
+     }
+@@ -2412,4 +2452,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+         for (u32 i = 0; i < g.n_surfaces; i++) {
+-            if (compressed || !g.surfaces[i].handle || g.surfaces[i].location != t.location ||
+-                g.surfaces[i].offset != t.offset)
++            if (compressed || !g.surfaces[i].handle || g.surfaces[i].guest_newer ||
++                g.surfaces[i].location != t.location || g.surfaces[i].offset != t.offset)
+                 continue;
+@@ -2429,3 +2469,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             const eng_zdepth* z = &g.zdepths[i];
+-            if (compressed || z->location != t.location || z->offset != t.offset || !z->depth_serial)
++            if (compressed || z->guest_newer || z->location != t.location || z->offset != t.offset ||
++                !z->depth_serial)
+                 continue;
+@@ -2500,4 +2541,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             for (u32 i = 0; i < g.n_zdepths; i++)
+-                if (g.zdepths[i].location == t.location &&
+-                    g.zdepths[i].offset == t.offset && current_zslot != i) {
++                if (g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset &&
++                    current_zslot != i && !g.zdepths[i].guest_newer) {
+                     g.zdepths[i].last_use = g.frames;
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index d742673..d4357b3 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -324,3 +324,6 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
+  * pitch, `w` and `h` in 32-bit pixels. Only 8-bit-per-channel surfaces laid
+- * out with the same pitch take part; anything else is left alone. */
++ * out with the same pitch take part. Any other target the rectangle covers
++ * (another pitch or format, a depth target) holds older pixels than guest
++ * memory from then on: textures read the guest bytes there, and a later
++ * transfer does not write it back, until something is drawn into it again. */
+ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 110468a..fde335a 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -1262,7 +1262,2 @@ static void test_transfer_coherence(void)
+ 
+-    /* Another pitch lays the rows out elsewhere, and other memory is not a surface. */
+-    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 2048u, 4u, 4u);
+-    rsx_draw_engine_guest_wrote(RSX_LOCATION_MAIN, 0x40000u, 1024u, 4u, 4u);
+-    CHECK(g_written.n == 1, "a different pitch or memory space touches no surface");
+-
+     /* A transfer reading a surface's bytes gets the GPU's pixels first. */
+@@ -1274,2 +1269,69 @@ static void test_transfer_coherence(void)
+           "the surface's R,G,B,A pixels land in guest memory as A8R8G8B8");
++
++    /* Another pitch lays the rows out elsewhere, and other memory is not a surface. */
++    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 2048u, 4u, 4u);
++    rsx_draw_engine_guest_wrote(RSX_LOCATION_MAIN, 0x40000u, 1024u, 4u, 4u);
++    CHECK(g_written.n == 1, "a different pitch or memory space touches no surface");
++    engine_down();
++}
++
++/* A transfer that writes over a target at another pitch leaves its pixels older than guest memory: Resistance 3
++ * copies its frame with NV3089 over a bloom target and a shadow map's zeta drawn at the same address and samples
++ * the copy. Textures read the guest bytes until the target is drawn into again. */
++static void test_transfer_supersedes_other_targets(void)
++{
++    printf("-- transfer over a target at another pitch\n");
++    engine_up();
++    m(M_COLOR_A_PITCH, 1024u);                 /* 256 pixels of A8R8G8B8 */
++    draw_triangle();
++    const u32 surface = stub.bound_rt[0];
++    m(M_COLOR_A_OFFSET, 0x90000u);
++    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
++    draw_triangle();
++    CHECK(stub.bound_tex[0] == surface, "a unit at the target's address samples it");
++
++    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u + 2u * 1024u, 1024u, 4u, 4u);
++    draw_triangle();
++    CHECK(stub.bound_tex[0] == surface, "a transfer at its own pitch updates it and it is still sampled");
++
++    int before = stub.n_texture_create;
++    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 3840u, 960u, 4u);
++    draw_triangle();
++    CHECK(stub.bound_tex[0] != surface && stub.n_texture_create == before + 1,
++          "after one at another pitch the unit reads guest memory (%d uploads)",
++          stub.n_texture_create - before);
++
++    u8* px = vm_base + GUEST_LOCAL_EA + 0x40000u + 1024u;
++    memset(px, 0x5A, 8);
++    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, 0x40000u + 1024u, 1024u, 2u, 1u);
++    CHECK(px[0] == 0x5A && px[7] == 0x5A, "a later transfer does not write the old pixels back over it");
++
++    m(M_COLOR_A_OFFSET, 0x40000u);
++    draw_triangle();
++    m(M_COLOR_A_OFFSET, 0x90000u);
++    draw_triangle();
++    CHECK(stub.bound_tex[0] == surface, "drawn into again, the target is sampled again");
++
++    /* A depth target the transfer covers: the unit reads guest memory, nothing is read back from it. */
++    const u32 zeta = 0x00100000u;
++    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
++    m(M_SURFACE_FORMAT, 8u | (2u << 5));
++    m(M_ZETA_OFFSET, zeta);
++    m(M_ZETA_PITCH, 1024u);
++    m(M_COLOR_A_OFFSET, zeta);
++    m(M_COLOR_MASK, 0u);
++    m(M_DEPTH_TEST, 1u);
++    m(M_DEPTH_WRITE, 1u);
++    draw_triangle();
++    m(M_COLOR_MASK, 0x01010101u);
++    m(M_DEPTH_TEST, 0u);
++    m(M_DEPTH_WRITE, 0u);
++    m(M_COLOR_A_OFFSET, 0x90000u);
++    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, zeta, 3840u, 960u, 4u);
++    bind_texture_unit(RSX_LOCATION_LOCAL, zeta);
++    before = stub.n_texture_create;
++    draw_triangle();
++    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == before + 1,
++          "a zeta written over reads guest memory (%d readbacks, %d uploads)",
++          stub.n_depth_readback, stub.n_texture_create - before);
+     engine_down();
+@@ -2225,2 +2287,3 @@ int main(void)
+     test_transfer_coherence();
++    test_transfer_supersedes_other_targets();
+     test_transfer_rows();

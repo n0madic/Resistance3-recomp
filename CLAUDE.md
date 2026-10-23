@@ -123,6 +123,8 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   The menu atlases (DXT) share local memory with the level's post-processing targets and the engine's target table
   outlives the level: a block-compressed unit never reads a target (`gcm-rsx/0017`; before, the menu after leaving a
   mission was noise on a flat background).
+  An NV3089 copy that lands over a target it does not update (another pitch) makes guest memory the newer copy until
+  the target is drawn again (`gcm-rsx/0018`; before, the hurt screen showed a stretched bloom target over black).
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
