@@ -19,7 +19,8 @@ data, the lifted module, build products and logs must never be committed. `build
   copy. `PACKED/GAME/*.PSARC` is uppercase locally; the host FS is case-insensitive.
 - Runtime state written by the game: `gamedata/dev_hdd0/` (HDD install, saves, trophies), `cache/BCES01118` (FIOS
   disk cache; delete it if a data-path bug may have poisoned it). The host keeps translated shaders in `cache/msl`
-  (`PS3RECOMP_MSL_CACHE`, gcm-rsx/0015): a first run stalls on every new shader, later runs do not.
+  (`PS3RECOMP_MSL_CACHE`, gcm-rsx/0015): a first run stalls on every new shader, later runs do not. The files stay
+  valid across host rebuilds; an edit to `rsx_shader_msl.cpp`/`.h` (their hash is the key) retires them.
 
 ## Commands
 
