@@ -1,0 +1,696 @@
+SPU: position-independent code modules: lifted once, dispatched wherever they are loaded.
+
+Resistance 3's job igjob_00DC0200 loads two small modules (guest 0xDB2D80 and 0xDB0400) into its local store at a
+new address every time (0x11B60, 0x133C0, 0x146C0, ...) and calls them. A lift is made for one address, so they ran in
+the interpreter: in the opening cutscene (the blurred hand) about 25M interpreted steps/s on two SPU threads, and the
+game stood at 0-2 fps for 20-35 s; afterwards about 12M steps/s kept the cutscene at 25-28 fps instead of 30.
+Their only references to their own addresses are pc-relative (lqr, link values, relative branches), so one lift serves
+every load:
+
+- spu_lifter.py --pic (build_spu_workloads.py --pic IMAGE): every LS address of the image that the code observes --
+  lqr/stqr addresses, link values, return pcs, transfer targets -- is emitted moved by _pd, the load offset a function
+  takes on entry from the pc it was entered at (ctx->pc is the entry's address on every way into a lifted function;
+  the PIC lift sets it before its own direct calls). Absolute branches (bra/brasl) stay absolute. Without --pic the
+  output is unchanged (all 62 SPU images of the title lift byte-identical).
+- spu_overlay_register_pic_region: a verified region whose GET may land anywhere. The load at L takes a resident code
+  slot: the one at L, else one whose whole span the GET overwrote, else a free one, else the one of another copy --
+  one that later loads overwrote in part first, the oldest first (resident slots record when they were loaded). Copies
+  neither use up the slots nor keep fixed-address code out, and one that a later load overwrote in part keeps the rest
+  while a slot is free. (Evicting simply the oldest copy threw out the one the job had been running all along.) The copy is verified once against the code bytes moved to
+  L, and dispatch to A there runs the function lifted at A - L + link address.
+
+Test: tools/test_spu_lifter_pic.py lifts a module with --pic and runs it with the runtime at three load addresses (14
+checks fail at the two non-zero ones without --pic); runtime/spu/tests/test_spu_lifted_start.c
+test_pic_resident_code (8 checks fail without the address mapping).
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index faeda8f..00e9a45 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1541,2 +1541,3 @@ static int spu_resident_hole(const spu_context* ctx, unsigned slot, uint32_t lsa
+ }
++static uint32_t spu_resident_link_lsa(const spu_context* ctx, unsigned slot, uint32_t lsa);
+ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+@@ -1557,3 +1558,4 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+                 !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
+-            return (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
++            return (spu_lifted_fn)spu_lookup(spu_resident_link_lsa(ctx, slot, lsa),
++                                             ctx->resident_code[slot].image_id);
+         }
+@@ -1669,3 +1671,4 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
+-                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code; } spu_ovl_src;
++                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
++                 int pic; } spu_ovl_src;
+ /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
+@@ -1730,2 +1733,23 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+ 
++/* A position-independent module is a verified region the title may load at any
++ * local-store address: link_lsa is where it was lifted (spu_lifter.py --pic),
++ * and a load at L is the same code moved by L - link_lsa. */
++int spu_overlay_register_pic_region(uint32_t content_ea, uint32_t link_lsa,
++    uint32_t span, int image_id, const spu_overlay_code_segment* code, unsigned count)
++{
++    if (!spu_overlay_register_verified_region(content_ea, link_lsa, span, image_id, code, count))
++        return 0;
++    s_ovl_src[s_ovl_src_count - 1].pic = 1;
++    return 1;
++}
++
++/* The address a resident slot's lift has for the loaded byte at lsa: the same
++ * address, except in a position-independent module loaded away from its link
++ * address. */
++static uint32_t spu_resident_link_lsa(const spu_context* ctx, unsigned slot, uint32_t lsa)
++{
++    const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
++    return o->pic ? lsa - ctx->resident_code[slot].lsa + o->load_lsa : lsa;
++}
++
+ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+@@ -1735,2 +1759,5 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+         const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
++        /* Where the load put the lifted bytes: 0 but for a position-independent
++         * module loaded away from its link address. */
++        const uint32_t moved = ctx->resident_code[slot].lsa - o->load_lsa;
+         int match = 1;
+@@ -1739,3 +1766,3 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+         for (unsigned i = 0; match && i < o->code_count; ++i)
+-            for (uint32_t a = o->code[i].lsa, end = o->code[i].lsa + o->code[i].size; match && a < end;) {
++            for (uint32_t a = o->code[i].lsa + moved, end = a + o->code[i].size; match && a < end;) {
+                 uint32_t run = end;
+@@ -1746,3 +1773,3 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+                 }
+-                if (run > a) { match = !memcmp(ctx->ls + a, o->code[i].bytes + (a - o->code[i].lsa), run - a); a = run; }
++                if (run > a) { match = !memcmp(ctx->ls + a, o->code[i].bytes + (a - moved - o->code[i].lsa), run - a); a = run; }
+             }
+@@ -1900,2 +1927,30 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
+ 
++/* The slot for a code load that wrote [lsa, lsa + size): the one of a load at
++ * the same address, else one whose whole span it overwrote, else a free slot,
++ * else the one of a copy of a position-independent module: one that later
++ * loads overwrote in part first (the title has moved on from it), the oldest
++ * first. Those copies come and go at a new address each time, so they must
++ * neither use up the slots nor keep fixed-address code out; a copy a load
++ * overwrote only in part keeps the rest (its holes) while a slot is free.
++ * N when none is left. */
++static unsigned spu_resident_slot(const spu_context* ctx, uint32_t lsa, uint32_t size)
++{
++    unsigned free_slot = SPU_RESIDENT_CODE_SLOTS, pic_slot = SPU_RESIDENT_CODE_SLOTS;
++    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
++        const uint32_t base = ctx->resident_code[slot].lsa, span = ctx->resident_code[slot].size;
++        if (!ctx->resident_code[slot].image_id) {
++            if (free_slot == SPU_RESIDENT_CODE_SLOTS) free_slot = slot;
++            continue;
++        }
++        if (base == lsa || (base >= lsa && base - lsa <= size && span <= size - (base - lsa))) return slot;
++        if (!s_ovl_src[ctx->resident_code[slot].source_index].pic) continue;
++        if (pic_slot == SPU_RESIDENT_CODE_SLOTS) { pic_slot = slot; continue; }
++        const int holed = ctx->resident_code[slot].n_holes != 0, best_holed = ctx->resident_code[pic_slot].n_holes != 0;
++        if (holed != best_holed ? holed
++                                : (int32_t)(ctx->resident_code[slot].loaded - ctx->resident_code[pic_slot].loaded) < 0)
++            pic_slot = slot;
++    }
++    return free_slot != SPU_RESIDENT_CODE_SLOTS ? free_slot : pic_slot;
++}
++
+ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
+@@ -1936,18 +1991,19 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                 if (lsa + o->span > SPU_LS_SIZE) return;
+-                /* Verified code was lifted for one load address. */
+-                if (o->code && lsa != o->load_lsa) continue;
+-                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+-                        continue;
+-                    ctx->resident_code[slot].lsa = lsa;
+-                    ctx->resident_code[slot].size = o->span;
+-                    ctx->resident_code[slot].source_ea = ea;
+-                    ctx->resident_code[slot].image_id = o->image_id;
+-                    ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
+-                    ctx->resident_code[slot].source_index = i;
+-                    ctx->resident_code[slot].n_holes = 0;
+-                    spu_dcache_residency_changed(ctx);
++                /* Verified code was lifted for one load address, unless it is
++                 * position-independent. */
++                if (o->code && !o->pic && lsa != o->load_lsa) continue;
++                const unsigned slot = spu_resident_slot(ctx, lsa, size);
++                if (slot == SPU_RESIDENT_CODE_SLOTS) {
++                    fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                     return;
+                 }
+-                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
++                ctx->resident_code[slot].lsa = lsa;
++                ctx->resident_code[slot].size = o->span;
++                ctx->resident_code[slot].source_ea = ea;
++                ctx->resident_code[slot].image_id = o->image_id;
++                ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
++                ctx->resident_code[slot].source_index = i;
++                ctx->resident_code[slot].n_holes = 0;
++                spu_dcache_residency_changed(ctx);
++                ctx->resident_code[slot].loaded = ctx->dcache_residency;
+                 return;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index ffec359..8605dae 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -302,2 +302,5 @@ typedef struct spu_context {
+         int verify_state, source_index;
++        /* When it was loaded, in dcache_residency ticks: the oldest copy of a
++         * position-independent module gives its slot up first. */
++        uint32_t loaded;
+         /* LS ranges [lo, hi) inside the span that a DMA from elsewhere wrote
+diff --git a/runtime/spu/spu_overlay_residency.h b/runtime/spu/spu_overlay_residency.h
+index d05d733..f1f97bd 100644
+--- a/runtime/spu/spu_overlay_residency.h
++++ b/runtime/spu/spu_overlay_residency.h
+@@ -28,2 +28,14 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+ 
++/* Register a position-independent code module: a verified region the title
++ * loads anywhere in local store, often at a new address each time. Its
++ * functions are lifted once at link_lsa with spu_lifter.py --pic, and its code
++ * segments are given at link addresses. A GET from content_ea into local store
++ * at L makes [L, L + span) resident, verified once against the segments moved
++ * to L; dispatch to an address A there runs the function lifted at
++ * A - L + link_lsa, which finds L from the pc it is entered at. Returns 1 on
++ * success, 0 on invalid input or a full registry. */
++int spu_overlay_register_pic_region(uint32_t content_ea, uint32_t link_lsa,
++    uint32_t span, int image_id, const spu_overlay_code_segment* code,
++    unsigned count);
++
+ #ifdef __cplusplus
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index d2489fc..2944662 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -515,2 +515,95 @@ static void test_verified_with_holes(void)
+ 
++/* A position-independent module is lifted once, at its link address, and the
++ * title loads it anywhere: every load dispatches to the same lift, verified
++ * against the bytes where the load put them. Copies come and go at new
++ * addresses, mostly over an earlier one, and must not use up the slots. */
++static void pic_entry(spu_context* ctx) { ctx->gpr[3]._u32[0] = 105; ctx->gpr[4]._u32[0] = ctx->pc; }
++static void pic_inner(spu_context* ctx) { ctx->gpr[3]._u32[0] = 106; ctx->gpr[4]._u32[0] = ctx->pc; }
++static void test_pic_resident_code(void)
++{
++    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
++    if (!ctx) { check(0, "allocate pic context"); return; }
++    spu_context_init(ctx, 0);
++    const uint32_t ea = 0xE00000, link = 0x0, first = 0x11B60;
++    uint8_t code[0x100];
++    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x60 + i);
++    spu_begin_image(105); spu_register_function(link, pic_entry); spu_register_function(link + 0x80, pic_inner);
++    spu_begin_image(0);
++    const spu_overlay_code_segment seg = {link, sizeof code, code};
++    check(spu_overlay_register_pic_region(ea, link, sizeof code, 105, &seg, 1), "pic module registers");
++    ctx->image_id = 100;
++    memcpy(ctx->ls + link, code, sizeof code);          /* the link address holds the code too: not what is verified */
++
++    memcpy(ctx->ls + first, code, sizeof code);
++    spu_overlay_note_get(ctx, ea, ctx->ls + first, sizeof code);
++    check(spu_lifted_lookup(ctx, first) == pic_entry, "a load away from the link address dispatches the lift");
++    check(spu_lifted_lookup(ctx, first + 0x80) == pic_inner, "every function of it, at its offset");
++    check(spu_lifted_lookup(ctx, first + sizeof code) == NULL, "the end of the copy is not its code");
++    ctx->gpr[4]._u32[0] = 0; spu_dispatch(ctx, first + 0x80);
++    check(ctx->gpr[3]._u32[0] == 106 && ctx->gpr[4]._u32[0] == first + 0x80,
++          "dispatch enters the lift with the pc of the copy");
++
++    const uint32_t second = 0x14600;
++    memcpy(ctx->ls + second, code, sizeof code);
++    spu_overlay_note_get(ctx, ea, ctx->ls + second, sizeof code);
++    check(spu_lifted_lookup(ctx, second) == pic_entry && spu_lifted_lookup(ctx, first) == pic_entry,
++          "two copies are resident together");
++
++    const uint32_t over = first + 0x80;                 /* the next copy lands over half of the first */
++    memcpy(ctx->ls + over, code, sizeof code);
++    spu_overlay_note_get(ctx, ea, ctx->ls + over, sizeof code);
++    check(spu_lifted_lookup(ctx, over) == pic_entry, "a copy over an earlier one dispatches");
++    check(spu_lifted_lookup(ctx, first) == pic_entry, "the part of the earlier copy it left still does");
++    unsigned held = 0;
++    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) held += ctx->resident_code[slot].image_id == 105;
++    check(held == 3, "both keep a slot");
++    memcpy(ctx->ls + first - 0x10, code, sizeof code);   /* this one covers the whole first copy... */
++    memcpy(ctx->ls + first - 0x10 + sizeof code, code, 0x20);
++    spu_overlay_note_get(ctx, ea, ctx->ls + first - 0x10, sizeof code + 0x20);
++    held = 0;
++    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) held += ctx->resident_code[slot].image_id == 105;
++    check(held == 3, "...and takes its slot");
++    check(spu_lifted_lookup(ctx, first - 0x10) == pic_entry, "where it dispatches");
++
++    const uint32_t bad = 0x16000;
++    memcpy(ctx->ls + bad, code, sizeof code);
++    ctx->ls[bad + 0x10] ^= 0xFF;
++    spu_overlay_note_get(ctx, ea, ctx->ls + bad, sizeof code);
++    check(spu_lifted_lookup(ctx, bad) == NULL, "a copy whose bytes differ is interpreted");
++
++    for (uint32_t i = 0; i < 2 * SPU_RESIDENT_CODE_SLOTS; ++i) {
++        const uint32_t at = 0x20000 + i * 0x200;
++        memcpy(ctx->ls + at, code, sizeof code);
++        spu_overlay_note_get(ctx, ea, ctx->ls + at, sizeof code);
++    }
++    const uint32_t last = 0x20000 + (2 * SPU_RESIDENT_CODE_SLOTS - 1) * 0x200;
++    check(spu_lifted_lookup(ctx, last) == pic_entry, "more copies than slots: the newest is resident");
++
++    /* All slots held by copies: a copy later loads overwrote in part goes before
++     * an older one left whole (the title still runs that one). */
++    memset(ctx->resident_code, 0, sizeof ctx->resident_code);
++    const uint32_t oldest = 0x2C000, holed = 0x2C200, newest = 0x36000;
++    for (uint32_t i = 0; i < SPU_RESIDENT_CODE_SLOTS; ++i) {
++        const uint32_t at = oldest + i * 0x200;
++        memcpy(ctx->ls + at, code, sizeof code);
++        spu_overlay_note_get(ctx, ea, ctx->ls + at, sizeof code);
++    }
++    spu_overlay_note_get(ctx, 0x4AD00000, ctx->ls + holed + 0x80, 0x10);   /* data over a younger copy */
++    memcpy(ctx->ls + newest, code, sizeof code);
++    spu_overlay_note_get(ctx, ea, ctx->ls + newest, sizeof code);
++    check(spu_lifted_lookup(ctx, newest) == pic_entry, "a copy loaded with every slot taken dispatches");
++    check(spu_lifted_lookup(ctx, oldest) == pic_entry, "the oldest copy, left whole, keeps its slot");
++    check(spu_lifted_lookup(ctx, holed) == NULL, "the one a later load overwrote in part gave its slot up");
++
++    /* All slots held by copies: a fixed-address module still gets one. */
++    const uint32_t fixed = 0x3A000;
++    spu_begin_image(107); spu_register_function(fixed, pic_inner);
++    spu_begin_image(0);
++    spu_overlay_register_region(0xF00000, 0x400, 107);
++    spu_overlay_note_get(ctx, 0xF00000, ctx->ls + fixed, 0x400);
++    check(spu_lifted_lookup(ctx, fixed) == pic_inner, "copies do not keep a fixed-address module out");
++    g_spu_trampoline_fn = 0;
++    free(ctx);
++}
++
+ /* A streamed region registered with its code bytes dispatches by residency
+@@ -1054,2 +1147,3 @@ int main(void)
+     test_verified_with_holes();
++    test_pic_resident_code();
+     test_resident_interpreter_rejoin();
+diff --git a/runtime/spu/tests/test_spu_pic_lift.c b/runtime/spu/tests/test_spu_pic_lift.c
+new file mode 100644
+index 0000000..74f28e5
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_pic_lift.c
+@@ -0,0 +1,136 @@
++/* A position-independent module lifted once (spu_lifter.py --pic, generated by
++ * tools/test_spu_lifter_pic.py into pic_lifted.c) runs from wherever it is
++ * loaded. The module (link address 0):
++ *
++ *   0x00 brsl $r0, 0x10      internal call: the link is the copy's address
++ *   0x04 lqr  $r4, 0x40      pc-relative load of the copy's constant
++ *   0x08 stqr $r4, 0x50      pc-relative store into the copy
++ *   0x0C br   0x20           transfer to another lifted function
++ *   0x10 lqr  $r5, 0x40      (callee) the same constant, from the callee
++ *   0x14 ori  $r6, $r0, 0    the link it was called with
++ *   0x18 bi   $r0            return
++ *   0x20 bisl $r0, $r7       indirect call out of the module (to 0x300)
++ *   0x24 ori  $r8, $r0, 0    the link of that call
++ *   0x28 bra  0x240          absolute branch out of the module: finish
++ *   0x40 constant, 0x50 store target
++ *
++ * Usage: test_spu_pic_lift <load address>. The link address holds a decoy
++ * constant, so a lift reading its own link addresses shows. */
++#include "../spu_helpers.h"
++#include "../spu_interp.h"
++#include "../spu_overlay_residency.h"
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++extern void spu_begin_image(int);
++extern void spu_register_function(uint32_t, void (*)(spu_context*));
++extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
++extern void spu_halt(spu_context*);
++extern void pic_spu_recomp_register(void);
++extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
++
++static const uint32_t module[24] = {
++    0x33000200, 0x33800784, 0x23800904, 0x32000280,
++    0x33800605, 0x04000006, 0x35000000, 0x00200000,
++    0x35200380, 0x04000008, 0x30004800, 0x00200000,
++    0x00200000, 0x00200000, 0x00200000, 0x00200000,
++    0xDEADBEEF, 0x01234567, 0x89ABCDEF, 0x0F1E2D3C,
++    0, 0, 0, 0,
++};
++static const uint32_t constant[4] = {0xDEADBEEF, 0x01234567, 0x89ABCDEF, 0x0F1E2D3C};
++static spu_context ctx;
++static uint32_t base;
++
++static uint32_t ls_word(uint32_t a) {
++    return ((uint32_t)ctx.ls[a] << 24) | ((uint32_t)ctx.ls[a+1] << 16) |
++           ((uint32_t)ctx.ls[a+2] << 8) | ctx.ls[a+3];
++}
++static void put_words(uint32_t a, const uint32_t* w, unsigned n) {
++    for (unsigned i = 0; i < n; ++i) {
++        ctx.ls[a+4*i] = w[i] >> 24; ctx.ls[a+4*i+1] = w[i] >> 16;
++        ctx.ls[a+4*i+2] = w[i] >> 8; ctx.ls[a+4*i+3] = w[i];
++    }
++}
++static void callee(spu_context* c) {
++    c->gpr[9] = c->gpr[0];
++    SPU_RET(c);
++}
++static void finish(spu_context* c) {
++    c->gpr[11]._u32[0]++;
++    c->status = SPU_STATUS_STOPPED_BY_STOP;
++    spu_halt(c);
++}
++static void start(spu_context* c) {
++    c->pc = base; g_spu_trampoline_fn = spu_indirect_branch;
++}
++static int same_quad(const u128* r) {
++    for (int i = 0; i < 4; ++i)
++        if (r->_u32[i] != constant[i]) return 0;
++    return 1;
++}
++
++int main(int argc, char** argv) {
++    assert(argc == 2);
++    base = (uint32_t)strtoul(argv[1], 0, 0);
++    spu_context_init(&ctx, 0);
++    ctx.image_id = 77;
++    ctx.policy_mode = 1;
++    ctx.status = SPU_STATUS_RUNNING;
++    spu_begin_image(77);
++    spu_register_function(0x240, finish);
++    spu_register_function(0x300, callee);
++    spu_begin_image(78);
++    pic_spu_recomp_register();
++    spu_begin_image(0);
++    uint8_t bytes[sizeof module];
++    for (unsigned i = 0; i < 24; ++i) {
++        bytes[4*i] = module[i] >> 24; bytes[4*i+1] = module[i] >> 16;
++        bytes[4*i+2] = module[i] >> 8; bytes[4*i+3] = module[i];
++    }
++    const spu_overlay_code_segment seg = {0, 0x30, bytes};
++    assert(spu_overlay_register_pic_region(0xE00000, 0, sizeof bytes, 78, &seg, 1));
++    if (base) {
++        const uint32_t decoy[4] = {1, 2, 3, 4};
++        put_words(0x40, decoy, 4);
++    }
++    put_words(base, module, 24);
++    spu_overlay_note_get(&ctx, 0xE00000, ctx.ls + base, sizeof bytes);
++    ctx.gpr[7]._u32[0] = 0x300;
++
++    int halted = spu_run_with_halt(start, &ctx);
++    printf("base 0x%05X: halted=%d finish=%u r6=0x%X r8=0x%X r9=0x%X stored=%08X\n", base, halted,
++           ctx.gpr[11]._u32[0], ctx.gpr[6]._u32[0], ctx.gpr[8]._u32[0], ctx.gpr[9]._u32[0],
++           ls_word(base + 0x50));
++    int ok = 1;
++#define EXPECT(c, what) do { if (!(c)) { printf("  FAIL: %s\n", what); ok = 0; } } while (0)
++    EXPECT(ctx.gpr[11]._u32[0] == 1, "the absolute branch out of the module reached finish");
++    EXPECT(same_quad(&ctx.gpr[4]), "lqr read the copy's constant");
++    EXPECT(same_quad(&ctx.gpr[5]), "the callee's lqr read it too");
++    EXPECT(ls_word(base + 0x50) == constant[0] && ls_word(base + 0x5C) == constant[3], "stqr wrote into the copy");
++    EXPECT(!base || ls_word(0x50) == 0, "nothing was written at the link address");
++    EXPECT(ctx.gpr[6]._u32[0] == base + 4, "the internal call's link is the copy's return address");
++    EXPECT(ctx.gpr[9]._u32[0] == base + 0x24, "the outgoing call's link is the copy's return address");
++    EXPECT(ctx.gpr[8]._u32[0] == base + 0x24, "and execution came back to the copy after it");
++    puts(ok ? "PASS" : "FAILED");
++    return ok ? 0 : 1;
++}
++
++/* The rest of the runtime these units reach at link time; none of it runs here. */
++void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
++void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
++unsigned long long ps3_ms_now(void) { return 0; }
++uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
++int g_resv_store_active;
++uint32_t g_barrier_sync_watch;
++uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
++void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
++void ydkj_wake_all_event_flags(void) { abort(); }
++void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
++    (void)c; (void)a; (void)b; (void)d; abort();
++}
++uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+diff --git a/tools/build_spu_workloads.py b/tools/build_spu_workloads.py
+index e506810..eaac08c 100644
+--- a/tools/build_spu_workloads.py
++++ b/tools/build_spu_workloads.py
+@@ -122,2 +122,7 @@ def main():
+                          "e.g. --extra-funcs pm_wwsjob=0xA2C")
++    ap.add_argument("--pic", action="append", default=[], metavar="IMAGE",
++                    help="Lift this image position-independent (spu_lifter "
++                         "--pic): code the title loads at a different LS "
++                         "address each time. Register it with "
++                         "spu_overlay_register_pic_region. Repeatable.")
+     ap.add_argument("--constructor", action="store_true",
+@@ -161,2 +166,4 @@ def main():
+                    "--symbol-prefix", prefix, "-o", outdir]
++            if img in args.pic:
++                cmd.append("--pic")
+             if img in extra_funcs:
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index cdf5a39..fb99218 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -219,4 +219,4 @@ _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
+ # nested another host frame until the depth guard halted the SPU.
+-def _drain_ret_open(ret: int) -> str:
+-    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = 0x{ret & 0x3FFFC:X}; "
++def _drain_ret_open(ret: str) -> str:
++    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = {ret}; "
+ 
+@@ -515,4 +515,14 @@ LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
+ class SPULifter:
+-    def __init__(self, trace: bool = False, prefix: str = ""):
++    def __init__(self, trace: bool = False, prefix: str = "", pic: bool = False):
+         self.functions: list[LiftedFunction] = []
++        # Position-independent lift (--pic): code that is loaded anywhere in
++        # local store, lifted at one link address. Every LS address of the
++        # image that the code observes -- pc-relative loads and stores, link
++        # values, return pcs, transfer targets -- is emitted as that address
++        # moved by _pd, the load offset each function takes on entry from the
++        # pc it was entered at (ctx->pc is the entry's LS address on every way
++        # into a lifted function; the PIC lift sets it before its own direct
++        # calls too). The runtime maps the loaded copy's addresses back to
++        # the link addresses (spu_overlay_register_pic_region).
++        self.pic = pic
+         self.call_targets: set[int] = set()
+@@ -561,2 +571,5 @@ class SPULifter:
+         last_insn = None
++        if self.pic:
++            func.body_lines.append(
++                f"const uint32_t _pd = (uint32_t)(ctx->pc - 0x{start:X}u) & SPU_LS_MASK;")
+         for insn in insns:
+@@ -588,3 +601,3 @@ class SPULifter:
+             func.body_lines.append(
+-                f"    {{ ctx->pc = 0x{end:X}; "
++                f"    {{ ctx->pc = {self._ls(end)}; "
+                 f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+@@ -612,2 +625,12 @@ class SPULifter:
+ 
++    def _ls(self, addr: int, mask: int = 0) -> str:
++        """C expression of the LS address `addr` of this image (masked by
++        `mask` when given): the constant, or in a position-independent lift
++        the same address in the loaded copy."""
++        if mask:
++            addr &= mask
++        if self.pic:
++            return f"((0x{addr & 0x3FFFF:X}u + _pd) & SPU_LS_MASK)"
++        return f"0x{addr:X}"
++
+     @staticmethod
+@@ -872,5 +895,7 @@ class SPULifter:
+         if mn in ("lqa", "lqr"):
+-            return f"{g(rt())} = spu_ls_read128(ctx, {_imm(ops[1])});"
++            ea = self._ls(int(ops[1], 16)) if self.pic and mn == "lqr" else _imm(ops[1])
++            return f"{g(rt())} = spu_ls_read128(ctx, {ea});"
+         if mn in ("stqa", "stqr"):
+-            return f"spu_ls_write128(ctx, {_imm(ops[1])}, {g(rt())});"
++            ea = self._ls(int(ops[1], 16)) if self.pic and mn == "stqr" else _imm(ops[1])
++            return f"spu_ls_write128(ctx, {ea}, {g(rt())});"
+         if mn == "lqx":
+@@ -900,2 +925,7 @@ class SPULifter:
+                 return "ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
++            # An absolute target is not part of a position-independent image:
++            # a transfer to that LS address, wherever this copy runs.
++            if self.pic and mn == "bra" and tgt is not None:
++                return (f"ctx->pc = 0x{tgt:X}u; "
++                        f"g_spu_trampoline_fn = spu_indirect_branch; return;")
+             return self._uncond_branch(tgt, func)
+@@ -908,3 +938,3 @@ class SPULifter:
+             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
+-            link = f"{g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X});"   # wraps at the end of LS
++            link = f"{g(link_rt)} = spu_link({self._ls(addr + 4, 0x3FFFC)});"   # wraps at the end of LS
+             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
+@@ -927,4 +957,8 @@ class SPULifter:
+                 return f"{link} {self._uncond_branch(addr + 4, func)}"
++            if self.pic and mn == "brasl" and tgt is not None:
++                return f"{link} {{ uint32_t _tg = 0x{tgt:X}u; {self._dispatch_call(addr, '')} }}"
+             if tgt is not None:
+                 self.call_targets.add(tgt)
++                # The callee takes its load offset from the pc (see self.pic).
++                enter = f"ctx->pc = {self._ls(tgt)}; " if self.pic else ""
+                 # Nested host call bracketed by host_depth (so the callee's
+@@ -936,5 +970,5 @@ class SPULifter:
+                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+-                        f"{_drain_ret_open(addr + 4)}"
+-                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+-                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; "
++                        f"{_drain_ret_open(self._ls(addr + 4, 0x3FFFC))}"
++                        f"ctx->host_depth++; {enter}{self.prefix}spu_func_{tgt:08X}(ctx); "
++                        f"spu_drain_call(ctx, {self._ls(addr + 4)}); ctx->host_depth--; "
+                         f"{_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
+@@ -946,3 +980,3 @@ class SPULifter:
+                 return (f'/* TODO spu: {mn} {insn.operands} */ '
+-                        f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
++                        f'spu_unsupported({self._ls(insn.addr)}, "{mn}");')
+             if func.start_addr <= tgt < func.end_addr:
+@@ -952,3 +986,3 @@ class SPULifter:
+             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
+-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
++            return (f"if ({cond}) {{ ctx->pc = {self._ls(tgt)}; "
+                     f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+@@ -1000,8 +1034,4 @@ class SPULifter:
+             # read the target BEFORE writing the link: rt may be the same register as ra
+-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
+-                    f"int32_t _si = (int32_t)ctx->image_id; "
+-                    f"{_drain_ret_open(addr + 4)}"
+-                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
+-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
+-                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
++            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._ls(addr + 4, 0x3FFFC)}); "
++                    f"{self._dispatch_call(addr, _ied)} }}")
+         # bisled: set link, branch to RA only if an external event is pending.
+@@ -1011,3 +1041,3 @@ class SPULifter:
+             # read the target before writing the link: rt may alias ra
+-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
++            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._ls(addr + 4, 0x3FFFC)}); "
+                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
+@@ -1042,3 +1072,3 @@ class SPULifter:
+         return (f'/* TODO spu: {mn} {insn.operands} */ '
+-                f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
++                f'spu_unsupported({self._ls(insn.addr)}, "{mn}");')
+ 
+@@ -1057,2 +1087,13 @@ class SPULifter:
+ 
++    def _dispatch_call(self, addr: int, ied: str) -> str:
++        """Body of an indirect call from `addr` to the LS address in _tg, once
++        the link is set: nested dispatch bracketed like brsl (host_depth +
++        SPU_DRAIN + image save/restore) so the callee's tail-chains drain here
++        and its `bi $r0` returns via host return."""
++        return (f"int32_t _si = (int32_t)ctx->image_id; "
++                f"{_drain_ret_open(self._ls(addr + 4, 0x3FFFC))}"
++                f"{ied}ctx->pc = _tg; ctx->host_depth++; "
++                f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._ls(addr + 4)}); "
++                f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);")
++
+     def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
+@@ -1065,3 +1106,3 @@ class SPULifter:
+         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
+-        return (f"{{ ctx->pc = 0x{tgt:X}; "
++        return (f"{{ ctx->pc = {self._ls(tgt)}; "
+                 f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+@@ -1110,4 +1151,5 @@ class SPULifter:
+                 lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
+-                lines.append(f"    ctx->pc = 0x{t:X}u; "
+-                             f"g_spu_trampoline_fn = spu_indirect_branch; return;")
++                # A position-independent caller has already set the pc of the copy.
++                pc = "" if self.pic else f"ctx->pc = 0x{t:X}u; "
++                lines.append(f"    {pc}g_spu_trampoline_fn = spu_indirect_branch; return;")
+                 lines.append("}")
+@@ -1155,2 +1197,11 @@ def main() -> None:
+     p.add_argument("--report", help="Write machine-readable generation diagnostics JSON")
++    p.add_argument("--pic", action="store_true",
++                   help="Position-independent image: code the title loads at a "
++                        "different local-store address each time, lifted at "
++                        "--base (or the ELF's address). The lifted functions "
++                        "find the copy's address from the pc they are entered "
++                        "at; register the image with "
++                        "spu_overlay_register_pic_region so dispatch maps a "
++                        "loaded copy to them. Absolute branches (bra/brasl) "
++                        "stay absolute.")
+     p.add_argument("--trace", action="store_true",
+@@ -1319,3 +1370,3 @@ def main() -> None:
+ 
+-    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
++    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, pic=args.pic)
+     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
+diff --git a/tools/test_spu_lifter_pic.py b/tools/test_spu_lifter_pic.py
+new file mode 100644
+index 0000000..f79db8b
+--- /dev/null
++++ b/tools/test_spu_lifter_pic.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""Self-check: a position-independent SPU lift runs from wherever it is loaded.
++
++Lifts a small module with spu_lifter --pic at link address 0, builds it with the
++real runtime (runtime/spu/tests/test_spu_pic_lift.c) and runs it loaded at the
++link address and at two others: pc-relative loads and stores, link values,
++transfers between its functions and calls out of it all follow the copy.
++
++Run: python tools/test_spu_lifter_pic.py
++"""
++import os
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from spu_disasm import disassemble_spu  # noqa: E402
++from spu_lifter import SPULifter, compute_bi_r0_jumps, compute_link_returns  # noqa: E402
++
++if os.name == 'nt':
++    print('SKIP: fixture currently requires the POSIX compiler/linker')
++    raise SystemExit(0)
++
++ROOT = Path(__file__).resolve().parents[1]
++SPU = ROOT / 'runtime/spu'
++# The module of test_spu_pic_lift.c: code up to 0x30, then data.
++CODE = struct.pack('>12I', 0x33000200, 0x33800784, 0x23800904, 0x32000280,
++                   0x33800605, 0x04000006, 0x35000000, 0x00200000,
++                   0x35200380, 0x04000008, 0x30004800, 0x00200000)
++BOUNDS = [(0x00, 0x10), (0x10, 0x20), (0x20, 0x30)]
++SOURCES = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
++           'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
++           'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
++
++
++def lift(out: Path) -> None:
++    insns = disassemble_spu(CODE, 0)
++    lifter = SPULifter(prefix='pic_', pic=True)
++    lifter.bi_r0_jump = compute_bi_r0_jumps(insns, BOUNDS)
++    lifter.link_return = compute_link_returns(insns, BOUNDS)
++    lifter.func_starts = {s for s, _ in BOUNDS}
++    for s, e in BOUNDS:
++        lifter.lift_function(insns, s, e)
++    (out / 'pic_lifted.h').write_text(lifter.emit_header().replace('../../runtime/spu/', ''))
++    (out / 'pic_lifted.c').write_text(lifter.emit_source('pic_lifted.h').replace('../../runtime/spu/', ''))
++
++
++def main() -> int:
++    with tempfile.TemporaryDirectory(prefix='spu-pic-lift-') as tmp:
++        out = Path(tmp)
++        lift(out)
++        binary = out / 'test'
++        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-w',
++                        '-I' + str(ROOT / 'include'), '-I' + str(SPU), '-I' + str(ROOT / 'runtime/platform'),
++                        str(SPU / 'tests/test_spu_pic_lift.c'), str(out / 'pic_lifted.c'),
++                        *[str(SPU / name) for name in SOURCES],
++                        str(ROOT / 'runtime/platform/win32_compat.c'), '-pthread', '-lm',
++                        '-o', str(binary)], check=True)
++        env = {k: v for k, v in os.environ.items() if not k.startswith(('SPU_', 'SPURS_'))}
++        failed = []
++        for base in ('0', '0x11B60', '0x2A400'):
++            r = subprocess.run([str(binary), base], capture_output=True, text=True, timeout=10, cwd=tmp, env=env)
++            print(r.stdout.strip())
++            if r.returncode:
++                print(r.stderr[-2000:])
++                failed.append(base)
++    if failed:
++        print('FAILED at ' + ', '.join(failed))
++        return 1
++    print('ok: the position-independent lift runs from every load address')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

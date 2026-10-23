@@ -25,3 +25,10 @@ applied (Resistance 3 on macOS showed no need; re-check on the Windows/Linux hos
 - 0010: optional LGPL-free ATRAC build, MinGW GCC fixes in ppu_loader.cpp.
 - 0012: a higher-priority new thread runs until it blocks (SC2HD's audio mixer race; Resistance 3's audio queue key was
   never zero in any run).
+
+Later own patches set aside (complete, applied on top of their domain at the time):
+
+- metal-present-on-guest-cadence.patch (was metal/0003, 2026-10-23): shows frames one guest frame interval apart with
+  presentDrawable:atTime: (frames held for exactly 4 refreshes at 120 Hz: 721 -> 801-858 of 900). The judder it was
+  written for turned out to be shader translation stalls (gcm-rsx/0015), and with those gone no difference was visible;
+  it costs half a vblank of latency. Revisit if 30 fps content judders on a ProMotion display.

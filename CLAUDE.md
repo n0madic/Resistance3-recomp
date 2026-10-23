@@ -18,7 +18,8 @@ data, the lifted module, build products and logs must never be committed. `build
 - **Game data** `PS3_GAME/` (decrypted; served as `/dev_bdvd/PS3_GAME`). The ISO is gone: `PS3_GAME/` is the only
   copy. `PACKED/GAME/*.PSARC` is uppercase locally; the host FS is case-insensitive.
 - Runtime state written by the game: `gamedata/dev_hdd0/` (HDD install, saves, trophies), `cache/BCES01118` (FIOS
-  disk cache; delete it if a data-path bug may have poisoned it).
+  disk cache; delete it if a data-path bug may have poisoned it). The host keeps translated shaders in `cache/msl`
+  (`PS3RECOMP_MSL_CACHE`, gcm-rsx/0015): a first run stalls on every new shader, later runs do not.
 
 ## Commands
 
@@ -35,7 +36,8 @@ scripts/run_game.sh [--fps] [--log] [--lang ru|en]    # run; --log writes logs/r
 
 - `r3_host` ignores SIGTERM. Always `pkill -9 -x r3_host` before a run (stale instances survive and skew results);
   for timed runs use `timeout -k 3 N`. Use `pgrep -x` (not `-f`, which matches `timeout`).
-- The module's compile cache key ignores headers: after toolkit header changes delete `module/obj`.
+- The module's compile cache key includes the SDK ABI (a hash of the toolkit headers and lifters), so a header change
+  recompiles every unit.
 
 ### Tests (toolkit)
 

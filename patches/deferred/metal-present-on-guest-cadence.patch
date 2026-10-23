@@ -1,0 +1,265 @@
+Metal: show frames on the guest's cadence (whole vblanks apart), not the moment their flips arrive.
+
+The host presents a guest flip as soon as the walker reaches it, so when a frame is shown follows the guest's render
+time, which wanders by several milliseconds. On a 120 Hz (ProMotion) display Resistance 3's 30 fps opening cutscene
+then held frames for 3, 4 or 5 refreshes (the drawables' presentedTime over 900 frames: 721 x 4, 72 x 3, 76 x 5), and
+the woman getting up and walking to the bed judders while the camera holds still. The RSX shows a flip at a vblank,
+so on the console every frame of a 30 fps title stays up for exactly two 60 Hz refreshes.
+metal_frame_pacing.h estimates the guest's frame interval in whole vblanks (median of the last 15 present intervals;
+not paced beyond 4 vblanks, i.e. loading screens and stalls) and keeps a schedule that advances by that interval: the
+backend presents with presentDrawable:atTime: when a frame is early and at once when it is late (the schedule then
+restarts from it, half a vblank later than the interval alone so that frames wandering by a few ms still arrive in
+time), and restarts the schedule when a frame arrives more than an interval early (held frames take drawables,
+nextDrawable then blocks the thread that feeds the guest, and the guest locked itself at 20 fps). A minimum on-screen
+time (presentDrawable:afterMinimumDuration:) was tried first and fell into that 20 fps lock.
+PS3RECOMP_METAL_PACING=0 presents at once as before.
+
+Test: tools/test_metal_frame_pacing.py (libs/video/tests/test_metal_frame_pacing.c: 30/60/20 fps with jitter, loading
+screen, a single stall, the schedule). Scripted run of the cutscene, 900 frames' presentedTime at 120 Hz: frames held
+for 4 refreshes 721 -> 801-858, for 3 or 5 refreshes 148 -> 24-82, 7 dropped either way, 29.6 fps either way. (The
+judder the user saw turned out to be shader translation stalls, gcm-rsx/0015; this one was not visible by eye.)
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/video/metal_frame_pacing.h b/libs/video/metal_frame_pacing.h
+new file mode 100644
+index 0000000..302a87c
+--- /dev/null
++++ b/libs/video/metal_frame_pacing.h
+@@ -0,0 +1,81 @@
++/* Present pacing: when to show each frame so that frames stay on screen for the guest's frame interval.
++ *
++ * The RSX shows a flip at a vblank, so a title running at 30 fps puts every frame on a 60 Hz
++ * display for exactly two refreshes. The host presents a flip as soon as the guest issues it, so
++ * when a frame is shown follows the guest's render time, which wanders by several milliseconds from
++ * frame to frame. On a 120 Hz (ProMotion) display a 30 fps frame then stays up for 3, 4 or 5 refreshes, and
++ * anything moving on screen judders. Showing frames on a schedule that advances by exactly the guest's
++ * frame interval gives back the even cadence: a frame that arrives early waits for its time, one that
++ * arrives late is shown at once and the schedule restarts from it, METAL_PACING_LEAD_S later than the
++ * interval alone so that frames wandering by a few milliseconds still arrive in time (it costs that much
++ * latency; without it about one frame in twenty arrived late and was shown a refresh off). A frame
++ * more than a whole interval early restarts the schedule a vblank after the previous frame: held frames
++ * take drawables, the next nextDrawable blocks the thread that also feeds the guest, the guest slows to
++ * the held cadence and the interval estimate follows it (a 30 fps title locked itself at 20 fps that
++ * way). Showing that frame at once instead dropped the one still waiting for its time.
++ *
++ * The interval is the guest's, in whole vblanks: the median of the last present-to-present
++ * intervals rounded to vblanks, so a 30 fps title gets two and a 60 fps one gets one. Slower than
++ * METAL_PACING_MAX_VBLANKS (loading screens, stalls) is not paced. (A minimum on-screen time,
++ * presentDrawable:afterMinimumDuration:, held a 30 fps frame for five or six refreshes and slowed the
++ * guest to 20 fps: it counts from when the previous frame became visible.) Caller supplies
++ * synchronization. */
++#ifndef PS3RECOMP_METAL_FRAME_PACING_H
++#define PS3RECOMP_METAL_FRAME_PACING_H
++#include <string.h>
++
++#define METAL_PACING_VBLANK_S   (1.0 / 60.0)
++#define METAL_PACING_HISTORY    15
++#define METAL_PACING_MIN_SAMPLES 5
++#define METAL_PACING_MAX_VBLANKS 4
++#define METAL_PACING_LEAD_S     (METAL_PACING_VBLANK_S / 2.0)
++
++typedef struct {
++    double last;                                    /* time of the previous present, 0 before the first */
++    double due;                                     /* when the next frame is to be shown, 0 = not paced */
++    double shown;                                   /* when the previous frame was to be shown */
++    unsigned count, next;
++    unsigned char vblanks[METAL_PACING_HISTORY];    /* recent intervals, in vblanks */
++} MetalFramePacing;
++
++/* The guest's frame interval in seconds (whole vblanks), or 0 when it is not to be paced. Call at
++ * each present with a monotonic time in seconds. */
++static inline double metal_frame_pacing_interval(MetalFramePacing *p, double now)
++{
++    if (p->last > 0.0 && now > p->last) {
++        const double v = (now - p->last) / METAL_PACING_VBLANK_S;
++        const unsigned n = v < 0.5 ? 0u : v > 250.0 ? 250u : (unsigned)(v + 0.5);
++        p->vblanks[p->next] = (unsigned char)n;
++        p->next = (p->next + 1) % METAL_PACING_HISTORY;
++        if (p->count < METAL_PACING_HISTORY) ++p->count;
++    }
++    p->last = now;
++    if (p->count < METAL_PACING_MIN_SAMPLES) return 0.0;
++    unsigned char sorted[METAL_PACING_HISTORY];
++    memcpy(sorted, p->vblanks, sizeof sorted);
++    for (unsigned i = 1; i < p->count; ++i)                 /* insertion sort of a few bytes */
++        for (unsigned j = i; j > 0 && sorted[j - 1] > sorted[j]; --j) {
++            const unsigned char t = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = t;
++        }
++    const unsigned median = sorted[p->count / 2];
++    if (median < 1 || median > METAL_PACING_MAX_VBLANKS) return 0.0;
++    return median * METAL_PACING_VBLANK_S;
++}
++
++/* Call at each present, in the same time base as the display's (CACurrentMediaTime). Returns when to
++ * show this frame, or 0 for "at once". */
++static inline double metal_frame_pacing_present_time(MetalFramePacing *p, double now)
++{
++    const double interval = metal_frame_pacing_interval(p, now);
++    if (interval <= 0.0) { p->due = 0.0; p->shown = now; return 0.0; }
++    double t = 0.0;                                                 /* late, or the first: at once */
++    if (p->due > now && p->due <= now + interval)
++        t = p->due;                                                 /* on schedule */
++    else if (p->due > now && p->shown + METAL_PACING_VBLANK_S > now)
++        t = p->shown + METAL_PACING_VBLANK_S;                       /* far ahead: right after the one waiting */
++    p->due = t > 0.0 ? t + interval : now + interval + METAL_PACING_LEAD_S;
++    p->shown = t > 0.0 ? t : now;
++    return t;
++}
++
++#endif
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index fc6d49b..944272d 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -57,2 +57,3 @@
+ #include "metal_frame_rate.h"
++#include "metal_frame_pacing.h"
+ #include <stdatomic.h>
+@@ -182,2 +183,14 @@ void rsx_metal_backend_note_guest_frame(void) {}
+ 
++/* Present on the guest's cadence (metal_frame_pacing.h): frames are shown one guest frame interval
++ * (in whole vblanks) apart. PS3RECOMP_METAL_PACING=0 presents at once. */
++static void present_paced(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable)
++{
++    static int on = -1;
++    static MetalFramePacing pacing;
++    if (on < 0) { const char *e = getenv("PS3RECOMP_METAL_PACING"); on = !(e && e[0] == '0'); }
++    const double at = on ? metal_frame_pacing_present_time(&pacing, CACurrentMediaTime()) : 0.0;
++    if (at > 0.0) [cb presentDrawable:drawable atTime:at];
++    else [cb presentDrawable:drawable];
++}
++
+ /* ---- vertex layout ----------------------------------------------------------
+@@ -3740,3 +3753,3 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+-        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
++        if (drawable) { fps_track_drawable(drawable); present_paced(cb, drawable); }
+         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
+@@ -4219,3 +4232,3 @@ void rsx_metal_backend_present(void)
+ 
+-        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
++        if (drawable) { fps_track_drawable(drawable); present_paced(cb, drawable); }
+ 
+diff --git a/libs/video/tests/test_metal_frame_pacing.c b/libs/video/tests/test_metal_frame_pacing.c
+new file mode 100644
+index 0000000..becdcff
+--- /dev/null
++++ b/libs/video/tests/test_metal_frame_pacing.c
+@@ -0,0 +1,86 @@
++/* metal_frame_pacing.h: frames are shown on a schedule that advances by the guest's frame interval
++ * in whole vblanks, through jitter, and slow or irregular stretches are not paced. */
++#include "metal_frame_pacing.h"
++#include <math.h>
++#include <stdio.h>
++
++static int failed;
++static void check(int ok, const char *what)
++{
++    if (!ok) { printf("  FAIL: %s\n", what); failed = 1; }
++}
++
++/* Presents every `ms` milliseconds with a +-`jitter_ms` sawtooth; returns the last interval. */
++static double run(MetalFramePacing *p, double *t, int frames, double ms, double jitter_ms)
++{
++    double d = 0.0;
++    for (int i = 0; i < frames; ++i) {
++        const double j = jitter_ms * ((i % 5) - 2) / 2.0;
++        *t += (ms + j) / 1000.0;
++        d = metal_frame_pacing_interval(p, *t);
++    }
++    return d;
++}
++static int vblanks(double d, int n) { return fabs(d - n * METAL_PACING_VBLANK_S) < 1e-9; }
++
++int main(void)
++{
++    MetalFramePacing p; memset(&p, 0, sizeof p);
++    double t = 100.0;
++    check(metal_frame_pacing_interval(&p, t) == 0.0, "the first present is not paced");
++    check(run(&p, &t, 3, 33.3, 0) == 0.0, "nor the next few, before there is a history");
++    check(vblanks(run(&p, &t, 20, 33.3, 8), 2), "a 30 fps guest whose frames wander by 8 ms: two vblanks");
++    check(vblanks(run(&p, &t, 20, 16.7, 3), 1), "a 60 fps guest: one");
++    check(vblanks(run(&p, &t, 20, 50.0, 6), 3), "a 20 fps guest: three");
++    check(run(&p, &t, 20, 400.0, 0) == 0.0, "a loading screen at 2.5 fps is not paced");
++    check(vblanks(run(&p, &t, 20, 33.3, 0), 2), "and pacing comes back after it");
++    double d = 0.0;                            /* one long stall among steady frames */
++    for (int i = 0; i < 6; ++i) { t += (i == 3 ? 0.2 : 0.0333); d = metal_frame_pacing_interval(&p, t); }
++    check(vblanks(d, 2), "a single stall does not change the interval");
++
++    /* The schedule: 30 fps frames arriving 33.3 ms +- 8 ms apart are shown exactly 33.3 ms apart. */
++    MetalFramePacing s; memset(&s, 0, sizeof s);
++    double now = 200.0, prev_shown = 0.0;
++    int even = 1, scheduled = 0;
++    for (int i = 0; i < 60; ++i) {
++        now += (33.333 + 8.0 * (((i * 7) % 5) - 2) / 2.0) / 1000.0;
++        const double at = metal_frame_pacing_present_time(&s, now);
++        const double shown = at > 0.0 ? at : now;
++        if (at > 0.0) ++scheduled;
++        if (i > 20 && prev_shown > 0.0 && fabs((shown - prev_shown) - 2 * METAL_PACING_VBLANK_S) > 1e-6) even = 0;
++        prev_shown = shown;
++    }
++    check(scheduled > 50, "frames that arrive early wait for their time");
++    check(even, "and are shown exactly one guest interval apart");
++    /* A late frame is shown at once and the schedule restarts from it. */
++    const double late = now + 0.060;
++    check(metal_frame_pacing_present_time(&s, late) == 0.0, "a late frame is shown at once");
++    check(fabs(s.due - (late + 2 * METAL_PACING_VBLANK_S + METAL_PACING_LEAD_S)) < 1e-9,
++          "the next is due one interval and the lead after it");
++    /* A schedule left at three vblanks (after a slow stretch) must not hold a guest that is back at
++     * 30 fps: frames are never queued more than one interval ahead, so the guest is not slowed and the
++     * estimate returns to two vblanks. */
++    MetalFramePacing q; memset(&q, 0, sizeof q);
++    double tq = 300.0, ahead = 0.0;
++    for (int i = 0; i < 20; ++i) { tq += 0.050; metal_frame_pacing_present_time(&q, tq); }
++    for (int i = 0; i < 20; ++i) {
++        tq += 0.0333;
++        const double at = metal_frame_pacing_present_time(&q, tq);
++        if (at > 0.0 && at - tq > ahead) ahead = at - tq;
++    }
++    check(ahead <= 3 * METAL_PACING_VBLANK_S + 1e-9, "a frame is never held more than one interval");
++    /* ...and no frame is shown before the one in front of it (which would drop that one). */
++    MetalFramePacing r; memset(&r, 0, sizeof r);
++    double tr = 400.0, last = 0.0; int order = 1;
++    for (int i = 0; i < 20; ++i) { tr += 0.050; const double a = metal_frame_pacing_present_time(&r, tr); last = a > 0 ? a : tr; }
++    for (int i = 0; i < 20; ++i) {
++        tr += 0.0333;
++        const double a = metal_frame_pacing_present_time(&r, tr), at = a > 0.0 ? a : tr;
++        if (at <= last) order = 0;
++        last = at;
++    }
++    check(order, "frames are shown in order, none before the one ahead of it");
++    check(vblanks(metal_frame_pacing_interval(&q, tq + 0.0333), 2), "the estimate is back at two vblanks");
++    puts(failed ? "FAILED" : "metal frame pacing: all checks passed");
++    return failed;
++}
+diff --git a/tools/test_metal_frame_pacing.py b/tools/test_metal_frame_pacing.py
+new file mode 100644
+index 0000000..e579d90
+--- /dev/null
++++ b/tools/test_metal_frame_pacing.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++"""Builds and runs libs/video/tests/test_metal_frame_pacing.c (present pacing of the Metal backend)."""
++import os
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main() -> int:
++    with tempfile.TemporaryDirectory(prefix='metal-pacing-') as tmp:
++        binary = Path(tmp) / 'test'
++        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-I', str(ROOT / 'libs/video'),
++                        str(ROOT / 'libs/video/tests/test_metal_frame_pacing.c'), '-lm', '-o', str(binary)],
++                       check=True, timeout=60)
++        return subprocess.run([str(binary)], timeout=10).returncode
++
++
++if __name__ == '__main__':
++    sys.exit(main())

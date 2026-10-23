@@ -16,9 +16,13 @@ causes, both needed for the shadows to come back:
   snapshot is now released with it (it was dropped without a release when a zeta was reallocated).
 With both, PR #424's comparison order (depth FUNC reference, patches/upstream) gives the console's picture: the lit
 pool under the lamp with the table's shadow on its right; the other order lights only a patch under the table.
-TODO: the shadow maps are cleared with ZSTENCIL_CLEAR_VALUE 0 and drawn with LEQUAL; the engine's "0 means 1.0"
-reading of the clear value is what makes them work here, and why the console does not end up with an empty map
-is not understood.
+The shadow maps (and the main zeta) are cleared with a ZSTENCIL_CLEAR_VALUE of 0: the game sets it once, for the
+stencil-layer clear on a level's first frame (0x00BB56F0), and never writes the register again. On the console every
+flip puts the RSX state back to its reset values (RPCS3: flip_command -> rsx_state::reset, ZSTENCIL_CLEAR_VALUE
+0xFFFFFF00), so the later clears are to the far plane. The toolkit does not reset at a flip; the engine reading a 0
+clear value as 1.0 stands in for that. The reset with an honest decode is PR #526
+(https://github.com/sp00nznet/ps3recomp/pull/526); in a scripted run it gives the same Home frame, so it is not
+carried here.
 
 test_texture_layout: test_remap_depth_lanes (0xA900 and 0xAAE4 on all four depth formats; 24 failures without).
 test_rsx_draw_engine: test_full_tables_evict_the_oldest -- 64 zetas, two frames, a zeta read as a texture: the 65th

@@ -49,6 +49,7 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #endif
 
 #ifdef _WIN32
@@ -58,6 +59,7 @@
  * there is nothing to shim: the 15.6 ms default timer granularity this works
  * around is a Windows problem. */
 #include <timeapi.h>
+#include <direct.h>   /* _mkdir */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -273,6 +275,7 @@ static int rsx_backend_init(uint32_t w, uint32_t h, const char* title)
  * that all allocators skip, and log loudly on any overlap. */
 #define R3_HLE_INJECT_BASE 0x5F000000u
 #define R3_HDD0_ROOT  "./gamedata/dev_hdd0"   /* host dir of /dev_hdd0: installed data, saves */
+#define R3_MSL_CACHE_DIR "./cache/msl"          /* the game's shaders translated to MSL, kept between runs */
 /* The game's view turn rate (degrees per second) against right-stick deflection from the centre (0-127), at the
  * default look sensitivity, measured on the first level by holding the stick and reading the camera matrix
  * (guest 0x0105B4A0) every poll. A dead zone to 23, a slow span to 96 and a steep one to the top rate. */
@@ -419,10 +422,14 @@ static DWORD WINAPI frame_clock(LPVOID)
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
 
-        /* R3_FPS=1: guest frames presented per second, every 5 s. */
-        { static int on = -1; static ULONGLONG t0; static LONG f0;
-          if (on < 0) { on = getenv("R3_FPS") ? 1 : 0; t0 = now; f0 = g_frames_presented; }
-          if (on && now - t0 >= 5000) {
+        /* R3_FPS=1: guest frames presented per second, every 5 s; R3_FPS=<ms> (100 or more) sets the period. */
+        { static int on = -1; static ULONGLONG t0, period; static LONG f0;
+          if (on < 0) {
+              const char* e = getenv("R3_FPS");
+              on = e ? 1 : 0; period = (e && atoi(e) >= 100) ? (ULONGLONG)atoi(e) : 5000;
+              t0 = now; f0 = g_frames_presented;
+          }
+          if (on && now - t0 >= period) {
               const LONG f = g_frames_presented;
               fprintf(stderr, "[fps] %.1f\n", (f - f0) * 1000.0 / (double)(now - t0));
               t0 = now; f0 = f;
@@ -633,6 +640,18 @@ int main(int argc, char** argv)
      * alternates 960x640 and 960x704 clips at one address and samples those surfaces with descriptors of their own
      * size: with the reuse the first level shows full-width yellow bands. The surface is recreated as before. */
     set_default_env("PS3RECOMP_ENG_SURFACE_REUSE", "0");
+
+    /* Every guest program a scene meets for the first time is translated HLSL -> SPIR-V -> MSL on the thread that
+     * walks the FIFO, 20-200 ms each: the opening cutscene stalled for 160-360 ms on the same frames of every run
+     * (the woman's head jerked back and forth). Kept on disk, a translation is done once. */
+    if (!getenv("PS3RECOMP_MSL_CACHE")) {
+#ifdef _WIN32
+        _mkdir("./cache"); _mkdir(R3_MSL_CACHE_DIR);
+#else
+        mkdir("./cache", 0755); mkdir(R3_MSL_CACHE_DIR, 0755);
+#endif
+        set_default_env("PS3RECOMP_MSL_CACHE", R3_MSL_CACHE_DIR);
+    }
 
     /* Resistance 3 reserves 256 MB with sys_mmapper_allocate_address at 256 MB alignment, which landed on
      * 0x20000000 (toolkit v0.16), the runtime's default home for the GCM labels and control register: its heap and
