@@ -1,0 +1,96 @@
+rsx draw engine: a block-compressed texture never reads a render target.
+
+Resistance 3: after leaving a mission for the main menu the menu was unreadable (user report): the paper background
+was missing, replaced by black and the level's fog colour, with a block of scratch noise behind the text. A pass dump
+of the menu frame (RSX_ENGINE_PASS_DUMP) against one of the menu at boot showed the same 46 draws and the same
+textures at the same addresses; only the first draw's unit 0 differed: the 1024x1024 DXT1 paper atlas at local
+0x037A1B00 was bound as colour surface 16, the level's 128x80 bloom history target, last drawn shortly before.
+The menu atlases and the level's post-processing targets share local memory. The engine keeps a target in its table
+until the table evicts it and binds a target for any unit whose address matches, whatever the unit's format; the
+guest's own writes over the memory are not seen (the atlas comes from a path the walker does not observe, not
+NV0039 -- a log of every NV0039 copy into that range showed none). A DXT texture cannot be a target's pixels: nothing
+renders into DXT blocks, and the host image of a target cannot be read as them. Such a unit now takes the guest
+bytes, as it would with no target at its address. Textures of other formats at a stale target's address are not
+covered; none shows in this game.
+
+test_rsx_draw_engine, new test_compressed_texture_is_not_a_target: an A8R8G8B8 unit at a target's address still
+samples the target; a DXT1, DXT3 and DXT5 unit at the same address upload from guest memory. The three fail without
+the change. Checked with a scripted run (boot, Continue, comic skip, pause, quit to menu): the menu frame is the
+boot one again.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 44e03e7..ff003f5 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -2382,2 +2382,11 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
+ 
++/* A block-compressed texture is never a render target's pixels: nothing renders into DXT blocks, and the host
++ * image of a target cannot be read as them. Resistance 3 keeps its menu atlases (DXT) in the local memory its
++ * level then uses for post-processing targets; the engine's target table outlives the level and its entries
++ * outranked the atlas at the same address, so after a mission the menu was drawn from a bloom target. */
++static int eng_format_block_compressed(u32 base_fmt)
++{
++    return base_fmt == RSX_TEX_FMT_DXT1 || base_fmt == RSX_TEX_FMT_DXT23 || base_fmt == RSX_TEX_FMT_DXT45;
++}
++
+ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2399,5 +2408,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+ 
++        const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
++        const int compressed = eng_format_block_compressed(base_fmt);
+         int sampled = -1, own = 0, surface_at = -1;
+         for (u32 i = 0; i < g.n_surfaces; i++) {
+-            if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
++            if (compressed || !g.surfaces[i].handle || g.surfaces[i].location != t.location ||
+                 g.surfaces[i].offset != t.offset)
+@@ -2413,3 +2424,2 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+         }
+-        const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+         /* The depth at this address, when it was written after any colour
+@@ -2419,3 +2429,3 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             const eng_zdepth* z = &g.zdepths[i];
+-            if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
++            if (compressed || z->location != t.location || z->offset != t.offset || !z->depth_serial)
+                 continue;
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 64e882b..110468a 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -583,2 +583,29 @@ static void test_surface_aliasing(void)
+ 
++/* Resistance 3 keeps its menu atlases (DXT1) in the memory its level renders post-processing targets into. A
++ * target left from the level, at the atlas's address, was sampled in the atlas's place: the menu after a mission
++ * came out as noise on a flat background. Nothing renders into DXT blocks. */
++static void test_compressed_texture_is_not_a_target(void)
++{
++    printf("-- compressed texture is not a target\n");
++    engine_up();
++    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
++    m(M_COLOR_A_OFFSET, TEX_OFFSET);
++    m(M_CLEAR_BUFFERS, 0xF0u);
++    const u32 surface = stub.last_created_color;
++    m(M_COLOR_A_OFFSET, 0x90000u);
++    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
++    draw_triangle();
++    CHECK(stub.bound_tex[0] == surface, "an A8R8G8B8 unit at the target's address samples the target");
++
++    for (u32 fmt = 0x86u; fmt <= 0x88u; fmt++) {
++        const int before = stub.n_texture_create;
++        m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | (fmt << 8) | (1u << 16));
++        draw_triangle();
++        CHECK(stub.bound_tex[0] != surface && stub.n_texture_create == before + 1,
++              "a DXT unit (format 0x%02X) reads guest memory, not the target (%d uploads)",
++              fmt, stub.n_texture_create - before);
++    }
++    engine_down();
++}
++
+ /* ---- 2b. the MRT set ----------------------------------------------------- */
+@@ -2184,2 +2211,3 @@ int main(void)
+     test_surface_aliasing();
++    test_compressed_texture_is_not_a_target();
+     test_mrt_set();

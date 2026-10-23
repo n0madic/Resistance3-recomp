@@ -120,6 +120,9 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   (before, the maps Home renders at load got no depth target). The compare order is PR #424's (depth FUNC ref).
   Close to a lamp the game switches its map to a swizzled power-of-two Z16 surface (zeta pitch 64), read as swizzled
   DEPTH16 (`gcm-rsx/0016`; before, the lamp's light vanished near it).
+  The menu atlases (DXT) share local memory with the level's post-processing targets and the engine's target table
+  outlives the level: a block-compressed unit never reads a target (`gcm-rsx/0017`; before, the menu after leaving a
+  mission was noise on a flat background).
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
