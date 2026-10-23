@@ -1,0 +1,197 @@
+rsx draw engine: a swizzled zeta read through a swizzled texture is converted on the GPU, and stored swizzled.
+
+Resistance 3: the light of the lamp over the radio table in Home came and went with the view (user report). Close to
+the table it was gone. Close to a shadowed lamp the game renders that lamp's shadow map into a swizzled power-of-two
+Z16 surface (1024x1024 or 512x512, zeta pitch register 64) and samples it as a swizzled DEPTH16 texture (format
+0xD2); farther away it uses a linear one (928x928, 448x448, format 0xF2). eng_zdepth_as_color took only linear
+textures of the zeta's pitch and eng_zdepth_to_guest only a pitch of at least a row, so the light shader got
+whatever else was at the address: guest memory, or the bloom target that shares 0x01DA8800. Every shadowed light
+then lit nothing. A per-light dump of the light buffer (scratch tooling) at one spot by the table showed it. Shadowed
+lights read swizzled maps and added nothing. A step away, with linear maps, one of them lit 104k pixels.
+
+The depth target holds the image whatever the guest layout, so a zeta rendered through a swizzled surface (raster
+type 2, recorded with the write) and read through a swizzled texture is the same picture as the linear pair. The
+hook now takes either matching pair; the pitch is compared for the linear one only. A mismatched pair goes through
+guest memory as before. The guest store writes a swizzled zeta in Morton order over its power-of-two size
+(rsx_swizzle_offset), so the fallback (a backend without the hook, PS3RECOMP_ENG_DEPTH_VIA_GUEST=1) reads the same
+image too.
+
+test_rsx_draw_engine, new test_swizzled_z16_read_as_depth16: a swizzled 256x256 Z16 zeta read as swizzled DEPTH16
+goes to the hook with no readback; a linear read of it does not; a refusing backend gets the depth in Morton order
+(texels (1,0), (0,1), (1,1), (2,0) at 2, 4, 6 and 8 bytes). All three fail without the change. Checked in play by the
+user: walking up to the table and turning, the lamp's light stays.
+
+Upstream: not proposed yet.
+
+---
+
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index eb5a28c..44e03e7 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -121,2 +121,3 @@ typedef struct {
+     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
++    int swizzled;          /* that write went through a swizzled surface     */
+     u32 used_w, used_h;    /* the clip that write went through              */
+@@ -1061,5 +1062,11 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+     if (s_depth_via_guest || !g.be->depth_as_color || !g.be->surface_view ||
+-        !z->handle || !(bytes || d16) || !(t->format & RSX_TEX_FMT_LINEAR) ||
+-        t->cubemap || t->dimension == 3 || t->mipmaps > 1)
++        !z->handle || !(bytes || d16) || t->cubemap || t->dimension == 3 || t->mipmaps > 1)
+         return 0;
++    /* The depth target holds the image whatever the guest layout: a swizzled
++     * zeta read through a swizzled texture is the same picture, as a linear
++     * one read through a linear texture of its pitch. Resistance 3 renders a
++     * lamp's shadow map into a swizzled power-of-two Z16 surface once the
++     * camera is close to the lamp (1024x1024 or 512x512, zeta pitch 64). */
++    const int linear = (t->format & RSX_TEX_FMT_LINEAR) != 0;
++    if (linear == z->swizzled) return 0;
+     const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
+@@ -1067,3 +1074,3 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+     if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
+-        t->pitch != z->pitch)
++        (linear && t->pitch != z->pitch))
+         return 0;
+@@ -1463,3 +1470,13 @@ static int eng_zdepth_to_guest(u32 slot)
+     const u32 h = z->used_h < z->h ? z->used_h : z->h;
+-    if (!w || !h || z->pitch < w * bpp) return 0;
++    /* A swizzled zeta is Morton-ordered over its power-of-two size and has no
++     * row pitch (the register holds 64). */
++    u32 log2w = 0, log2h = 0;
++    if (!w || !h) return 0;
++    if (z->swizzled) {
++        if ((w & (w - 1u)) || (h & (h - 1u))) return 0;
++        while ((1u << log2w) < w) log2w++;
++        while ((1u << log2h) < h) log2h++;
++    } else if (z->pitch < w * bpp) {
++        return 0;
++    }
+     if (s_depth_cap < w * h) {
+@@ -1474,7 +1491,17 @@ static int eng_zdepth_to_guest(u32 slot)
+         return 0;
++    u8* image = NULL;
++    if (z->swizzled) {
++        image = (u8*)eng_guest_ptr(NULL, z->location, z->offset, w * h * bpp);
++        if (!image) return 0;
++    }
+     for (u32 r = 0; r < h; r++) {
+-        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+-        if (!dst) return 0;
++        u8* row = image;
++        if (!image) {
++            row = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
++            if (!row) return 0;
++        }
+         const float* src = s_depth_rows + (size_t)r * w;
+         for (u32 c = 0; c < w; c++) {
++            u8* dst = image ? image + rsx_swizzle_offset(c, r, log2w, log2h) * bpp
++                            : row + c * bpp;
+             float d = src[c];
+@@ -1494,3 +1521,2 @@ static int eng_zdepth_to_guest(u32 slot)
+             }
+-            dst += bpp;
+         }
+@@ -1498,6 +1524,7 @@ static int eng_zdepth_to_guest(u32 slot)
+     z->guest_dirty = 0;
+-    eng_textures_touch(z->location, z->offset, z->pitch * h);
++    eng_textures_touch(z->location, z->offset, image ? w * h * bpp : z->pitch * h);
+     if (eng_coherence_log())
+-        fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
+-                z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
++        fprintf(stderr, "[rsx engine] depth 0x%08X (%s, %s %u) %ux%u stored to guest memory\n",
++                z->offset, bpp == 2u ? "Z16" : "Z24S8", z->swizzled ? "swizzled, pitch reg" : "pitch",
++                z->pitch, w, h);
+     return 1;
+@@ -1514,2 +1541,3 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+     z->pitch = sf->zeta_pitch;
++    z->swizzled = sf->raster_type == 2u;
+     z->used_w = sf->clip_w ? sf->clip_w : g.width;
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 5940211..64e882b 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -302,2 +302,3 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
+ static float g_readback_depth = 0.5f;
++static int g_readback_ramp;     /* texel (c, r) reads back as (r * w + c) / 0xFFFF */
+ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
+@@ -309,3 +310,4 @@ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
+         for (u32 c = 0; c < w; c++)
+-            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) = g_readback_depth;
++            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) =
++                g_readback_ramp ? (float)((double)(r * w + c) / 65535.0) : g_readback_depth;
+     return 0;
+@@ -1805,2 +1807,70 @@ static void test_z16_read_as_depth16_on_gpu(void)
+ 
++/* Resistance 3 renders a lamp's shadow map into a swizzled power-of-two Z16
++ * surface (zeta pitch register 64) once the camera is close to the lamp, and
++ * reads it through a swizzled DEPTH16 texture. Neither the backend hook nor
++ * guest memory took it: the hook wanted a linear texture of the zeta's pitch,
++ * the store a pitch of a whole row. The light read guest memory or another
++ * target at that address and the lamp lit nothing. */
++static void swizzled_z16_pass_then_read_as(u32 tex_fmt)
++{
++    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
++    m(M_SURFACE_FORMAT, 8u | (1u << 5) | (2u << 8) | (8u << 16) | (8u << 24));
++    m(M_ZETA_OFFSET, ZETA_OFFSET);
++    m(M_ZETA_PITCH, 64u);
++    m(M_COLOR_MASK, 0u);
++    m(M_DEPTH_TEST, 1u);
++    m(M_DEPTH_WRITE, 1u);
++    m(M_TEX_UNIT + 0x0C, 0u);
++    draw_triangle();
++    m(M_SURFACE_FORMAT, 8u | (2u << 5));
++    m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
++    m(M_ZETA_PITCH, 256u * 4u);
++    m(M_COLOR_MASK, 0x01010101u);
++    m(M_DEPTH_TEST, 0u);
++    m(M_DEPTH_WRITE, 0u);
++    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
++    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | (tex_fmt << 8) | (1u << 16));
++    m(M_TEX_UNIT + 0x18, (256u << 16) | 256u);
++    m(0x1840 /* control3: pitch */, (tex_fmt & 0x20u) ? 256u * 2u : 0u);
++}
++
++static void test_swizzled_z16_read_as_depth16(void)
++{
++    printf("-- swizzled Z16 zeta read as a swizzled DEPTH16 texture\n");
++    engine_up();
++    rsx_draw_backend be = g_stub_backend;
++    be.depth_as_color = stub_depth_as_color;
++    rsx_draw_engine_set_backend(&be);
++    g_argb_calls = 0; g_argb_fail = 0;
++    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
++    memset(z, 0x5A, 8);
++
++    swizzled_z16_pass_then_read_as(0x92u);
++    draw_triangle();
++    CHECK(g_argb_calls == 1 && g_argb_fmt == 0x92u && g_argb_w == 256 && g_argb_h == 256 &&
++          stub.n_depth_readback == 0 && z[0] == 0x5A,
++          "the backend made the 256x256 DEPTH16 texture (%d calls, %d readbacks)",
++          g_argb_calls, stub.n_depth_readback);
++
++    /* A linear texture over a swizzled zeta is another picture: not the hook. */
++    swizzled_z16_pass_then_read_as(0x92u | 0x20u);
++    draw_triangle();
++    CHECK(g_argb_calls == 1, "a linear read of the swizzled zeta is not converted (%d calls)",
++          g_argb_calls);
++
++    /* Refused: guest memory gets the depth in Morton order. Texel (c, r) holds
++     * r * 256 + c; (1,0) is the second texel, (0,1) the third, (2,0) the fifth. */
++    g_argb_fail = 1;
++    g_readback_ramp = 1;
++    const int readbacks = stub.n_depth_readback;
++    swizzled_z16_pass_then_read_as(0x92u);
++    draw_triangle();
++    const u32 t1 = (u32)z[2] << 8 | z[3], t2 = (u32)z[4] << 8 | z[5], t4 = (u32)z[8] << 8 | z[9];
++    const u32 t3 = (u32)z[6] << 8 | z[7];
++    CHECK(stub.n_depth_readback == readbacks + 1 && t1 == 1u && t2 == 256u && t3 == 257u && t4 == 2u,
++          "refused: stored swizzled (%u %u %u %u)", t1, t2, t3, t4);
++    g_readback_ramp = 0;
++    engine_down();
++}
++
+ /* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
+@@ -2136,2 +2206,3 @@ int main(void)
+     test_z16_read_as_depth16_on_gpu();
++    test_swizzled_z16_read_as_depth16();
+     test_full_tables_evict_the_oldest();
