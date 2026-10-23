@@ -128,7 +128,8 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
 - **Keyboard and mouse** (cellPad's fps layout, `patches/input/0004`; the game never reads cellMouse. In play the
   mouse turns the hero's orientation matrix directly, `host/r3_input.cpp` via `patches/input/0006`; in menus and
   cutscenes it moves the right stick, capped at the game's top stick rate):
-  - WASD walk, mouse look (cursor captured while the window is in front; Cmd+Tab frees it);
+  - WASD walk, mouse look (cursor captured while the window is in front and no menu is up, `patches/input/0007`;
+    Cmd+Tab frees it too). Cmd+Q or the window's close button quits (`patches/metal/0001`);
   - left button = R1 (fire), right = L1 (aim), middle or V = R3 (melee), wheel or Q = triangle (weapons);
   - Space = cross (jump), C/Ctrl/Backspace = circle (crouch, back), E/R = square (reload, use);
   - G/F = L2/R2 (grenade, secondary fire), Shift = L3 (sprint);
