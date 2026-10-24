@@ -142,9 +142,11 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   and a texture descriptor smaller than a target reads a copy of its top-left (`gcm-rsx/0020`; recreating the target
   instead gave a black frame at the onset of a heavy hit, binding it whole a yellow band at the bottom).
   Tile 4 is bound over main memory (IO 0x30000, pitch 8192, bank 2). While aiming, NV3089 downsamples the scene into
-  it for an SPU depth-of-field job that reads and writes the tiled layout. RSX-side accesses to main-memory tiles go
-  through the tiling (`rsx_tiling.h`, a port of RPCS3's `tiled_dma_copy`, `gcm-rsx/0021`). Before that, the job's
-  output showed as bands and the blur never appeared.
+  it for an SPU depth-of-field job that reads and writes the tiled layout. Every RSX access to a main-memory tile
+  goes through the tiling (`gcm-rsx/0021`). The address math is `rsx_tiling.h`, a port of RPCS3's `tiled_dma_copy`.
+  `rsx_tiling.c` holds the one tile table and the range copies used by the 2D engines, NV0039, and the draw engine's
+  surfaces, textures and fetches. Before that, the job's output showed as bands and the blur never appeared. Only
+  the NV3089 and texture paths are reached in the scenes checked.
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
