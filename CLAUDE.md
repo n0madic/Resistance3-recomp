@@ -50,18 +50,18 @@ cmake -S build/ps3recomp -B <scratch>/build-tests -G Ninja -DPS3RECOMP_BUILD_TES
       -DCMAKE_PREFIX_PATH="$PWD/build/deps/prefix" -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
       -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON
 cmake --build <scratch>/build-tests -- -k 0     # keep going past a target that does not link
-ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 16
+ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 17
 ```
 
-Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (76 of them on
-v0.17.0; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
+Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (83 of them with
+the patches; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
 Some runtime unit tests (e.g. `runtime/spu/tests/test_spu_thread_ls_dma.c`) are built directly with clang from the
 toolkit dir against the runtime sources they need. The Metal ones that translate guest programs
 (`libs/video/tests/test_shadow_compare_metal.m`) need the translator: compile `rsx_shader_msl.cpp` with
 `-DPS3RECOMP_HAVE_MSL_TRANSLATION=1 -DPS3RECOMP_MSL_TRANSLATOR_ID='"<any 23 chars>"'` and `-I build/deps/prefix/include`
 (+ `/spirv_cross`), and link glslang, SPIRV, SPIRV-Tools(-opt) and the spirv-cross static libraries from
 `build/deps/prefix/lib`; without it the stub reports "translation was not built" and 32 of 37 checks fail (with it,
-133/133 pass). On the pinned v0.17.0 all 16 ctest tests and all 76 scripts pass with
+133/133 pass). On the pinned v0.17.0 all 17 ctest tests and all 83 scripts pass with
 the patches on (`test_metal_frame_rate` needs a usable display), so a new failure is ours. A patch that moves a symbol or
 changes a code path can break a fixture's link line or stub (the loader fixtures stub `cellGcm_on_put_store`): fix the
 fixture in the same patch.
@@ -141,6 +141,10 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   Under load the game drops its scene from 704 to 640 rows at the same addresses; the engine keeps the 704-row target
   and a texture descriptor smaller than a target reads a copy of its top-left (`gcm-rsx/0020`; recreating the target
   instead gave a black frame at the onset of a heavy hit, binding it whole a yellow band at the bottom).
+  Tile 4 is bound over main memory (IO 0x30000, pitch 8192, bank 2). While aiming, NV3089 downsamples the scene into
+  it for an SPU depth-of-field job that reads and writes the tiled layout. RSX-side accesses to main-memory tiles go
+  through the tiling (`rsx_tiling.h`, a port of RPCS3's `tiled_dma_copy`, `gcm-rsx/0021`). Before that, the job's
+  output showed as bands and the blur never appeared.
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.

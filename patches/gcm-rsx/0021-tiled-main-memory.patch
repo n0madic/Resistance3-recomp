@@ -1,0 +1,749 @@
+rsx: tiles bound over main memory are tiled for the RSX's own accesses (NV3089 copies, the draw engine's guest reads
+and writes).
+
+Resistance 3 binds tile 4 over main memory (IO 0x30000, 0x580000 bytes, pitch 8192, bank 2). While aiming it
+downsamples the scene colour and depth with NV3089 into it (two 480x352 images at 0x30000 and 0x30800), an SPU
+depth-of-field job reads and writes them in the tiled layout the RSX gives them, and the RSX samples the job's output
+as a texture. Copied in and read back linearly, the job's output landed on rows 0-15 of every 64 (a 1920-byte-wide
+rectangle, tiled, covers exactly those linear rows) and showed as horizontal bands over the scene; the blur never
+appeared at all.
+
+- rsx_tiling.h (new, header only): the tiled address of a byte, a port of RPCS3's rsx::tiled_dma_copy (link and
+  commit in the file), and a copy between a linear buffer and the tiling 32 bytes at a time (bits 0-4 carry over).
+- cellGcmSetTile binds the tile, as RPCS3's does (tile.bound = pitch > 0): the game never calls BindTile. Set, Bind,
+  Unbind and the resets pass the table to the engine (rsx_draw_engine_set_tile); only main-memory tiles count,
+  local ones are transparent (RPCS3 skips them too).
+- nv3089_blit: a source or destination in such a tile goes a row at a time through the tiling (gcm_tile_row; the
+  stores notify SPU reservations as gcm_row_copy's do, now through gcm_store).
+- rsx_draw_engine: texture uploads, guest_wrote and the surface seed read a tiled region through the tiling
+  (eng_guest_linear); guest_read and the zeta store write through it. A tile whose IO pages are not contiguous in
+  host memory is read and written linearly, as before (logged).
+- Not tiled (TODO in rsx_tiling.h, RPCS3 does not either): NV309E copies from a tiled source, NV0039, vertex and
+  index fetches.
+
+test_rsx_tiling (tools/test_rsx_tiling.py): addresses for four pitch classes against a separate port of the RPCS3
+function, the tiling permutes the tile's 32-byte blocks, a row round-trips. test_rsx_draw_engine: a target in a
+tiled region is stored and loaded through the tiling, a texture there decodes the tiled bytes, an unbound tile is
+linear again. test_nv3089_engine_read: 2:1 and 1:1 blits into a tile in main memory put every pixel at its tiled
+address. The fixtures that compile cellGcmSys.c in (tests/test_gcm_io_alloc.c too) stub rsx_draw_engine_set_tile.
+In the game (Haven street fight, aiming): no bands, the depth-of-field blur appears; a dump of the tile at the
+texture read, detiled, is clean on every row. Cost: about 1.1 ms of CPU a frame while aiming (tiled copy and
+texture read), nothing otherwise.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 5f9dd5c..26de0bc 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -12,2 +12,3 @@
+ #include "rsx_draw_engine.h"
++#include "rsx_tiling.h"
+ #include "cellGcmSys.h"
+@@ -318,2 +319,30 @@ static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
+ 
++/* The draw engine reads and writes tiled main memory through the tiling
++ * (rsx_tiling.h): tell it what is bound. */
++static void gcm_tile_publish(u32 index)
++{
++    const CellGcmTileInfo* t = &s_tiles[index];
++    if (t->bound) rsx_draw_engine_set_tile(index, t->tile & 1u, t->offset, t->size, t->pitch, t->bank);
++    else          rsx_draw_engine_set_tile(index, 0, 0, 0, 0, 0);
++}
++
++static void gcm_tiles_publish(void)
++{
++    for (u32 i = 0; i < CELL_GCM_MAX_TILE_COUNT; i++) gcm_tile_publish(i);
++}
++
++/* The bound main-memory tile holding location offset `off`, as rsx_tiling.h takes it. */
++static int gcm_main_tile(int local, u32 off, rsx_tile* out)
++{
++    if (local) return 0;
++    for (u32 i = 0; i < CELL_GCM_MAX_TILE_COUNT; i++) {
++        const CellGcmTileInfo* t = &s_tiles[i];
++        if (t->bound && (t->tile & 1u) && t->size && off - t->offset < t->size) {
++            out->offset = t->offset; out->size = t->size; out->pitch = t->pitch; out->bank = t->bank;
++            return 1;
++        }
++    }
++    return 0;
++}
++
+ /* Zcull configuration (8 zcull regions) */
+@@ -484,2 +513,3 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+     memset(s_tiles, 0, sizeof(s_tiles));
++    gcm_tiles_publish();
+     memset(s_zcull, 0, sizeof(s_zcull));
+@@ -1033,3 +1063,3 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
+  * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
+-static void gcm_row_copy(u32 d, u32 s, u32 n)
++static void gcm_store(u32 d, const u8* src, u32 n)
+ {
+@@ -1039,5 +1069,5 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
+     for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
+-    if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
++    if (!reserved) { memmove(vm_base + d, src, n); return; }
+     spu_lockline_lock();
+-    memmove(vm_base + d, vm_base + s, n);
++    memmove(vm_base + d, src, n);
+     for (u32 a = l0; a <= l1; a += 128)
+@@ -1047,2 +1077,25 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
+ 
++static void gcm_row_copy(u32 d, u32 s, u32 n)
++{
++    extern u8* vm_base;
++    gcm_store(d, vm_base + s, n);
++}
++
++/* A row of RSX-side bytes at main-memory offset `off` of tile `t`, stored
++ * through the tiling 32 bytes at a time (rsx_tiling.h), or read back. */
++static void gcm_tile_row(const rsx_tile* t, u32 off, u8* row, u32 n, int store)
++{
++    extern u8* vm_base;
++    while (n) {
++        const u32 run = 32u - (off & 31u) < n ? 32u - (off & 31u) : n;
++        const u32 a = rsx_tile_address(t, off);
++        const u32 ea = a != 0xFFFFFFFFu ? cellGcmResolveLocated(0, a) : 0u;
++        if (ea) {
++            if (store) gcm_store(ea, row, run);
++            else       memcpy(row, vm_base + ea, run);
++        }
++        off += run; row += run; n -= run;
++    }
++}
++
+ static void nv3089_blit(void)
+@@ -1201,2 +1254,43 @@ static void nv3089_blit(void)
+     if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
++    /* A side in tiled main memory goes through the tiling (rsx_tiling.h).
++     * Resistance 3 downsamples its scene and depth into a tiled main-memory
++     * region for an SPU depth-of-field job while aiming. */
++    rsx_tile stile, dtile;
++    const int stiled = gcm_main_tile(src_local, s_nv3089.in_off, &stile);
++    const int dtiled = gcm_main_tile(dst_local, s_gcm2d.dst_offset, &dtile);
++    if ((stiled || dtiled) && (s_nv3089.in_sz & 0xFFFF)) {
++        /* Row at a time: the source row read back through its tiling, the
++         * destination row built linearly and stored through its own. */
++        static u8* rows;
++        static u32 rows_cap;
++        const u32 in_w = s_nv3089.in_sz & 0xFFFF;
++        const u32 need = (in_w + out_w) * bpp;
++        if (rows_cap < need) {
++            u8* n = (u8*)realloc(rows, need);
++            if (!n) return;
++            rows = n;
++            rows_cap = need;
++        }
++        u8* srow = rows;
++        u8* drow = rows + in_w * bpp;
++        u32 xa = 0, xb = out_w;
++        if (out_x < cx0) xa = cx0 - out_x;
++        if ((u64)out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
++        extern u8* vm_base;
++        for (u32 y = 0; y < out_h && xa < xb; y++) {
++            const u32 dy = out_y + y;
++            if (dy < cy0 || dy >= cy1) continue;
++            const u32 sy = (u32)((nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy) >> 20);
++            if (stiled) gcm_tile_row(&stile, s_nv3089.in_off + sy * in_pitch, srow, in_w * bpp, 0);
++            else        memcpy(srow, vm_base + src + sy * in_pitch, in_w * bpp);
++            for (u32 x = xa; x < xb; x++) {
++                u32 sx = (u32)((nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx) >> 20);
++                if (sx >= in_w) sx = in_w - 1u;
++                memcpy(drow + x * bpp, srow + sx * bpp, bpp);
++            }
++            const u32 n = (xb - xa) * bpp;
++            if (dtiled) gcm_tile_row(&dtile, s_gcm2d.dst_offset + dy * dst_pitch + (out_x + xa) * bpp, drow + xa * bpp, n, 1);
++            else        gcm_store(dst + dy * dst_pitch + (out_x + xa) * bpp, drow + xa * bpp, n);
++        }
++    } else
+     if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
+@@ -3578,3 +3672,5 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
+     s_tiles[index].bank   = bank;
+-    s_tiles[index].bound  = 0;
++    /* SetTile binds too (RPCS3 cellGcmSys.cpp: tile.bound = pitch > 0); a
++     * title that never calls BindTile still has its tiles in force. */
++    s_tiles[index].bound  = pitch > 0;
+ 
+@@ -3583,2 +3679,3 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
+     s_tiles[index].limit = offset + size - 1;
++    gcm_tile_publish(index);
+ 
+@@ -3623,2 +3720,3 @@ s32 cellGcmBindTile(u8 index)
+     s_tiles[index].bound = 1;
++    gcm_tile_publish(index);
+     return CELL_OK;
+@@ -3645,2 +3743,3 @@ s32 cellGcmUnbindTile(u8 index)
+     s_tiles[index].bound = 0;
++    gcm_tile_publish(index);
+     return CELL_OK;
+@@ -3850,2 +3949,3 @@ void cellGcmTerminate(void)
+     memset(s_tiles, 0, sizeof(s_tiles));
++    gcm_tiles_publish();
+     memset(s_zcull, 0, sizeof(s_zcull));
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index e9b8fc8..4dc507b 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -17,2 +17,3 @@
+ #include "rsx_restart_cuts.h"
++#include "rsx_tiling.h"
+ #include "rsx_vertex_formats.h"
+@@ -278,2 +279,64 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
+ 
++/* The tiles bound over main memory (cellGcmSetTile), kept apart from g:
++ * a title sets them before the engine starts. */
++static rsx_tile s_tiles[RSX_TILE_COUNT];
++
++void rsx_draw_engine_set_tile(u32 index, u32 location, u32 offset, u32 size, u32 pitch, u32 bank)
++{
++    if (index >= RSX_TILE_COUNT) return;
++    rsx_tile t = { 0, 0, 0, 0 };
++    if (location == RSX_LOCATION_MAIN && size && pitch) { t.offset = offset; t.size = size; t.pitch = pitch; t.bank = bank; }
++    s_tiles[index] = t;
++}
++
++/* The main-memory tile the byte at (location, offset) lies in, or NULL. */
++static const rsx_tile* eng_tile_at(u32 location, u32 offset)
++{
++    if (location != RSX_LOCATION_MAIN) return NULL;
++    for (u32 i = 0; i < RSX_TILE_COUNT; i++)
++        if (s_tiles[i].size && offset - s_tiles[i].offset < s_tiles[i].size) return &s_tiles[i];
++    return NULL;
++}
++
++/* The tile's bytes in host memory, when its IO pages map contiguously (a
++ * title maps its main memory in one block); NULL otherwise, and the engine
++ * then reads and writes the region as if it were linear. */
++static u8* eng_tile_mem(const rsx_tile* t)
++{
++    u8* mem = t ? (u8*)eng_guest_ptr(NULL, RSX_LOCATION_MAIN, t->offset, t->size) : NULL;
++    if (mem && eng_guest_ptr(NULL, RSX_LOCATION_MAIN, t->offset + t->size - 1u, 1u) != mem + t->size - 1u) {
++        static u32 logs;
++        if (PS3_LOG_FIRST(logs, 4))
++            fprintf(stderr, "[rsx engine] tile 0x%X+0x%X is not contiguous in host memory; read as linear\n",
++                    t->offset, t->size);
++        return NULL;
++    }
++    return mem;
++}
++
++static u8* s_detiled;
++static u32 s_detiled_cap;
++
++/* Guest bytes as the RSX reads them: the bytes of a tiled main-memory region
++ * through its tiling, the rest as they lie. The result lasts until the next
++ * call. */
++static const u8* eng_guest_linear(u32 location, u32 offset, u32 len)
++{
++    const u8* raw = eng_guest_ptr(NULL, location, offset, len);
++    const rsx_tile* t = raw ? eng_tile_at(location, offset) : NULL;
++    u8* mem = eng_tile_mem(t);
++    if (!mem) return raw;
++    if (s_detiled_cap < len) {
++        u8* n = (u8*)realloc(s_detiled, len);
++        if (!n) return NULL;
++        s_detiled = n;
++        s_detiled_cap = len;
++    }
++    const u32 in_tile = t->offset + t->size - offset;
++    const u32 tiled = len < in_tile ? len : in_tile;
++    rsx_tile_copy(t, mem, offset, s_detiled, tiled, 0);
++    if (tiled < len) memcpy(s_detiled + tiled, raw + tiled, len - tiled);
++    return s_detiled;
++}
++
+ static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
+@@ -612,3 +675,3 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
+     if (!tl.face_bytes || !tl.dst_row_bytes) return NULL;
+-    const u8* src = eng_guest_ptr(NULL, location, offset, tl.face_bytes);
++    const u8* src = eng_guest_linear(location, offset, tl.face_bytes);
+     if (!src) return NULL;
+@@ -917,3 +980,6 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+         }
+-        memcpy(dst, src + skip, bytes);
++        const rsx_tile* t = eng_tile_at(location, offset + r * pitch);
++        u8* mem = eng_tile_mem(t);
++        if (mem) rsx_tile_copy(t, mem, offset + r * pitch, src + skip, bytes, 1);
++        else     memcpy(dst, src + skip, bytes);
+     }
+@@ -975,3 +1041,3 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
+     for (u32 r = 0; r < h; r++) {
+-        const u8* src = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
++        const u8* src = eng_guest_linear(location, offset + r * pitch, w * 4u);
+         if (!src) return;
+@@ -1272,3 +1338,3 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
+-        const u8* src = eng_guest_ptr(NULL, location, offset, span);
++        const u8* src = eng_guest_linear(location, offset, span);
+         if (!src) return 0;
+@@ -1310,3 +1376,3 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+-    const u8* src = eng_guest_ptr(NULL, location, offset, span);
++    const u8* src = eng_guest_linear(location, offset, span);
+     if (!src) return 0;
+@@ -1535,5 +1601,18 @@ static int eng_zdepth_to_guest(u32 slot)
+     }
++    /* Rows of a zeta in tiled main memory are built here and stored through the tiling. */
++    const rsx_tile* tile = image ? NULL : eng_tile_at(z->location, z->offset);
++    u8* tile_mem = eng_tile_mem(tile);
++    static u8* tile_row;
++    static u32 tile_row_cap;
++    if (tile_mem && tile_row_cap < w * bpp) {
++        u8* n = (u8*)realloc(tile_row, w * bpp);
++        if (!n) return 0;
++        tile_row = n;
++        tile_row_cap = w * bpp;
++    }
+     for (u32 r = 0; r < h; r++) {
+         u8* row = image;
+-        if (!image) {
++        if (tile_mem) {
++            row = tile_row;
++        } else if (!image) {
+             row = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+@@ -1561,2 +1640,3 @@ static int eng_zdepth_to_guest(u32 slot)
+         }
++        if (tile_mem) rsx_tile_copy(tile, tile_mem, z->offset + r * z->pitch, row, w * bpp, 1);
+     }
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index 4ec4abd..61d6fb7 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -339,2 +339,6 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
++/* cellGcmSetTile and friends: tile `index` now covers [offset, offset + size)
++ * of `location` at `pitch` (size or pitch 0: unbound). Only main-memory tiles
++ * matter: the engine reads and writes them through rsx_tiling.h. */
++void rsx_draw_engine_set_tile(u32 index, u32 location, u32 offset, u32 size, u32 pitch, u32 bank);
+ 
+diff --git a/libs/video/rsx_tiling.h b/libs/video/rsx_tiling.h
+new file mode 100644
+index 0000000..1b02918
+--- /dev/null
++++ b/libs/video/rsx_tiling.h
+@@ -0,0 +1,103 @@
++/*
++ * RSX tiled main memory.
++ *
++ * A tile bound over main memory (cellGcmSetTile with location MAIN) lays the
++ * RSX's view of that memory out in 256-byte x 64-row tiles, with banks and
++ * partitions interleaved. The RSX's own accesses (render targets, textures,
++ * NV3089 copies) go through that mapping; the PPU and the SPUs see the bytes
++ * where they lie. Local memory tiles are transparent to every client and need
++ * nothing. Resistance 3 downsamples its scene into tiled main memory with
++ * NV3089 for an SPU depth-of-field job while aiming; the job reads and writes
++ * the tiled layout, and sampled linearly its output showed as bands (rows
++ * 0-15 of every 64).
++ *
++ * The address math is a port of RPCS3's rsx::tiled_dma_copy
++ * (https://github.com/RPCS3/rpcs3/blob/06ae1af55161e8a9e8ad77395a97455d493b5cb3/rpcs3/Emu/RSX/Common/tiled_dma_copy.hpp),
++ * itself from envytools' NV40 VRAM notes
++ * (https://envytools.readthedocs.io/en/latest/hw/memory/vram.html).
++ * RPCS3 takes the tile's effective address as the base; the location offset
++ * used here differs from it only above bit 19 (IO pages are 1 MB), and those
++ * bits cancel in the result.
++ *
++ * TODO: NV309E swizzled copies out of a tiled source, NV0039 buffer copies
++ * and vertex/index fetches still read tiled main memory as linear (RPCS3
++ * does not tile those either); no title here needs them.
++ */
++#ifndef RSX_TILING_H
++#define RSX_TILING_H
++
++#include "ps3emu/ps3types.h"
++#include <string.h>
++
++#define RSX_TILE_COUNT 15u
++
++typedef struct rsx_tile {
++    u32 offset;   /* location offset of the tile's first byte */
++    u32 size;
++    u32 pitch;
++    u32 bank;
++} rsx_tile;
++
++/* Where the RSX keeps the byte at linear location offset `lin` of tile `t`:
++ * a location offset, or UINT32_MAX when it falls outside the tile. Bits 0-4
++ * carry over, so 32 aligned linear bytes stay together. */
++static inline u32 rsx_tile_address(const rsx_tile* t, u32 lin)
++{
++    static const u32 bank_lut[16] = { 0, 1, 2, 3, 2, 3, 0, 1, 1, 2, 3, 0, 3, 0, 1, 2 };
++    const u32 base = t->offset;
++    /* tiles per row: pitch / 256 = prime * factor, prime the odd part */
++    u32 factor = t->pitch >> 8;
++    if (t->pitch & (t->pitch - 1u)) {
++        static const u32 primes[5] = { 3, 5, 7, 11, 13 };
++        u32 k = 0;
++        while (k < 5u && factor % primes[k]) k++;
++        if (k == 5u) return 0xFFFFFFFFu;
++        factor /= primes[k];
++    }
++    const u32 per_row = t->pitch >> 8;
++    if (!per_row || lin < base) return 0xFFFFFFFFu;
++
++    const u32 texel = (lin - base) / 256u;
++    const u32 tile_x = texel % per_row;
++    const u32 tile_y = (texel / per_row) / 64u;
++    const u32 tile_id = tile_y * per_row + tile_x;
++    const u32 sel = (tile_id + (base >> 14)) & 0x3ffffu;
++    const u32 row_address = (sel >> 2) & 0xffffu;
++
++    u32 bank = 0;
++    if (factor == 1u)      bank = sel & 3u;
++    else if (factor == 2u) bank = bank_lut[((sel + ((tile_y & 1u) << 1)) & 3u) * 4u + (tile_y & 3u)];
++    else if (factor >= 4u) bank = bank_lut[(sel & 3u) * 4u + (tile_y & 3u)];
++    bank = (bank + t->bank) & 3u;
++
++    const u32 line = (texel / per_row) % 64u;
++    u32 column = 0;
++    column |= ((line >> 3) & 7u) << 7;
++    column |= ((lin >> 5) & 7u) << 4;
++    column |= (line & 3u) << 2;
++    const u32 partition = (((line >> 2) & 1u) + ((lin >> 6) & 1u)) & 1u;
++
++    u32 a = (row_address << 16) | (bank << 14) | (((column >> 4) & 0x3fu) << 8) |
++            (partition << 7) | (((column >> 2) & 3u) << 5) | (lin & 0x1fu);
++    a ^= (((a >> 12) ^ ((bank ^ sel) & 1u) ^ (a >> 14)) & 1u) << 9;
++    a ^= ((a >> 11) & 1u) << 10;
++    return (a - base < t->size) ? a : 0xFFFFFFFFu;
++}
++
++/* Copy n bytes between a linear buffer and tiled memory, the linear bytes
++ * starting at location offset `lin`; `mem` is the tile's first byte in host
++ * memory. Bytes that map outside the tile are skipped (left as they are). */
++static inline void rsx_tile_copy(const rsx_tile* t, u8* mem, u32 lin, u8* linear, u32 n, int to_tile)
++{
++    while (n) {
++        const u32 run = 32u - (lin & 31u) < n ? 32u - (lin & 31u) : n;
++        const u32 a = rsx_tile_address(t, lin);
++        if (a != 0xFFFFFFFFu) {
++            if (to_tile) memcpy(mem + (a - t->offset), linear, run);
++            else         memcpy(linear, mem + (a - t->offset), run);
++        }
++        lin += run; linear += run; n -= run;
++    }
++}
++
++#endif /* RSX_TILING_H */
+diff --git a/libs/video/tests/test_gcm_fifo_user_command.c b/libs/video/tests/test_gcm_fifo_user_command.c
+index c653a23..02b9f35 100644
+--- a/libs/video/tests/test_gcm_fifo_user_command.c
++++ b/libs/video/tests/test_gcm_fifo_user_command.c
+@@ -42,2 +42,3 @@ void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (v
+ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+diff --git a/libs/video/tests/test_gcm_flip_stream.c b/libs/video/tests/test_gcm_flip_stream.c
+index 364aa75..d6d13c6 100644
+--- a/libs/video/tests/test_gcm_flip_stream.c
++++ b/libs/video/tests/test_gcm_flip_stream.c
+@@ -56,2 +56,3 @@ void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (v
+ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+diff --git a/libs/video/tests/test_gcm_flip_wrap.c b/libs/video/tests/test_gcm_flip_wrap.c
+index 6868923..0a353de 100644
+--- a/libs/video/tests/test_gcm_flip_wrap.c
++++ b/libs/video/tests/test_gcm_flip_wrap.c
+@@ -45,2 +45,3 @@ void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (v
+ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+diff --git a/libs/video/tests/test_gcm_get_on_jump.c b/libs/video/tests/test_gcm_get_on_jump.c
+index adf0fd5..4b43ccb 100644
+--- a/libs/video/tests/test_gcm_get_on_jump.c
++++ b/libs/video/tests/test_gcm_get_on_jump.c
+@@ -54,2 +54,3 @@ void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (v
+ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+diff --git a/libs/video/tests/test_gcm_get_on_release.c b/libs/video/tests/test_gcm_get_on_release.c
+index 7920eed..336d19f 100644
+--- a/libs/video/tests/test_gcm_get_on_release.c
++++ b/libs/video/tests/test_gcm_get_on_release.c
+@@ -61,2 +61,3 @@ void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (v
+ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+diff --git a/libs/video/tests/test_gcm_legacy_state_filter.c b/libs/video/tests/test_gcm_legacy_state_filter.c
+index e3e9d31..a37f1a9 100644
+--- a/libs/video/tests/test_gcm_legacy_state_filter.c
++++ b/libs/video/tests/test_gcm_legacy_state_filter.c
+@@ -46,2 +46,3 @@ void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (v
+ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+diff --git a/libs/video/tests/test_nv3089_engine_read.c b/libs/video/tests/test_nv3089_engine_read.c
+index e0f368d..9615b6a 100644
+--- a/libs/video/tests/test_nv3089_engine_read.c
++++ b/libs/video/tests/test_nv3089_engine_read.c
+@@ -13,2 +13,7 @@
+  *
++ * A destination in a tile bound over main memory (cellGcmSetTile, location MAIN) is written through the tiling
++ * (rsx_tiling.h): Resistance 3 downsamples its scene into one for an SPU depth-of-field job, which reads the tiled
++ * layout; written linearly, the job's output came back as bands. The tiled case checks every destination pixel at
++ * its tiled address.
++ *
+  * clang -std=gnu17 -I include -I libs/video libs/video/tests/test_nv3089_engine_read.c -Wl,-dead_strip -pthread
+@@ -46,2 +51,3 @@ void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
+ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+@@ -112,2 +118,42 @@ static void blit_case(const char* what, u32 out, u32 scale, u32 uv, u32 interp)
+ 
++/* Main memory for the tiled case: IO page 0 at EA 1 MB. Tile 4 as Resistance 3 sets it, scaled down. */
++#define MAIN_EA   0x00100000u
++#define TILE_IO   0x00030000u
++static const rsx_tile s_tile = { TILE_IO, 0x80000u, 2048u, 2u };
++
++static void blit_tiled_case(const char* what, u32 out, u32 scale)
++{
++    const u32 src_w = out * scale + 8u, src_pitch = src_w * 4u;
++    const u32 dst_off = TILE_IO + 64u;                          /* 16 pixels into the row */
++    memset(vm_base + LOCAL_BASE + SRC_OFF, 0, (size_t)src_pitch * src_w);
++    memset(vm_base + MAIN_EA, 0, 0x100000u);
++    s_reads = 0;
++
++    memset(&s_nv3089, 0, sizeof s_nv3089);
++    memset(&s_gcm2d, 0, sizeof s_gcm2d);
++    s_nv3089.fmt     = 3u;
++    s_nv3089.out_sz  = (out << 16) | out;
++    s_nv3089.in_sz   = ((out * scale) << 16) | (out * scale);
++    s_nv3089.in_fmt  = (1u << 24) | (2u << 16) | src_pitch;
++    s_nv3089.in_off  = SRC_OFF;
++    s_nv3089.ds_dx   = s_nv3089.dt_dy = scale << 20;
++    s_gcm2d.pitch      = s_tile.pitch << 16;
++    s_gcm2d.dst_offset = dst_off;
++    s_gcm2d.dst_dma    = 0xFEED0001u;                            /* main memory */
++    nv3089_blit();
++
++    u32 wrong = 0, moved = 0;
++    for (u32 y = 0; y < out; y++)
++        for (u32 x = 0; x < out; x++) {
++            const u32 lin = dst_off + y * s_tile.pitch + x * 4u;
++            const u32 a = rsx_tile_address(&s_tile, lin);
++            moved += a != lin;
++            if (vm_read32(MAIN_EA + a) != src_pixel(x * scale, y * scale)) wrong++;
++        }
++    const int ok = s_reads > 0 && wrong == 0 && moved > 0;
++    printf("[%s] %s: %u of %u destination pixels are not at their tiled address (%u moved by the tiling)\n",
++           ok ? "PASS" : "FAIL", what, wrong, out * out, moved);
++    fails += !ok;
++}
++
+ int main(void)
+@@ -128,2 +174,6 @@ int main(void)
+     blit_case("4:1 resolve, one texel source offset", 16, 4, 0x10, 1);
++    s_ea_address_table[TILE_IO >> 20] = (u16)(MAIN_EA >> 20);
++    cellGcmSetTile(4, 1 /* main */, s_tile.offset, s_tile.size, s_tile.pitch, 0, 3, (u8)s_tile.bank);
++    blit_tiled_case("2:1 downsample into a tile in main memory", 16, 2);
++    blit_tiled_case("1:1 copy into a tile in main memory", 16, 1);
+     printf("[nv3089_engine_read] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 9f57254..1bd6b27 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -17,2 +17,3 @@
+ #include "rsx_test_programs.h"
++#include "rsx_tiling.h"
+ 
+@@ -128,2 +129,5 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
+ 
++/* The first 16 bytes of the last upload: four R,G,B,A texels. */
++static u8 g_upload_first[16];
++
+ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
+@@ -132,3 +136,4 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
+     (void)u; (void)t; (void)face; (void)mip; (void)w; (void)h;
+-    (void)src; (void)row; (void)rows;
++    (void)row; (void)rows;
++    if (src) memcpy(g_upload_first, src, sizeof g_upload_first);
+     stub.n_texture_upload++;
+@@ -1310,2 +1315,63 @@ static void test_transfer_coherence(void)
+ 
++/* A tile bound over main memory: the RSX's reads and writes of it go through the tiling, the guest's bytes lie
++ * where the tiling puts them. Resistance 3 downsamples its scene into such a region with NV3089 for an SPU
++ * depth-of-field job and samples the job's output; read linearly it showed as bands over the scene. */
++#define TILE_OFF 0x00200000u
++static void test_tiled_main_memory(void)
++{
++    printf("-- tiled main memory\n");
++    const rsx_tile tile = { TILE_OFF, 0x80000u, 1024u, 2u };
++    memset(vm_base + TILE_OFF, 0, tile.size);
++    engine_up();
++    rsx_draw_engine_set_tile(0, RSX_LOCATION_MAIN, tile.offset, tile.size, tile.pitch, tile.bank);
++    rsx_draw_engine_set_tile(1, RSX_LOCATION_LOCAL, 0x40000u, 0x80000u, 1024u, 0u);   /* local: transparent */
++    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
++    m(M_COLOR_A_OFFSET, TILE_OFF);
++    m(M_COLOR_A_PITCH, 1024u);
++    draw_triangle();
++    const u32 surface = stub.bound_rt[0];
++
++    /* A surface stored to guest memory lands where the tiling puts each byte. */
++    g_stub_ramp = 1;
++    const u32 row5 = TILE_OFF + 5u * 1024u;
++    rsx_draw_engine_guest_read(RSX_LOCATION_MAIN, row5, 1024u, 16u, 1u);
++    g_stub_ramp = 0;
++    int placed = 1, moved = 0;
++    for (u32 c = 0; c < 16u; c++) {
++        const u8* p = vm_base + rsx_tile_address(&tile, row5 + c * 4u);
++        placed &= p[0] == 0x80 && p[1] == (u8)(4u * c + 1u) && p[2] == (u8)(4u * c + 2u) && p[3] == (u8)(4u * c + 3u);
++        moved |= rsx_tile_address(&tile, row5 + c * 4u) != row5 + c * 4u;
++    }
++    CHECK(placed && moved, "a stored row lands at its tiled addresses (%s)", moved ? "they differ from the linear ones" : "same");
++
++    /* Guest bytes pushed into the surface are read through the tiling. */
++    const u32 px = TILE_OFF + 3u * 1024u + 2u * 4u;
++    u8* t = vm_base + rsx_tile_address(&tile, px);
++    t[0] = 0x80; t[1] = 0x01; t[2] = 0x02; t[3] = 0x03;
++    memset(&g_written, 0, sizeof g_written);
++    rsx_draw_engine_guest_wrote(RSX_LOCATION_MAIN, px, 1024u, 5u, 4u);
++    CHECK(g_written.n == 1 && g_written.surface == surface &&
++          g_written.first[0] == 0x01 && g_written.first[1] == 0x02 && g_written.first[2] == 0x03 &&
++          g_written.first[3] == 0x80, "a transfer into it pushes the pixel from its tiled address");
++
++    /* A texture in the tile decodes the tiled bytes. */
++    const u32 tex = TILE_OFF + 0x40000u;           /* past the 256x256 target */
++    for (u32 c = 0; c < 4u; c++) {
++        u8* q = vm_base + rsx_tile_address(&tile, tex + c * 4u);
++        q[0] = 0xF0; q[1] = (u8)(0x10u + c); q[2] = (u8)(0x20u + c); q[3] = (u8)(0x30u + c);
++    }
++    bind_texture_unit(RSX_LOCATION_MAIN, tex);
++    draw_triangle();
++    CHECK(g_upload_first[0] == 0x10 && g_upload_first[3] == 0xF0 && g_upload_first[12] == 0x13 &&
++          g_upload_first[14] == 0x33, "a texture in the tile reads its texels through the tiling");
++
++    /* Unbound, the memory is linear again. */
++    rsx_draw_engine_set_tile(0, 0, 0, 0, 0, 0);
++    memset(vm_base + row5, 0, 64);
++    rsx_draw_engine_guest_read(RSX_LOCATION_MAIN, row5, 1024u, 16u, 1u);
++    CHECK(vm_base[row5] == 0x44 && vm_base[row5 + 63] == 0x33, "an unbound tile is stored linearly");
++    rsx_draw_engine_set_tile(1, 0, 0, 0, 0, 0);
++    engine_down();
++}
++
+ /* A transfer that writes over a target at another pitch leaves its pixels older than guest memory: Resistance 3
+@@ -2319,2 +2385,3 @@ int main(void)
+     test_transfer_coherence();
++    test_tiled_main_memory();
+     test_transfer_supersedes_other_targets();
+diff --git a/libs/video/tests/test_rsx_tiling.c b/libs/video/tests/test_rsx_tiling.c
+new file mode 100644
+index 0000000..3450997
+--- /dev/null
++++ b/libs/video/tests/test_rsx_tiling.c
+@@ -0,0 +1,80 @@
++/* rsx_tiling.h: where the RSX keeps a byte of a tiled main-memory region.
++ *
++ * The vectors come from a separate (Python) port of RPCS3's rsx::tiled_dma_copy, one per pitch class the function
++ * distinguishes: a power of two (factor 32, 8 and 2) and a prime multiple (5120 = 5 x 4 x 256). The first is
++ * Resistance 3's tile 4 (main 0x30000, 0x580000 bytes, pitch 8192, bank 2). Then, for that tile: every 32-byte block
++ * lands on a distinct block inside the tile, and a copy into the tiling and back returns the bytes.
++ *
++ * python3 tools/test_rsx_tiling.py, or
++ * clang -std=gnu17 -I include -I libs/video libs/video/tests/test_rsx_tiling.c -o /tmp/t && /tmp/t
++ */
++#include "rsx_tiling.h"
++#include <stdio.h>
++#include <stdlib.h>
++
++static int fails;
++
++#define CHECK(cond, ...) do { int ok_ = !!(cond); printf("[%s] ", ok_ ? "PASS" : "FAIL"); printf(__VA_ARGS__); \
++                              printf("\n"); fails += !ok_; } while (0)
++
++static void vectors(const char* what, rsx_tile t, const u32 (*v)[2], u32 n)
++{
++    u32 wrong = 0;
++    for (u32 i = 0; i < n; i++)
++        if (rsx_tile_address(&t, v[i][0]) != v[i][1]) {
++            printf("  0x%X -> 0x%X, expected 0x%X\n", v[i][0], rsx_tile_address(&t, v[i][0]), v[i][1]);
++            wrong++;
++        }
++    CHECK(!wrong, "%s: %u of %u addresses differ", what, wrong, n);
++}
++
++int main(void)
++{
++    static const u32 r3_tile4[][2] = {
++        { 0x2c7349, 0x2f8ce9 }, { 0x358983, 0x359483 }, { 0xc4586, 0xc4a46 },
++        { 0x31cee3, 0x2e3543 }, { 0x43f3ad, 0x4747ed }, { 0x7cca5, 0x6a5c5 } };
++    static const u32 pitch2048[][2] = {
++        { 0x1de07a, 0x1cbd1a }, { 0x123c4f, 0x13426f }, { 0x12e71b, 0x131c9b },
++        { 0x11e427, 0x113f87 }, { 0x1724c3, 0x17e603 }, { 0x1cb183, 0x1c14c3 } };
++    static const u32 pitch5120[][2] = {
++        { 0x3898c2, 0x391402 }, { 0x2217b2, 0x1fb592 }, { 0x6b4ca9, 0x6b9ba9 },
++        { 0x1e27b3, 0x228733 }, { 0x2e4406, 0x2e9206 }, { 0x301857, 0x30a277 } };
++    static const u32 pitch512[][2] = {
++        { 0x1c784, 0x1a664 }, { 0x17a0d, 0x1fead }, { 0x4f8bb, 0x4bb9b },
++        { 0x3835d, 0x380bd }, { 0x4a017, 0x49217 }, { 0x365ef, 0x377cf } };
++    const rsx_tile tile4 = { 0x30000u, 0x580000u, 8192u, 2u };
++    vectors("pitch 8192, bank 2 (Resistance 3's tile 4)", tile4, r3_tile4, 6);
++    vectors("pitch 2048, bank 0", (rsx_tile){ 0x100000u, 0x100000u, 2048u, 0u }, pitch2048, 6);
++    vectors("pitch 5120, bank 1", (rsx_tile){ 0x0u, 0x880000u, 5120u, 1u }, pitch5120, 6);
++    vectors("pitch 512, bank 3", (rsx_tile){ 0x10000u, 0x40000u, 512u, 3u }, pitch512, 6);
++
++    const u32 blocks = tile4.size / 32u;
++    u8* seen = calloc(blocks, 1);
++    u32 outside = 0, twice = 0, split = 0;
++    for (u32 b = 0; b < blocks; b++) {
++        const u32 lin = tile4.offset + b * 32u;
++        const u32 a = rsx_tile_address(&tile4, lin);
++        if (a == 0xFFFFFFFFu || a - tile4.offset >= tile4.size) { outside++; continue; }
++        if (rsx_tile_address(&tile4, lin + 31u) != a + 31u) split++;
++        if (seen[(a - tile4.offset) / 32u]++) twice++;
++    }
++    free(seen);
++    CHECK(!outside && !twice && !split, "the tiling permutes the tile's 32-byte blocks (%u outside, %u twice, %u split)",
++          outside, twice, split);
++
++    u8* mem = calloc(tile4.size, 1);
++    u8 row[1920], back[1920];
++    for (u32 i = 0; i < sizeof row; i++) row[i] = (u8)(i * 7u + 3u);
++    const u32 at = tile4.offset + 17u * 8192u + 2048u + 4u;    /* a 480-pixel row, not block aligned */
++    rsx_tile_copy(&tile4, mem, at, row, sizeof row, 1);
++    rsx_tile_copy(&tile4, mem, at, back, sizeof back, 0);
++    u32 diff = 0;
++    for (u32 i = 0; i < sizeof row; i++) diff += row[i] != back[i];
++    CHECK(!diff && mem[rsx_tile_address(&tile4, at) - tile4.offset] == row[0],
++          "a row copied into the tiling reads back the same (%u bytes differ)", diff);
++    free(mem);
++
++    CHECK(rsx_tile_address(&tile4, tile4.offset - 1u) == 0xFFFFFFFFu, "a byte before the tile has no tiled address");
++    printf("[rsx_tiling] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/tests/test_gcm_io_alloc.c b/tests/test_gcm_io_alloc.c
+index 5b749f9..df793a4 100644
+--- a/tests/test_gcm_io_alloc.c
++++ b/tests/test_gcm_io_alloc.c
+@@ -20,2 +20,3 @@ void spu_lockline_unlock(void) { abort(); }
+ void (*g_spu_put_hook)(uint32_t ea, uint32_t size);   /* set by cellGcmInit */
++void rsx_draw_engine_set_tile(u32 i, u32 l, u32 o, u32 s, u32 p, u32 b) { (void)i; (void)l; (void)o; (void)s; (void)p; (void)b; }
+ 
+diff --git a/tools/test_rsx_tiling.py b/tools/test_rsx_tiling.py
+new file mode 100644
+index 0000000..f6ab920
+--- /dev/null
++++ b/tools/test_rsx_tiling.py
+@@ -0,0 +1,18 @@
++#!/usr/bin/env python3
++"""RSX tiled main memory addressing (libs/video/tests/test_rsx_tiling.c, rsx_tiling.h)."""
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory(prefix='rsx-tiling-') as tmp:
++    binary = Path(tmp) / ('test.exe' if os.name == 'nt' else 'test')
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
++                    '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
++                    str(root / 'libs/video/tests/test_rsx_tiling.c'), '-o', str(binary)], check=True)
++    result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
++    print(result.stdout.strip())
++    if result.returncode:
++        print(result.stderr[-2000:])
++        raise SystemExit('test_rsx_tiling failed')
