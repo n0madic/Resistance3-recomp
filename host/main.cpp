@@ -323,12 +323,20 @@ extern "C" unsigned ppu_boot_frames_presented(void)
     return (unsigned)g_frames_presented;
 }
 
+/* Longest time between two guest frames since R3_FPS last printed: a hitch
+ * hides in a frame rate averaged over the period. Present thread only. */
+static ULONGLONG g_last_present_ms = 0, g_longest_frame_ms = 0;
+
 static void present_guest_frame(void)
 {
     rsx_backend_present();
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     InterlockedIncrement(&g_frames_presented);
+    const ULONGLONG now = GetTickCount64();
+    if (g_last_present_ms && now - g_last_present_ms > g_longest_frame_ms)
+        g_longest_frame_ms = now - g_last_present_ms;
+    g_last_present_ms = now;
     /* The flip is DONE only now: the walker has executed everything queued before
      * the guest's FLIP word, so the guest may reuse that frame's display lists.
      * Completing flips on the vblank beat alone (the template's cellGcmTickFlip
@@ -422,7 +430,8 @@ static DWORD WINAPI frame_clock(LPVOID)
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
 
-        /* R3_FPS=1: guest frames presented per second, every 5 s; R3_FPS=<ms> (100 or more) sets the period. */
+        /* R3_FPS=1: guest frames presented per second and the longest frame, every 5 s; R3_FPS=<ms> (100 or more)
+         * sets the period. */
         { static int on = -1; static ULONGLONG t0, period; static LONG f0;
           if (on < 0) {
               const char* e = getenv("R3_FPS");
@@ -431,8 +440,9 @@ static DWORD WINAPI frame_clock(LPVOID)
           }
           if (on && now - t0 >= period) {
               const LONG f = g_frames_presented;
-              fprintf(stderr, "[fps] %.1f\n", (f - f0) * 1000.0 / (double)(now - t0));
-              t0 = now; f0 = f;
+              fprintf(stderr, "[fps] %.1f longest %llu ms\n", (f - f0) * 1000.0 / (double)(now - t0),
+                      (unsigned long long)g_longest_frame_ms);
+              t0 = now; f0 = f; g_longest_frame_ms = 0;
           } }
 
         /* Drain at the outer cadence too, not only on the 60 Hz tick: titles

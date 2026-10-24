@@ -56,7 +56,12 @@ ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # o
 Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (76 of them on
 v0.17.0; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
 Some runtime unit tests (e.g. `runtime/spu/tests/test_spu_thread_ls_dma.c`) are built directly with clang from the
-toolkit dir against the runtime sources they need. On the pinned v0.17.0 all 16 ctest tests and all 76 scripts pass with
+toolkit dir against the runtime sources they need. The Metal ones that translate guest programs
+(`libs/video/tests/test_shadow_compare_metal.m`) need the translator: compile `rsx_shader_msl.cpp` with
+`-DPS3RECOMP_HAVE_MSL_TRANSLATION=1 -DPS3RECOMP_MSL_TRANSLATOR_ID='"<any 23 chars>"'` and `-I build/deps/prefix/include`
+(+ `/spirv_cross`), and link glslang, SPIRV, SPIRV-Tools(-opt) and the spirv-cross static libraries from
+`build/deps/prefix/lib`; without it the stub reports "translation was not built" and 32 of 37 checks fail (with it,
+133/133 pass). On the pinned v0.17.0 all 16 ctest tests and all 76 scripts pass with
 the patches on (`test_metal_frame_rate` needs a usable display), so a new failure is ours. A patch that moves a symbol or
 changes a code path can break a fixture's link line or stub (the loader fixtures stub `cellGcm_on_put_store`): fix the
 fixture in the same patch.

@@ -20,7 +20,7 @@ through fetch_many and fetch_one, with division element i; six of its checks fai
 plans (which compare _prepare's span with a walk of rsx_vertex_element_index) pass, as do all 17 ctest tests and
 tools/test_rsx_immediate_vertices.py.
 
-Upstream: not proposed yet.
+Upstream: PR #547 (on master, without #458; drop this patch when the pin has it).
 
 ---
 
