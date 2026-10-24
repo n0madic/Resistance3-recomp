@@ -107,13 +107,18 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   - SPURS policy modules `pm_wws` / `pm_ig`, at LS 0xA00;
   - WWS and Insomniac job modules. Insomniac ones are linked at LS 0x100, except the buffer modules (a second header
     layout) that the dispatcher loads into fixed LS buffers (0x6600, 0x20680, 0x24D00, ...) and the dispatcher itself
-    (0x3F580); their load addresses are a table in `extract_spu_raw.py` (`IG_BUFFER_MODULES`, from a census run).
+    (0x3F580); the load addresses of some are a table in `extract_spu_raw.py` (`IG_BUFFER_MODULES`, from census runs),
+    every other second-layout header in the EBOOT is lifted position-independent (`--pic`, verified wherever it loads).
+    Functions a job reaches only through a pointer are invisible to the lifter: `IG_EXTRA_ENTRIES` lists them per module
+    (from a census of lookup misses), passed as `--extra-funcs`. Lifting with `--return-entries` hangs the boot.
 
   `scripts/extract_spu_raw.py` wraps the non-ELF code as ELFs for lifting. `build_module.py` generates
   `spu/igjob_regions.c`, which registers each Insomniac module's span as resident code (buffer modules as verified
   regions with their bytes): they overwrite `pm_ig` in LS, so the dispatch must follow `resident_code`. A DMA from
   elsewhere into a span only takes over the bytes it wrote (`spu-runtime/0007`). Code that is not lifted runs in the
-  SPU interpreter, among it three position-independent modules loaded at a new address each time.
+  SPU interpreter. The ~220 images need larger runtime tables than the toolkit's defaults: `host/CMakeLists.txt` defines
+  `SPU_WORKLOAD_MAX` (past it the SPURS task ELFs were dropped and the boot hung) and `SPU_OVL_SRC_MAX`
+  (`spu-runtime/0009`; past it a module stays in the interpreter, the log says `[r3] ... not registered`).
 - **RSX/GCM**: the FIFO walker runs on the present thread. `cellGcm_on_put_store` takes JUMPs at an idle get
   immediately (the game injects command blocks at get and reuses their memory). The draw engine goes to Metal.
   The game reads its Z24S8 depth buffers as A8R8G8B8 several times a frame (one of them while it is still the

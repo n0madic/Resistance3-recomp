@@ -84,9 +84,13 @@ def lift(sdk: Path, elf: Path, work: Path, python: Path) -> tuple[Path, Path]:
          "--jobmods", jobmods, "--ig-manifest", ig_manifest, log_file=work / "spu_extract_raw.log")
     tool(python, tools / "lift_jobmods.py", "--jobmods", jobmods, "--out", spu,
          "--register", spu / "jobmods_register.c", "--symbol-prefix", "r3", log_file=work / "jobmods_lift.log")
-    pic = [arg for m in json.loads(ig_manifest.read_text()) if m.get("pic") for arg in ("--pic", m["name"])]
+    modules = json.loads(ig_manifest.read_text())
+    pic = [arg for m in modules if m.get("pic") for arg in ("--pic", m["name"])]
+    extra = [arg for m in modules if m.get("extra_funcs")
+             for arg in ("--extra-funcs", f"{m['name']}={','.join(m['extra_funcs'])}")]
     tool(python, tools / "build_spu_workloads.py", "--images", spu / "images", "--lifted", spu,
          "--out", spu / "spu_workloads.c", "--register-fn", SPU_REGISTER_FN, "--constructor", "--title", "r3", *pic,
+         *extra,
          log_file=work / "spu_lift.log")
     write_ig_regions(ig_manifest, spu / "spu_workloads.c", spu / IG_REGIONS_C)
     return ppu, spu

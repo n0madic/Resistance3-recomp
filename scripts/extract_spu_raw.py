@@ -18,7 +18,8 @@ usage: extract_spu_raw.py <EBOOT.elf> --tools <sdk/tools> --images <dir> --jobmo
   them. Each is wrapped at its address and listed in the manifest with its bytes (a .bin beside the manifest), so the
   build registers it as a verified region: it dispatches to its lift only when a load at that address matches.
 * Insomniac position-independent modules, loaded at a new LS address each time: some with the layout of the small
-  buffer modules (IG_PIC_MODULES lists them), and the ones kept in the data segment, found by a third layout: the
+  buffer modules (IG_PIC_MODULES lists them, and every second-layout header that IG_BUFFER_MODULES does not place),
+  and the ones kept in the data segment, found by a third layout: the
   signature, four layout words, then 0xFFFFFFEF, 0 and two DEADDEAD words, code from +0x30, the entry at layout word
   4 + 0x20 (a function prologue in every one). The game rewrites that header in memory, so only the bytes from +0x30
   are the load's. Each is wrapped at LS 0 and lifted
@@ -58,12 +59,12 @@ IG_MODULE_LSA = 0x100
 # The second census (the street fight in Haven, aiming included) counted the steps the interpreter ran by the module
 # header below the PC: 0xDFF880 to 0xE03580, which igjob_00E06E80 loads at 0x2D00 while the player aims (0xE03580
 # alone ran ~45M interpreted steps/s, 4-6 fps), and 0xDB5680, 0xE66A80, 0xE6DC00 and 0xE7A280. 0xE45480 went to seven
-# addresses there, 0xDACF80 to eight; 0xE42480 to 0x6D80 as well.
+# addresses there, 0xDACF80 to eight; 0xE42480 to 0x6D80 as well as 0x6E80, so it is not listed here (see below).
 # TODO: take a census on the later levels; a module missing here runs in the interpreter, as before.
 IG_BUFFER_MODULES = (
     (0xDB5680, 0x11860), (0xDB7080, 0x0DF00), (0xDFF880, 0x02D00), (0xE00B00, 0x02D00), (0xE01980, 0x02D00),
     (0xE01F80, 0x02D00), (0xE02D00, 0x02D00), (0xE03580, 0x02D00),
-    (0xE35F00, 0x06600), (0xE37700, 0x06780), (0xE42480, 0x06E80),
+    (0xE35F00, 0x06600), (0xE37700, 0x06780),
     (0xE62280, 0x20680), (0xE62780, 0x20680), (0xE63480, 0x20680), (0xE64080, 0x20680), (0xE65280, 0x20680),
     (0xE66080, 0x20680), (0xE66A80, 0x20680), (0xE69280, 0x21F00), (0xE6A980, 0x21F00), (0xE6C180, 0x21F00),
     (0xE6DC00, 0x21F00), (0xE74980, 0x21600),
@@ -77,6 +78,10 @@ IG_BUFFER_MODULES = (
 # (Resistance 3's opening cutscene stood at 2 fps for 20-35 s in the interpreter on them); the census saw each loaded
 # whole, in one GET of its layout size.
 IG_PIC_MODULES = (0xDB2D80, 0xDB0400, 0xE25B80)
+# Every other header of the second layout (no census has seen where it loads) is lifted position-independent too:
+# none of the 37 listed buffer modules addresses its own bytes absolutely (their absolute references go to the
+# dispatcher's shared data, 0xF000-0x10000), and the load is checked against the module's bytes wherever it lands,
+# so a module that is not position-independent after all, or a load of part of one, still runs in the interpreter.
 IG_PIC_LINK_LSA = 0
 # Third layout (data-segment modules): header words 8 and 9, where the code starts, and what layout word 4 counts
 # the entry from.
@@ -84,11 +89,21 @@ IG_DATA_MODULE_MARK = (0xFFFFFFEF, 0)
 IG_DATA_MODULE_CODE = 0x30
 IG_DATA_MODULE_ENTRY_BASE = 0x20
 # A data-segment module ends at the next header, or (the last one) at a run of this many zero bytes within
-# IG_DATA_MODULE_MAX; trailing zeros are alignment the loads do not always cover.
-IG_DATA_MODULE_GAP = 0x40
+# IG_DATA_MODULE_MAX; trailing zeros are alignment the loads do not always cover. The last one (0x1011280) ends in
+# 32 zero bytes, then a data table: a 64-byte run left it out.
+IG_DATA_MODULE_GAP = 0x20
 IG_DATA_MODULE_MAX = 0x4000
 # igPm's dispatcher (0xE28A00): igPm loads it to the top of LS. Its layout words give no size; this is the load's.
 IG_DISPATCHER = (0xE28A00, 0x3F580, 0x510)
+# Entries the lifter cannot see (functions the jobs reach through a pointer), by module guest address, at the link
+# address of its lift: the misses of the lookup inside resident modules while aiming in the Haven street fight
+# (igdat_00FF9400's 0x2C8 alone took ~3.5M interpreted lookups in 30 s).
+# TODO: take this census on the later levels too.
+IG_EXTRA_ENTRIES = {
+    0xD9F800: (0x17B0,),
+    0xFF7180: (0x3B8, 0x3C0),
+    0xFF9400: (0x2C8, 0x3B8, 0x4C0, 0x4C8),
+}
 
 
 def is_ila_r2(word: int) -> bool:
@@ -142,10 +157,36 @@ def ig_buffer_modules(elf: bytes) -> list[tuple[int, int, int, int, bytes]]:
     return out
 
 
-def ig_pic_modules(elf: bytes) -> list[tuple[int, int, int, bytes]]:
-    """(guest address, size, entry, bytes) of the position-independent modules, entry at the link address."""
+def is_ig_second_layout(words: tuple[int, ...]) -> bool:
+    """The second layout's words 4-7: word 5 repeats one halfword, word 7's low halfword is 0x8000."""
+    return words[5] >> 16 == words[5] & 0xFFFF and words[7] & 0xFFFF == 0x8000
+
+
+def ig_unlisted_modules(elf: bytes) -> list[int]:
+    """Guest addresses of the second-layout headers that no list here names, with a size and entry that fit LS."""
+    listed = ({ea for ea, _ in IG_BUFFER_MODULES} | set(IG_PIC_MODULES) | {IG_DISPATCHER[0]}
+              | {addr for _, addr, _ in PROGRAMS} | {file_to_guest(elf, off) for off, *_ in find_ig_modules(elf)})
     out = []
-    for ea in IG_PIC_MODULES:
+    for _vaddr, offset, filesz in load_segments(elf):
+        for p in range(offset, offset + filesz - 0x20 + 1, 16):
+            words = struct.unpack_from(">8I", elf, p)
+            if not all(is_ila_r2(w) for w in words[:IG_SIG_WORDS]) or not is_ig_second_layout(words):
+                continue
+            ea = file_to_guest(elf, p)
+            size, entry = ig_buffer_module_size(words), (words[6] & 0xFFFF) * 4
+            if ea in listed:
+                continue
+            if not 0 < size <= SPU_LS_SIZE or not 0x10 <= entry < size or p + size > offset + filesz:
+                LOG.info("second-layout header at %#x: size %#x or entry %#x does not fit, left out", ea, size, entry)
+                continue
+            out.append(ea)
+    return out
+
+
+def ig_pic_modules(elf: bytes, eas: list[int]) -> list[tuple[int, int, int, bytes]]:
+    """(guest address, size, entry, bytes) of the position-independent modules at eas, entry at the link address."""
+    out = []
+    for ea in eas:
         off = guest_to_file(elf, ea)
         words = struct.unpack_from(">8I", elf, off)
         if not all(is_ila_r2(w) for w in words[:IG_SIG_WORDS]):
@@ -254,7 +295,7 @@ def main() -> int:
         (args.ig_manifest.parent / f"{name}.bin").write_bytes(code)
         manifest.append({"name": name, "ea": ea, "span": size, "load_lsa": lsa, "bytes": f"{name}.bin"})
         LOG.info("ig buffer module %s: LS %#x, %d bytes, entry %#x", name, lsa, size, entry)
-    for ea, size, entry, code in ig_pic_modules(elf):
+    for ea, size, entry, code in ig_pic_modules(elf, [*IG_PIC_MODULES, *ig_unlisted_modules(elf)]):
         name = f"igpic_{ea:08X}"
         (args.images / f"{name}.elf").write_bytes(wrap(code, base=IG_PIC_LINK_LSA, entry=entry))
         (args.ig_manifest.parent / f"{name}.bin").write_bytes(code)
@@ -268,6 +309,9 @@ def main() -> int:
         manifest.append({"name": name, "ea": ea, "span": size, "load_lsa": IG_PIC_LINK_LSA, "bytes": f"{name}.bin",
                          "pic": True, "code_offset": IG_DATA_MODULE_CODE})
         LOG.info("ig data-segment module %s: %d bytes, entry %#x", name, size, entry)
+    for module in manifest:
+        if module["ea"] in IG_EXTRA_ENTRIES:
+            module["extra_funcs"] = [hex(a) for a in IG_EXTRA_ENTRIES[module["ea"]]]
     args.ig_manifest.write_text(json.dumps(manifest, indent=1) + "\n")
 
     pos = n = 0

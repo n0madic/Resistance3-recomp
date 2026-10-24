@@ -37,6 +37,11 @@ set(PS3RECOMP_ATRAC_LGPL OFF CACHE BOOL "" FORCE)
 # ps3recomp runtime library
 # ---------------------------------------------------------------------------
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_FROM_ALL)
+# Each lifted SPU image takes two entries of the workload registry (spu_workload.c, default 256). The module lifts
+# about 220 images (every Insomniac buffer module among them); past the cap the last ones -- the SPURS task ELFs --
+# were dropped and the boot hung on an event flag that task sets. Each Insomniac module also takes one overlay source
+# (spu_channels.c, default 128, spu-runtime/0009); past that cap a module stays in the interpreter.
+target_compile_definitions(ps3recomp_runtime PRIVATE SPU_WORKLOAD_MAX=1024 SPU_OVL_SRC_MAX=512)
 
 # ---------------------------------------------------------------------------
 # Generated, game-independent files

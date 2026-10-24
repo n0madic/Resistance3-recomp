@@ -1,0 +1,28 @@
+SPU: the overlay source table's size (SPU_OVL_SRC_MAX) may be defined at build time.
+
+Resistance 3 lifts about 220 SPU images, 213 of them Insomniac job modules registered as resident regions (every
+module of its job system; the buffer modules no census placed are lifted position-independent). The table of
+overlay sources holds 128: past that spu_overlay_register_verified_region fails, and the last 88 modules registered stayed
+in the interpreter. The default stays 128; the port defines a larger one from its own build, like SPU_WORKLOAD_MAX.
+
+Test: a scripted boot to the Haven street fight, aiming: no "[r3] ... not registered" line in the log (88 without
+the larger cap), and the interpreter census of that fight (see the commit) drops to the modules no lift covers.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 00e9a45..2647dc1 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1674,4 +1674,9 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+ /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
+- * the same job code buffer at LS 0x4000, dispatched by content signature). */
++ * the same job code buffer at LS 0x4000, dispatched by content signature).
++ * A title with more lifted modules defines a larger cap at build time
++ * (-DSPU_OVL_SRC_MAX=N): a registration past it fails, and that module
++ * stays in the interpreter. */
++#ifndef SPU_OVL_SRC_MAX
+ #define SPU_OVL_SRC_MAX 128
++#endif
+ static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
