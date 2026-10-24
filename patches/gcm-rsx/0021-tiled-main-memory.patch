@@ -42,7 +42,8 @@ bound (1 ns otherwise); the game keeps tile 4 bound and makes ~400k such lookups
 0.2 ms of the render thread a frame. A/B aiming runs (3 each, against the NV3089-and-engine-only version) gave
 medians of 19.9 and 19.4 fps, within the noise of that machine.
 
-Upstream: not proposed yet.
+Upstream: PR #569 (on master: without the NV0039 part, as master has no NV0039 yet (gcm-rsx/0004), and with
+the fetch tests standing alone; when the pin has it, keep only the NV0039 lines here).
 ---
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
