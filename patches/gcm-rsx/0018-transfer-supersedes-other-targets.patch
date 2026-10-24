@@ -26,7 +26,7 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index ff003f5..dba53c9 100644
+index 774f2ac..981df22 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -107,2 +107,3 @@ typedef struct {
@@ -37,16 +37,16 @@ index ff003f5..dba53c9 100644
      int guest_dirty;       /* written since guest memory last got a copy     */
 +    int guest_newer;       /* a 2D transfer wrote over it since it was last drawn */
      u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
-@@ -721,2 +723,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -717,2 +719,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      s->guest_dirty = 0;
 +    s->guest_newer = 0;
      s->last_use = g.frames;
-@@ -802,3 +805,3 @@ static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* xb, u32* y)
+@@ -798,3 +801,3 @@ static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* xb, u32* y)
          const eng_surface* s = &g.surfaces[i];
 -        if (!s->handle || s->location != location || offset < s->offset) continue;
 +        if (!s->handle || s->guest_newer || s->location != location || offset < s->offset) continue;
          const u32 bpp = eng_transfer_bpp(s->fmt);
-@@ -918,9 +921,43 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -914,9 +917,43 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
  
 +/* The guest bytes a colour target's rows cover; a swizzled target (its pitch register below a row) is packed. */
 +static u64 eng_rows_span(u32 pitch, u32 w, u32 h, u32 bpp)
@@ -93,32 +93,31 @@ index ff003f5..dba53c9 100644
 +    eng_mark_guest_newer(location, offset, (u64)offset + (u64)pitch * (h - 1u) + (u64)w * 4u, slot);
 +    if (slot == ENG_INVALID) {
          if (eng_coherence_log())
-@@ -1011,2 +1048,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -1007,2 +1044,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      z->guest_dirty = 0;
 +    z->guest_newer = 0;
      z->last_use = g.frames;
-@@ -1539,2 +1577,3 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+@@ -1535,2 +1573,3 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
      z->guest_dirty = 1;
 +    z->guest_newer = 0;
      z->zfmt = sf->depth_format;
-@@ -1552,2 +1591,3 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+@@ -1548,2 +1587,3 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
          g.surfaces[targets[i]].guest_dirty = 1;
 +        g.surfaces[targets[i]].guest_newer = 0;
      }
-@@ -2412,4 +2452,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
-         for (u32 i = 0; i < g.n_surfaces; i++) {
--            if (compressed || !g.surfaces[i].handle || g.surfaces[i].location != t.location ||
+@@ -2408,4 +2448,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+         for (u32 i = 0; i < g.n_surfaces && !compressed; i++) {
+-            if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
 -                g.surfaces[i].offset != t.offset)
-+            if (compressed || !g.surfaces[i].handle || g.surfaces[i].guest_newer ||
++            if (!g.surfaces[i].handle || g.surfaces[i].guest_newer ||
 +                g.surfaces[i].location != t.location || g.surfaces[i].offset != t.offset)
                  continue;
-@@ -2429,3 +2469,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2425,3 +2465,3 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              const eng_zdepth* z = &g.zdepths[i];
--            if (compressed || z->location != t.location || z->offset != t.offset || !z->depth_serial)
-+            if (compressed || z->guest_newer || z->location != t.location || z->offset != t.offset ||
-+                !z->depth_serial)
+-            if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
++            if (z->guest_newer || z->location != t.location || z->offset != t.offset || !z->depth_serial)
                  continue;
-@@ -2500,4 +2541,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2496,4 +2536,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              for (u32 i = 0; i < g.n_zdepths; i++)
 -                if (g.zdepths[i].location == t.location &&
 -                    g.zdepths[i].offset == t.offset && current_zslot != i) {
@@ -138,10 +137,10 @@ index d742673..d4357b3 100644
 + * transfer does not write it back, until something is drawn into it again. */
  void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 110468a..fde335a 100644
+index d254b94..f63a2ca 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -1262,7 +1262,2 @@ static void test_transfer_coherence(void)
+@@ -1210,7 +1210,2 @@ static void test_transfer_coherence(void)
  
 -    /* Another pitch lays the rows out elsewhere, and other memory is not a surface. */
 -    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 2048u, 4u, 4u);
@@ -149,7 +148,7 @@ index 110468a..fde335a 100644
 -    CHECK(g_written.n == 1, "a different pitch or memory space touches no surface");
 -
      /* A transfer reading a surface's bytes gets the GPU's pixels first. */
-@@ -1274,2 +1269,69 @@ static void test_transfer_coherence(void)
+@@ -1222,2 +1217,69 @@ static void test_transfer_coherence(void)
            "the surface's R,G,B,A pixels land in guest memory as A8R8G8B8");
 +
 +    /* Another pitch lays the rows out elsewhere, and other memory is not a surface. */
@@ -219,7 +218,7 @@ index 110468a..fde335a 100644
 +          "a zeta written over reads guest memory (%d readbacks, %d uploads)",
 +          stub.n_depth_readback, stub.n_texture_create - before);
      engine_down();
-@@ -2225,2 +2287,3 @@ int main(void)
+@@ -2171,2 +2233,3 @@ int main(void)
      test_transfer_coherence();
 +    test_transfer_supersedes_other_targets();
      test_transfer_rows();

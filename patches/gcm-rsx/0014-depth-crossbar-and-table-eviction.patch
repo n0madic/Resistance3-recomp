@@ -39,7 +39,7 @@ PR #499's fourth commit (https://github.com/sp00nznet/ps3recomp/pull/499).
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 11c4720..eb5a28c 100644
+index cea3b8d..07c2db9 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -107,2 +107,3 @@ typedef struct {
@@ -79,16 +79,16 @@ index 11c4720..eb5a28c 100644
 +    return best;
 +}
 +
- /* PS3RECOMP_ENG_SURFACE_REUSE=0 (read at engine init): a clip smaller than the surface at its address recreates the
-@@ -645,4 +674,6 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+ /* The colour target for this (location, offset), created or reallocated when
+@@ -641,4 +670,6 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                  ((s->w == want_w && s->h == want_h) ||
--                 (s_surface_reuse && pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
-+                 (s_surface_reuse && pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h))) {
+-                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
++                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h))) {
 +                g.surfaces[i].last_use = g.frames;
                  return i;
 +            }
              slot = i;
-@@ -661,5 +692,12 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -657,5 +688,12 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      }
 +    int evicted = 0;
      if (slot == ENG_MAX_SURFACES) {
@@ -103,21 +103,21 @@ index 11c4720..eb5a28c 100644
 +            evicted = 1;
 +        }
      }
-@@ -672,3 +710,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -668,3 +706,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      if (!handle)
 -        return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 +        return (!evicted && slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
  
-@@ -682,2 +720,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -678,2 +716,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      s->guest_dirty = 0;
 +    s->last_use = g.frames;
      if (slot == g.n_surfaces) g.n_surfaces++;
-@@ -934,3 +973,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -930,3 +969,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
          if (z->location == location && z->offset == offset) {
 -            if (z->w >= want_w && z->h >= want_h) return i;
 +            if (z->w >= want_w && z->h >= want_h) { z->last_use = g.frames; return i; }
              slot = i;
-@@ -941,5 +980,12 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -937,5 +976,12 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      }
 +    int evicted = 0;
      if (slot == ENG_MAX_ZDEPTHS) {
@@ -132,24 +132,24 @@ index 11c4720..eb5a28c 100644
 +            evicted = 1;
 +        }
      }
-@@ -948,3 +994,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -944,3 +990,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      if (!handle)
 -        return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 +        return (!evicted && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
  
-@@ -953,2 +999,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -949,2 +995,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      if (z->conv) g.be->texture_release(g.be->user, z->conv);
 +    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
      z->conv = 0;
-@@ -963,2 +1010,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -959,2 +1006,3 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      z->guest_dirty = 0;
 +    z->last_use = g.frames;
      if (slot == g.n_zdepths) g.n_zdepths++;
-@@ -2329,2 +2377,3 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2325,2 +2373,3 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              surface_at = (int)i;
 +            g.surfaces[i].last_use = g.frames;
              /* A current attachment requires an ordered immutable copy; it
-@@ -2344,4 +2393,6 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2340,4 +2389,6 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                  continue;
 -            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial)
 +            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial) {
@@ -157,11 +157,11 @@ index 11c4720..eb5a28c 100644
 +                g.zdepths[i].last_use = g.frames;
 +            }
              break;
-@@ -2413,2 +2464,3 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2409,2 +2460,3 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                      g.zdepths[i].offset == t.offset && current_zslot != i) {
 +                    g.zdepths[i].last_use = g.frames;
                      const u32 snap = eng_zdepth_snapshot(i);
-@@ -3092,2 +3144,3 @@ static void eng_present(u32 buffer_id)
+@@ -3088,2 +3140,3 @@ static void eng_present(u32 buffer_id)
      if (target == ENG_INVALID) return;
 +    g.surfaces[target].last_use = g.frames;
      if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
@@ -192,10 +192,10 @@ index 131cc0d..77e4f10 100644
 +                      : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
  
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 117d81f..5940211 100644
+index b063f81..0a571c1 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -1805,2 +1805,88 @@ static void test_z16_read_as_depth16_on_gpu(void)
+@@ -1780,2 +1780,88 @@ static void test_z16_read_as_depth16_on_gpu(void)
  
 +/* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
 + * depth target it was given, or 0. */
@@ -284,7 +284,7 @@ index 117d81f..5940211 100644
 +}
 +
  static void test_color_read_as_float(void)
-@@ -2050,2 +2136,3 @@ int main(void)
+@@ -2024,2 +2110,3 @@ int main(void)
      test_z16_read_as_depth16_on_gpu();
 +    test_full_tables_evict_the_oldest();
      test_color_read_as_float();

@@ -646,11 +646,6 @@ int main(int argc, char** argv)
     /* Enter/Esc confirm and go back in the game's menus, and press START elsewhere; the mouse turns the hero. */
     r3_input_register();
 
-    /* The engine keeps a larger colour surface for a smaller clip on the same pitch (toolkit v0.17). Resistance 3
-     * alternates 960x640 and 960x704 clips at one address and samples those surfaces with descriptors of their own
-     * size: with the reuse the first level shows full-width yellow bands. The surface is recreated as before. */
-    set_default_env("PS3RECOMP_ENG_SURFACE_REUSE", "0");
-
     /* Every guest program a scene meets for the first time is translated HLSL -> SPIR-V -> MSL on the thread that
      * walks the FIFO, 20-200 ms each: the opening cutscene stalled for 160-360 ms on the same frames of every run
      * (the woman's head jerked back and forth). Kept on disk, a translation is done once. */

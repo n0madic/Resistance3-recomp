@@ -1,0 +1,338 @@
+rsx draw engine: a texture descriptor smaller than the colour target it names reads the target's top-left region.
+
+Resistance 3 drops its scene from 704 to 640 rows when frames get slow (1920x704 -> 1920x640 and 960x704 -> 960x640
+at the same addresses and pitches) and reads each target with a descriptor of the size it was drawn at. The pin's
+eng_surface_get (#382) keeps the 704-row target for the 640-row clip, but the engine bound it whole, so its
+normalised coordinates squeezed all 704 rows into the 640-row read: the last 64 rows showed as a yellow band across
+the bottom of every 640-row frame. gcm-rsx/0007 (dropped with this patch) turned the reuse off in the port, which
+recreated the target at the new size instead -- and the frame the size changes on copies the previous frame from
+that target (960x704 descriptor) after a depth-only pass bound it at 640 rows: the copy read a never-written target,
+a black scene with only the HUD for one frame at the onset of a heavy hit.
+
+- rsx_draw_backend.color_region (optional): the top-left w x h of a colour target as a new texture, copied in command
+  order like color_snapshot; the Metal backend records it as a snapshot whose destination is smaller (the executor
+  copies the destination's extent). NULL keeps the whole-target bind (D3D12, Vulkan).
+- sink_bind_textures: a linear unit at the target's pitch with a descriptor smaller than the target reads that copy
+  (eng_surface_region). The copy is kept per target until the target is drawn again (color_serial), a transfer
+  writes its rows, or another size is asked for, and released with the target.
+
+test_rsx_draw_engine: a smaller clip at the same pitch keeps the target; a 256x192 descriptor reads a 256x192 copy,
+kept while the target is not drawn and remade after a draw or a transfer; a full-size descriptor and a backend
+without color_region read the target. test_metal_color_region: the Metal copy holds the target's top-left pixels and
+a region larger than the target is refused. In the game: five hits with the scene at 640 rows (Haven street fight),
+no black frame, no band.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 981df22..e9b8fc8 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -105,2 +105,5 @@ typedef struct {
+     u32 feedback;          /* last immutable own-target copy, engine-owned */
++    u32 region;            /* top-left copy for a smaller descriptor (eng_surface_region), engine-owned */
++    u32 region_w, region_h;
++    u64 region_serial;     /* color_serial the region was copied at */
+     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+@@ -713,2 +716,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
++    if (s->region) { g.be->texture_release(g.be->user, s->region); s->region = 0; }
+     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+@@ -980,2 +984,3 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
+     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
++    g.surfaces[slot].region_serial = UINT64_MAX;   /* the region copy predates these rows */
+ }
+@@ -2380,2 +2385,33 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
+  * different conversion and must not silently sample stale guest bytes. */
++/* What a texture unit naming colour target `slot` reads: the target, or, when
++ * the unit's descriptor is smaller than it at the same pitch, a copy of the
++ * top-left rows and columns the descriptor covers. That memory is what the RSX
++ * reads; binding the whole target squeezed it into the descriptor's extent.
++ * Resistance 3 drops its scene from 704 to 640 rows when frames get slow: with
++ * the 704-row target kept for the 640-row clip, every 640-row read of it showed
++ * the last 64 rows squeezed in as a band across the bottom, and with the target
++ * recreated at 640 rows instead the frame the switch happens on copied a
++ * never-written target to the screen (a black frame at the onset of a heavy
++ * hit). The copy is kept until the target is drawn again or another size is
++ * asked for. */
++static u32 eng_surface_region(u32 slot, const rsx_dsp_texture* t)
++{
++    eng_surface* s = &g.surfaces[slot];
++    if (!g.be->color_region || t->cubemap || t->dimension == 3 || !t->pitch ||
++        t->pitch != s->pitch || t->width > s->w || t->height > s->h ||
++        (t->width == s->w && t->height == s->h))
++        return s->handle;
++    if (s->region && s->region_w == t->width && s->region_h == t->height &&
++        s->region_serial == s->color_serial)
++        return s->region;
++    const u32 copy = g.be->color_region(g.be->user, s->handle, t->width, t->height);
++    if (!copy) return s->handle;
++    if (s->region) g.be->texture_release(g.be->user, s->region);
++    s->region = copy;
++    s->region_w = t->width;
++    s->region_h = t->height;
++    s->region_serial = s->color_serial;
++    return copy;
++}
++
+ static int eng_color_feedback_compatible(const eng_surface* s,
+@@ -2527,7 +2563,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+         if (sampled >= 0) {
++            const u32 src = eng_surface_region((u32)sampled, &t);
+             const u32 view = g.be->surface_view
+-                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
+-                                     t.remap & 0xFFFFu, t.format)
++                ? g.be->surface_view(g.be->user, src, t.remap & 0xFFFFu, t.format)
+                 : 0;
+-            textures[u] = view ? view : g.surfaces[sampled].handle;
++            textures[u] = view ? view : src;
+             continue;
+@@ -3319,2 +3355,3 @@ void rsx_draw_engine_shutdown(void)
+         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
++        if (g.surfaces[i].region) g.be->texture_release(g.be->user, g.surfaces[i].region);
+         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index d4357b3..4ec4abd 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -265,2 +265,11 @@ typedef struct rsx_draw_backend {
+     u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
++
++    /* Optional. The top-left w x h of a colour target (w and h no larger than
++     * the target) as a fresh texture of the target's storage format, copied in
++     * command order like color_snapshot; the engine owns the handle and
++     * releases it with texture_release. A texture unit that names a target
++     * with a smaller descriptor at the target's pitch reads that region of its
++     * memory, not the whole target scaled. 0 when the backend cannot; NULL
++     * binds the whole target, as before. */
++    u32  (*color_region)(void* user, u32 surface, u32 w, u32 h);
+ } rsx_draw_backend;
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index 065de39..4d3c31d 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -2889,2 +2889,26 @@ static u32 eng_color_snapshot(void* user, u32 surface)
+ 
++/* eng_color_snapshot of the top-left w x h only: the executor copies the
++ * destination's extent. */
++static u32 eng_color_region(void* user, u32 surface, u32 w, u32 h)
++{
++    (void)user;
++    id<MTLTexture> src = eng_obj(surface);
++    if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
++        !w || !h || w > [src width] || h > [src height] ||
++        s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
++    MTLTextureDescriptor* td =
++        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
++                         width:w height:h mipmapped:NO];
++    td.storageMode = MTLStorageModePrivate;
++    td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++    const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
++    if (!copy) { s_eng_dropped++; return 0; }
++    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
++    memset(r, 0, sizeof *r);
++    r->kind = ENG_REC_COLOR_SNAPSHOT;
++    r->rt[0] = surface;
++    r->resolve_dst = copy;
++    return copy;
++}
++
+ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+@@ -3463,4 +3487,5 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+             id<MTLTexture> dst = eng_obj(r->resolve_dst);
+-            if (!src || !dst || [src width] != [dst width] ||
+-                [src height] != [dst height] || [src pixelFormat] != [dst pixelFormat]) {
++            /* A snapshot is the whole target; a region (eng_color_region) its top-left. */
++            if (!src || !dst || [src width] < [dst width] ||
++                [src height] < [dst height] || [src pixelFormat] != [dst pixelFormat]) {
+                 s_eng_dropped++; continue;
+@@ -3472,3 +3497,3 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+-                     sourceSize:MTLSizeMake([src width], [src height], 1)
++                     sourceSize:MTLSizeMake([dst width], [dst height], 1)
+                       toTexture:dst destinationSlice:0 destinationLevel:0
+@@ -3990,2 +4015,3 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+     .depth_as_color       = eng_depth_as_color,
++    .color_region         = eng_color_region,
+     .pipeline_create      = eng_pipeline_create,
+diff --git a/libs/video/tests/test_metal_color_region.m b/libs/video/tests/test_metal_color_region.m
+new file mode 100644
+index 0000000..4bee1b4
+--- /dev/null
++++ b/libs/video/tests/test_metal_color_region.m
+@@ -0,0 +1,66 @@
++/* color_region: the top-left w x h of a colour target as a new texture, copied in command order. A target seeded with
++ * a distinct value per pixel must give back exactly its top-left rows and columns; a region larger than the target is
++ * refused. No window or original game data.
++ * clang -fobjc-arc -I include -I libs/video
++ * libs/video/tests/test_metal_color_region.m libs/video/rsx_texture_layout.c libs/video/rsx_shader_msl.cpp -lc++
++ * -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore
++ * -o /tmp/test_metal_color_region */
++#include "../rsx_metal_backend.m"
++#include <stdio.h>
++
++float cellAvconfExt_display_gamma(void) { return 1.0f; }
++
++static int failures, checks;
++#define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr, "FAIL %s\n", name); } } while (0)
++#define W 8u
++#define H 8u
++#define RW 5u
++#define RH 3u
++
++int main(void)
++{
++    @autoreleasepool {
++        s_dev = MTLCreateSystemDefaultDevice();
++        if (!s_dev) { printf("SKIP: no Metal device\n"); return 0; }
++        s_queue = [s_dev newCommandQueue];
++        s_headless = 1;
++        CHECK(eng_init(NULL, W, H) == 0, "backend initialisation");
++
++        u8 seed[W * H * 4];
++        for (u32 y = 0; y < H; y++)
++            for (u32 x = 0; x < W; x++) {
++                u8* p = seed + (y * W + x) * 4u;
++                p[0] = (u8)(x * 16u); p[1] = (u8)(y * 16u); p[2] = 7u; p[3] = 255u;
++            }
++        const u32 target = eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, W, H, seed, W * 4u);
++        CHECK(target != 0, "seeded target");
++        CHECK(eng_color_region(NULL, target, W + 1u, H) == 0, "a region wider than the target is refused");
++        CHECK(eng_color_region(NULL, target, W, H + 1u) == 0, "a region taller than the target is refused");
++        const u32 region = eng_color_region(NULL, target, RW, RH);
++        CHECK(region != 0 && region != target, "the region is a texture of its own");
++        CHECK([eng_obj(region) width] == RW && [eng_obj(region) height] == RH, "of the region's size");
++        s_eng_dropped = 0;
++        eng_submit_and_wait(NULL, 0);
++        CHECK(s_eng_rec_count == 0 && s_eng_dropped == 0, "the copy was encoded");
++
++        id<MTLBuffer> out = [s_dev newBufferWithLength:RW * RH * 4u options:MTLResourceStorageModeShared];
++        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
++        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++        [blit copyFromTexture:eng_obj(region) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
++                   sourceSize:MTLSizeMake(RW, RH, 1) toBuffer:out destinationOffset:0
++          destinationBytesPerRow:RW * 4u destinationBytesPerImage:RW * RH * 4u];
++        [blit endEncoding];
++        [cb commit];
++        [cb waitUntilCompleted];
++        CHECK(cb.status == MTLCommandBufferStatusCompleted && !cb.error, "readback");
++        const u8* px = (const u8*)[out contents];
++        int same = 1;
++        for (u32 y = 0; y < RH; y++)
++            for (u32 x = 0; x < RW; x++)
++                if (memcmp(px + (y * RW + x) * 4u, seed + (y * W + x) * 4u, 4) != 0) same = 0;
++        CHECK(same, "the region holds the target's top-left pixels");
++        eng_shutdown(NULL);
++    }
++    printf("color_region checks=%d failures=%d\n", checks, failures);
++    return failures ? 1 : 0;
++}
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index f63a2ca..9f57254 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -412,6 +412,6 @@ static void m(u32 method, u32 arg) { rsx_draw_engine_method(method, arg); }
+ 
+-static void engine_up(void)
++static void engine_up_with(const rsx_draw_backend* backend)
+ {
+     memset(&stub, 0, sizeof stub);
+-    rsx_draw_engine_set_backend(&g_stub_backend);
++    rsx_draw_engine_set_backend(backend);
+     if (rsx_draw_engine_init(1280, 720) != 0) {
+@@ -430,2 +430,4 @@ static void engine_up(void)
+ 
++static void engine_up(void) { engine_up_with(&g_stub_backend); }
++
+ static void engine_down(void)
+@@ -558,2 +560,85 @@ static void test_surface_aliasing(void)
+ 
++/* ---- 2a. a smaller descriptor reads the top-left of a target ------------ */
++
++/* Resistance 3 draws its scene at 960x704 and, when frames get slow, at 960x640 into the same target, which the
++ * engine keeps at 704 rows; a texture descriptor of the drawn size reads the top-left of that memory, not the whole
++ * target squeezed into its extent. */
++static struct { int n; u32 surface, w, h, last; } g_region;
++
++static u32 stub_color_region(void* u, u32 surface, u32 w, u32 h)
++{
++    (void)u;
++    g_region.n++;
++    g_region.surface = surface; g_region.w = w; g_region.h = h;
++    g_region.last = stub_handle();
++    return g_region.last;
++}
++
++/* A 256-pixel-wide target at local 0x40000 drawn at 256x256, then at 256x192; the target moves away and texture
++ * unit 0 names it with a w x h descriptor at its pitch. */
++static void region_setup(void)
++{
++    m(M_COLOR_A_PITCH, 1024u);
++    draw_triangle();
++    m(M_SURFACE_CLIP_V, 192u << 16);
++    draw_triangle();
++    m(M_COLOR_A_OFFSET, 0x80000u);
++}
++
++static void sample_target(u32 w, u32 h)
++{
++    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
++    m(M_TEX_UNIT + 0x18, (w << 16) | h);
++    m(0x1840 /* control3: pitch */, 1024u);
++    draw_triangle();
++}
++
++static void test_smaller_descriptor_reads_a_region(void)
++{
++    printf("-- smaller descriptor reads a region\n");
++    rsx_draw_backend be = g_stub_backend;
++    be.color_region = stub_color_region;
++    memset(&g_region, 0, sizeof g_region);
++    engine_up_with(&be);
++    m(M_COLOR_A_PITCH, 1024u);
++    draw_triangle();
++    const u32 target = stub.bound_rt[0];
++    m(M_SURFACE_CLIP_V, 192u << 16);
++    draw_triangle();
++    CHECK(stub.n_color_create == 1 && stub.bound_rt[0] == target,
++          "a smaller clip at the same pitch keeps the target (%d creates)", stub.n_color_create);
++    m(M_COLOR_A_OFFSET, 0x80000u);
++
++    sample_target(256u, 192u);
++    CHECK(g_region.n == 1 && g_region.surface == target && g_region.w == 256u && g_region.h == 192u &&
++          stub.bound_tex[0] == g_region.last,
++          "a 256x192 descriptor reads a 256x192 copy of the target's top-left (%d copies, %ux%u)",
++          g_region.n, g_region.w, g_region.h);
++    const u32 first = g_region.last;
++    sample_target(256u, 192u);
++    CHECK(g_region.n == 1 && stub.bound_tex[0] == first, "the copy is kept while the target is not drawn");
++
++    m(M_COLOR_A_OFFSET, 0x40000u);
++    draw_triangle();
++    m(M_COLOR_A_OFFSET, 0x80000u);
++    sample_target(256u, 192u);
++    CHECK(g_region.n == 2 && stub.alive[first] == 0 && stub.bound_tex[0] == g_region.last,
++          "drawing the target again makes a new copy and releases the old one");
++
++    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 1024u, 4u, 4u);
++    sample_target(256u, 192u);
++    CHECK(g_region.n == 3, "so does a transfer into the target's rows");
++
++    sample_target(256u, 256u);
++    CHECK(g_region.n == 3 && stub.bound_tex[0] == target, "a descriptor of the target's size reads the target");
++    engine_down();
++
++    engine_up();
++    region_setup();
++    const u32 whole = stub.n_color_create == 1 ? stub.last_created_color : 0;
++    sample_target(256u, 192u);
++    CHECK(whole && stub.bound_tex[0] == whole, "a backend without color_region binds the whole target");
++    engine_down();
++}
++
+ /* ---- 2b. the MRT set ----------------------------------------------------- */
+@@ -2220,2 +2305,3 @@ int main(void)
+     test_surface_aliasing();
++    test_smaller_descriptor_reads_a_region();
+     test_mrt_set();

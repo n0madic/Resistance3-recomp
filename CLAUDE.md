@@ -131,13 +131,16 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   Close to a lamp the game switches its map to a swizzled power-of-two Z16 surface (zeta pitch 64), read as swizzled
   DEPTH16 (`gcm-rsx/0016`; before, the lamp's light vanished near it).
   The menu atlases (DXT) share local memory with the level's post-processing targets and the engine's target table
-  outlives the level: a block-compressed unit never reads a target (`gcm-rsx/0017`; before, the menu after leaving a
-  mission was noise on a flat background).
+  outlives the level: a block-compressed unit never reads a target (upstream PR #508, imported; before, the menu
+  after leaving a mission was noise on a flat background).
   An NV3089 copy that lands over a target it does not update (another pitch) makes guest memory the newer copy until
   the target is drawn again (`gcm-rsx/0018`; before, the hurt screen showed a stretched bloom target over black).
   A vertex attribute at frequency 1 with its divider-operation bit set (modulo) is element 0 for every vertex: the
   tracer trails pass their start point and colours that way (`gcm-rsx/0019`; before, trails drew wedges across the
   screen).
+  Under load the game drops its scene from 704 to 640 rows at the same addresses; the engine keeps the 704-row target
+  and a texture descriptor smaller than a target reads a copy of its top-left (`gcm-rsx/0020`; recreating the target
+  instead gave a black frame at the onset of a heavy hit, binding it whole a yellow band at the bottom).
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.

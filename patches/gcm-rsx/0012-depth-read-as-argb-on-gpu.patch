@@ -31,7 +31,7 @@ Upstream: PR #499 (same change, generic wording; drop this patch when the pin ha
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 7934173..30066d5 100644
+index 196148c..c2b7a32 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -121,2 +121,5 @@ typedef struct {
@@ -40,12 +40,12 @@ index 7934173..30066d5 100644
 +    u32 argb_w, argb_h;
 +    u64 argb_serial;
  } eng_zdepth;
-@@ -949,2 +952,4 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -945,2 +948,4 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
 +    if (z->argb) g.be->texture_release(g.be->user, z->argb);
 +    z->argb = 0;
      z->location = location; z->offset = offset;
-@@ -979,2 +984,45 @@ static u32 eng_zdepth_snapshot(u32 slot)
+@@ -975,2 +980,45 @@ static u32 eng_zdepth_snapshot(u32 slot)
  
 +/* PS3RECOMP_ENG_DEPTH_VIA_GUEST=1 (read at engine init): a depth target read
 + * as A8R8G8B8 goes through guest memory even when the backend can convert it
@@ -91,17 +91,17 @@ index 7934173..30066d5 100644
 +}
 +
  /* ---- textures ------------------------------------------------------------ */
-@@ -2297,2 +2345,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2293,2 +2341,4 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              }
 +            const u32 argb = eng_zdepth_argb((u32)zsrc, &t);
 +            if (argb) { textures[u] = argb; continue; }
              if (eng_zdepth_to_guest((u32)zsrc)) {
-@@ -3096,2 +3146,4 @@ int rsx_draw_engine_init(u32 width, u32 height)
-       s_surface_reuse = !(e && *e == '0'); }
+@@ -3090,2 +3140,4 @@ int rsx_draw_engine_init(u32 width, u32 height)
+       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
 +    { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
 +      s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
      g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
-@@ -3134,4 +3186,6 @@ void rsx_draw_engine_shutdown(void)
+@@ -3128,4 +3180,6 @@ void rsx_draw_engine_shutdown(void)
      }
 -    for (u32 i = 0; i < g.n_zdepths; i++)
 +    for (u32 i = 0; i < g.n_zdepths; i++) {
@@ -438,10 +438,10 @@ index 0000000..40df14b
 +    }
 +}
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 24d5d35..b651cef 100644
+index ede81c8..d1bf387 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -1653,2 +1653,97 @@ static void test_depth_read_as_color(void)
+@@ -1628,2 +1628,97 @@ static void test_depth_read_as_color(void)
  
 +/* depth_as_argb: the zeta's bytes made on the GPU, no store to guest memory. */
 +static int g_argb_calls, g_argb_fail;
@@ -539,7 +539,7 @@ index 24d5d35..b651cef 100644
 +}
 +
  static void test_color_read_as_float(void)
-@@ -1896,2 +1991,3 @@ int main(void)
+@@ -1870,2 +1965,3 @@ int main(void)
      test_depth_read_as_color();
 +    test_depth_read_as_argb_on_gpu();
      test_color_read_as_float();
