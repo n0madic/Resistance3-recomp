@@ -111,6 +111,11 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     every other second-layout header in the EBOOT is lifted position-independent (`--pic`, verified wherever it loads).
     Functions a job reaches only through a pointer are invisible to the lifter: `IG_EXTRA_ENTRIES` lists them per module
     (from a census of lookup misses), passed as `--extra-funcs`. Lifting with `--return-entries` hangs the boot.
+    The WWS job modules get theirs from `WWS_JOB_EXTRA_ENTRIES` in `build_module.py`. A census keyed by the resident
+    span an interpreter entry lands in (its load's source EA and the offset in it) is exact. Keyed by the module
+    header below the PC, it misplaces the data-segment modules, which load over each other. After the 2026-10-25
+    census of a long Haven firefight, what still runs interpreted there is `pm_wws`'s stores into its own code, where
+    the SMC microstep hands each one to the interpreter.
 
   `scripts/extract_spu_raw.py` wraps the non-ELF code as ELFs for lifting. `build_module.py` generates
   `spu/igjob_regions.c`, which registers each Insomniac module's span as resident code (buffer modules as verified
@@ -147,6 +152,11 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   `rsx_tiling.c` holds the one tile table and the range copies used by the 2D engines, NV0039, and the draw engine's
   surfaces, textures and fetches. Before that, the job's output showed as bands and the blur never appeared. Only
   the NV3089 and texture paths are reached in the scenes checked.
+  Explosion smoke (rockets, hybrids blowing up) samples 256x256x16 DXT5 volumes in main memory, stored in NVIDIA's
+  VTC order; the pin's 3D path took uncompressed formats only, and the first 64 KB read as a 2D image drew dark
+  squares (`gcm-rsx/0022`).
+  A frame of the Haven fight binds ~1700 distinct textures; the engine's texture cache held 1024 and re-created
+  ~700 a frame (22 ms of the RSX thread's CPU). `host/CMakeLists.txt` sets it to 2048 (`gcm-rsx/0023`).
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.

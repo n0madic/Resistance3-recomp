@@ -40,8 +40,11 @@ add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_
 # Each lifted SPU image takes two entries of the workload registry (spu_workload.c, default 256). The module lifts
 # about 220 images (every Insomniac buffer module among them); past the cap the last ones -- the SPURS task ELFs --
 # were dropped and the boot hung on an event flag that task sets. Each Insomniac module also takes one overlay source
-# (spu_channels.c, default 128, spu-runtime/0009); past that cap a module stays in the interpreter.
-target_compile_definitions(ps3recomp_runtime PRIVATE SPU_WORKLOAD_MAX=1024 SPU_OVL_SRC_MAX=512)
+# (spu_channels.c, default 128, spu-runtime/0009); past that cap a module stays in the interpreter. A frame of the
+# Haven fight binds about 1700 distinct textures; the draw engine's cache holds 1024 by default (gcm-rsx/0023), and
+# past it every frame re-created ~700 of them.
+target_compile_definitions(ps3recomp_runtime PRIVATE SPU_WORKLOAD_MAX=1024 SPU_OVL_SRC_MAX=512
+                           RSX_DRAW_ENGINE_TEXTURE_CACHE=2048)
 
 # ---------------------------------------------------------------------------
 # Generated, game-independent files

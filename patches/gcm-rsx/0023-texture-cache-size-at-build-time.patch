@@ -1,0 +1,84 @@
+rsx draw engine: the texture cache's size (RSX_DRAW_ENGINE_TEXTURE_CACHE) may be defined at build time.
+
+A frame of Resistance 3's Haven street fight binds about 1700 distinct textures (world DXT textures up to 1024x1024
+with nine levels, effect atlases, volumes). The engine's cache holds 1024, so every frame evicted and re-created
+about 700 of the textures it was about to bind again (686 and 721 misses a frame on average in two runs, against
+about 8000 hits): 22 ms of the RSX thread's CPU time a frame went to the texture cache, and the thread, the one the
+fight waits on, spent 68 ms of CPU a frame. The default stays 1024; the port defines 2048 from its own build, like
+SPU_WORKLOAD_MAX. The Metal backend's object table, which holds the textures besides targets, views and per-draw
+copies (a released one until the command buffer that may use it is encoded), is sized from the cache: 2048 + twice
+the cache, 4096 as before at the default.
+
+Measured (scripted boot to the fight, 30 s standing in it, thread CPU time of the present thread per frame, two runs
+each, other processes loading the machine alike): 1024 -> 686/721 misses, 22.5/22.9 ms in the cache, 68.0/68.1 ms
+thread CPU, 1499/1571 frames presented; 2048 -> 1/1 misses, 5.0/3.8 ms, 45.1/41.0 ms, 2250/2641 frames.
+
+tools/test_rsx_immediate_vertices.py builds test_rsx_draw_engine a second time with -DRSX_DRAW_ENGINE_TEXTURE_CACHE=2048
+and -DRSX_TEST_EXPECT_TEXTURE_CACHE=2048: the test asserts the size it was built with, and the eviction test finds the
+boundary at 2048. Without the change that build fails the assertion (1024 == 2048). Passes with clang and gcc.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index 4ec4abd..1ee76a7 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -108,4 +108,9 @@ typedef struct rsx_be_render_state {
+  * least recently used one. Public so the eviction test can be exact about
+- * where the boundary is rather than assuming a number. */
++ * where the boundary is rather than assuming a number. A title whose frame
++ * binds more defines a larger cache at build time
++ * (-DRSX_DRAW_ENGINE_TEXTURE_CACHE=N): past the cap every frame evicts and
++ * re-decodes the textures it is about to bind again. */
++#ifndef RSX_DRAW_ENGINE_TEXTURE_CACHE
+ #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
++#endif
+ 
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index 31ec760..cafdd40 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -2200,3 +2200,6 @@ static void release_surfaces(void)
+ 
+-#define ENG_MAX_OBJECTS  4096
++/* Textures share the table with targets, views and per-draw copies, and a
++ * released one keeps its slot until the command buffer that may use it is
++ * encoded: room for twice the engine's texture cache besides. */
++#define ENG_MAX_OBJECTS  (2048 + 2 * RSX_DRAW_ENGINE_TEXTURE_CACHE)
+ #define ENG_MAX_PIPES    4096
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 4c811e4..2eee4ff 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -709,2 +709,7 @@ static void test_mrt_set(void)
+ 
++#ifdef RSX_TEST_EXPECT_TEXTURE_CACHE
++_Static_assert(RSX_DRAW_ENGINE_TEXTURE_CACHE == RSX_TEST_EXPECT_TEXTURE_CACHE,
++               "the texture cache size given at build time is the one the engine uses");
++#endif
++
+ static void test_texture_cache(void)
+diff --git a/tools/test_rsx_immediate_vertices.py b/tools/test_rsx_immediate_vertices.py
+index 4722489..464259c 100644
+--- a/tools/test_rsx_immediate_vertices.py
++++ b/tools/test_rsx_immediate_vertices.py
+@@ -15,8 +15,12 @@ def main():
+                "rsx_vp_decompiler.c", "rsx_fp_decompiler.c"]
+-    with tempfile.TemporaryDirectory(prefix="rsx-immediate-") as directory:
+-        binary = Path(directory) / "test_rsx_draw_engine"
+-        subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17",
+-                        "-Iinclude", "-Ilibs/video", "-o", str(binary),
+-                        *["libs/video/" + s for s in sources]], cwd=root, check=True)
+-        subprocess.run([str(binary)], cwd=root, check=True)
++    # The second build takes a larger texture cache from the command line, as a
++    # title whose frames bind more textures does; the header must let it (the
++    # test asserts the size it was told to expect).
++    for defines in ([], ["-DRSX_DRAW_ENGINE_TEXTURE_CACHE=2048", "-DRSX_TEST_EXPECT_TEXTURE_CACHE=2048"]):
++        with tempfile.TemporaryDirectory(prefix="rsx-immediate-") as directory:
++            binary = Path(directory) / "test_rsx_draw_engine"
++            subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", *defines,
++                            "-Iinclude", "-Ilibs/video", "-o", str(binary),
++                            *["libs/video/" + s for s in sources]], cwd=root, check=True)
++            subprocess.run([str(binary)], cwd=root, check=True)
+ 
