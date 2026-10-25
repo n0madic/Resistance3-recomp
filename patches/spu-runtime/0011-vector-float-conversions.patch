@@ -1,0 +1,206 @@
+SPU: cflts/cfltu/csflt/cuflt four lanes at a time with NEON.
+
+In a Resistance 3 firefight the SPU float conversions took ~10% of the SPU threads' time (`sample`: spu_cflts,
+spu_cuflt, spu_cfltu next to the lifted code). The per-lane forms were too big to inline into the lifted
+functions, so every conversion was a call with the vector passed through general registers (131 out-of-line
+copies in the module). On NEON they are now inline vector code: cflts/cfltu scale in single precision and
+convert truncating and saturating; csflt/cuflt convert in double and truncate with the fast path's
+spu__nv_trunc0, and only a lane outside the single range (a scale the ISA leaves undefined) is redone one by
+one. The per-lane forms stay as the reference (spu__cflts_s, ...) and on other hosts.
+
+Test: tools/test_spu_convert_vector.py (runtime/spu/tests/test_spu_convert_vector.c: every i8 on boundary and
+pseudo-random words; `full` runs all 2^32 words at i8 173/155: 25.8G lanes agree). Micro-benchmark, a
+float->int->float pair: throughput 4.5 -> 2.3 ns, latency 9.3 -> 9.4 ns against the called per-lane forms.
+In the game (`sample`, 25 s of the Haven firefight, 2 runs each) the conversions' share of the SPU threads went
+from 7-9% to none and the lifted code's rose by the same amount: no gain shows at that resolution.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 3f7d733..c50f318 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1001,8 +1001,71 @@ static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
+ }
+-static inline u128 spu_cflts(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
+-static inline u128 spu_cfltu(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
+-static inline u128 spu_csflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
+-    r._u32[i] = v ? spu__sf_pack(v < 0 ? 0x80000000u : 0, v < 0 ? 0u - (uint32_t)v : (uint32_t)v, -(155 - (i8 & 0xFF))) : 0; } return r; }
+-static inline u128 spu_cuflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
+-    r._u32[i] = v ? spu__sf_pack(0, v, -(155 - (i8 & 0xFF))) : 0; } return r; }
++static inline uint32_t spu__ifl_lane(uint32_t v, int i8, int is_unsigned) {
++    const int neg = !is_unsigned && (v >> 31);
++    return v ? spu__sf_pack(neg ? 0x80000000u : 0, neg ? 0u - v : v, -(155 - (i8 & 0xFF))) : 0;
++}
++/* Per-lane forms (the reference). */
++static inline u128 spu__cflts_s(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
++static inline u128 spu__cfltu_s(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
++static inline u128 spu__csflt_s(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__ifl_lane(a._u32[i], i8, 0); return r; }
++static inline u128 spu__cuflt_s(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__ifl_lane(a._u32[i], i8, 1); return r; }
++#if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
++/* The conversions four lanes at a time, as two f64x2 halves. The scalar forms were not inlined
++ * (a call per instruction, ~10% of the SPU threads' time in a Resistance 3 firefight). */
++SPU__NV_INLINE float64x2_t spu__nv_pow2(int e) {                 /* 2^e, -1022 <= e <= 1023 */
++    return vreinterpretq_f64_u64(vdupq_n_u64((uint64_t)(1023 + e) << 52));
++}
++/* cflts/cfltu: scale by 2^(173-i8) in single precision (exact: a power of two; an overflow is an
++ * infinity, which saturates like the true value; an underflow is below 1 and truncates to 0
++ * either way), then convert truncating toward zero and saturating. A scale above 127 is applied
++ * in two factors. The SPU reads exponent 0 as zero and exponent 255 as an ordinary binade (at
++ * least 2^128, which saturates): the input clears the first and turns the second into an
++ * infinity, so no lane leaves the vector path. */
++SPU__NV_INLINE float32x4_t spu__nv_cfl_in(uint32x4_t x, int scale) {
++    const uint32x4_t ext = vcgtq_u32(vshlq_n_u32(x, 1), vdupq_n_u32(0xFEFFFFFFu));      /* exponent 255 */
++    x = vbicq_u32(vandq_u32(x, vtstq_u32(x, vdupq_n_u32(0x7F800000u))), vandq_u32(ext, vdupq_n_u32(0x7FFFFFu)));
++    float32x4_t f = vreinterpretq_f32_u32(x);
++    if (scale > 127) { f = vmulq_n_f32(f, 0x1p127f); scale -= 127; }
++    return vmulq_f32(f, vreinterpretq_f32_u32(vdupq_n_u32((uint32_t)(127 + scale) << 23)));   /* 2^scale */
++}
++SPU__NV_INLINE u128 spu_cflts(u128 a, int i8) {
++    return spu__nv_u128(vreinterpretq_u32_s32(vcvtq_s32_f32(spu__nv_cfl_in(vld1q_u32(a._u32), 173 - (i8 & 0xFF)))));
++}
++SPU__NV_INLINE u128 spu_cfltu(u128 a, int i8) {
++    return spu__nv_u128(vcvtq_u32_f32(spu__nv_cfl_in(vld1q_u32(a._u32), 173 - (i8 & 0xFF))));
++}
++/* csflt/cuflt: the integer in double (exact), scaled by 2^(i8-155) (exact), then spu__nv_trunc0.
++ * Only a scale outside 0..127 (undefined by the ISA) can leave the single range; those lanes
++ * are redone one by one. */
++SPU__NV_SLOW uint32x4_t spu__ifl_fix(uint32x4_t r, uint32x4_t ok, uint32x4_t a, int i8, int is_unsigned) {
++    SPU__NV_LANES(r, o); SPU__NV_LANES(ok, m); SPU__NV_LANES(a, x);
++    for (int i = 0; i < 4; i++) if (!m[i]) o[i] = spu__ifl_lane(x[i], i8, is_unsigned);
++    return vld1q_u32(o);
++}
++SPU__NV_INLINE u128 spu__nv_ifl(u128 a, int i8, int is_unsigned) {
++    const uint32x4_t x = vld1q_u32(a._u32);
++    const float64x2_t s = spu__nv_pow2((i8 & 0xFF) - 155);
++    float64x2_t dlo, dhi;
++    if (is_unsigned) {
++        dlo = vcvtq_f64_u64(vmovl_u32(vget_low_u32(x)));
++        dhi = vcvtq_f64_u64(vmovl_high_u32(x));
++    } else {
++        dlo = vcvtq_f64_s64(vmovl_s32(vget_low_s32(vreinterpretq_s32_u32(x))));
++        dhi = vcvtq_f64_s64(vmovl_high_s32(vreinterpretq_s32_u32(x)));
++    }
++    uint32x2_t oklo, okhi, zlo, zhi;
++    const float32x2_t lo = spu__nv_trunc0(vmulq_f64(dlo, s), &oklo, &zlo, NULL);
++    const float32x2_t hi = spu__nv_trunc0(vmulq_f64(dhi, s), &okhi, &zhi, NULL);
++    const uint32x4_t ok = vcombine_u32(oklo, okhi);
++    uint32x4_t r = spu__nv_vec(lo, hi);
++    if (!spu__nv_all4(ok)) r = spu__ifl_fix(r, ok, x, i8, is_unsigned);
++    return spu__nv_u128(r);
++}
++SPU__NV_INLINE u128 spu_csflt(u128 a, int i8) { return spu__nv_ifl(a, i8, 0); }
++SPU__NV_INLINE u128 spu_cuflt(u128 a, int i8) { return spu__nv_ifl(a, i8, 1); }
++#else
++static inline u128 spu_cflts(u128 a, int i8) { return spu__cflts_s(a, i8); }
++static inline u128 spu_cfltu(u128 a, int i8) { return spu__cfltu_s(a, i8); }
++static inline u128 spu_csflt(u128 a, int i8) { return spu__csflt_s(a, i8); }
++static inline u128 spu_cuflt(u128 a, int i8) { return spu__cuflt_s(a, i8); }
++#endif
+ 
+diff --git a/runtime/spu/tests/test_spu_convert_vector.c b/runtime/spu/tests/test_spu_convert_vector.c
+new file mode 100644
+index 0000000..ad7c8e5
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_convert_vector.c
+@@ -0,0 +1,64 @@
++/* The vector cflts/cfltu/csflt/cuflt against the per-lane reference, for every i8 (0..255) on
++ * boundary words and pseudo-random words. `full` instead runs every 32-bit word through the
++ * float-to-integer pair at i8 = 173 (scale 0) and 155 (scale 2^18), and the integer-to-float
++ * pair at i8 = 155. Prints "OK: <n> lanes" or the first mismatches. */
++#include "spu_helpers.h"
++#include <stdio.h>
++#include <string.h>
++
++static unsigned long long lanes;
++static int failed;
++
++static void check(const char* op, u128 got, u128 want, u128 in, int i8) {
++    lanes += 4;
++    for (int i = 0; i < 4; i++)
++        if (got._u32[i] != want._u32[i] && failed++ < 20)
++            printf("FAIL %s i8=%d in=0x%08X got=0x%08X want=0x%08X\n", op, i8, in._u32[i], got._u32[i], want._u32[i]);
++}
++static void check_all(u128 a, int i8) {
++    check("cflts", spu_cflts(a, i8), spu__cflts_s(a, i8), a, i8);
++    check("cfltu", spu_cfltu(a, i8), spu__cfltu_s(a, i8), a, i8);
++    check("csflt", spu_csflt(a, i8), spu__csflt_s(a, i8), a, i8);
++    check("cuflt", spu_cuflt(a, i8), spu__cuflt_s(a, i8), a, i8);
++}
++static uint32_t rng = 0x9E3779B9u;
++static uint32_t next(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
++
++int main(int argc, char** argv) {
++    if (argc > 1 && !strcmp(argv[1], "full")) {
++        for (uint64_t w = 0; w < (1ull << 32); w += 4) {
++            u128 a;
++            for (int i = 0; i < 4; i++) a._u32[i] = (uint32_t)(w + i);
++            check("cflts", spu_cflts(a, 173), spu__cflts_s(a, 173), a, 173);
++            check("cfltu", spu_cfltu(a, 173), spu__cfltu_s(a, 173), a, 173);
++            check("cflts", spu_cflts(a, 155), spu__cflts_s(a, 155), a, 155);
++            check("cfltu", spu_cfltu(a, 155), spu__cfltu_s(a, 155), a, 155);
++            check("csflt", spu_csflt(a, 155), spu__csflt_s(a, 155), a, 155);
++            check("cuflt", spu_cuflt(a, 155), spu__cuflt_s(a, 155), a, 155);
++        }
++    } else {
++        /* sign x {zero, denormal, smallest normal, 1.0, 1.5, around 2^23/2^31/2^32, largest IEEE,
++         * extended range (exponent 255)}, and integers around 0, 2^24, 2^31, 2^32 */
++        static const uint32_t edge[] = {
++            0x00000000, 0x00000001, 0x007FFFFF, 0x00800000, 0x3F000000, 0x3F7FFFFF, 0x3F800000, 0x3FC00000,
++            0x4B000000, 0x4B7FFFFF, 0x4EFFFFFF, 0x4F000000, 0x4F7FFFFF, 0x4F800000, 0x7F7FFFFF, 0x7F800000,
++            0x7F800001, 0x7FC00000, 0x7FFFFFFF, 0x00000002, 0x00FFFFFF, 0x01000000, 0x01000001, 0x0000FFFF};
++        const int n = (int)(sizeof edge / sizeof edge[0]);
++        for (int i8 = 0; i8 < 256; i8++) {
++            for (int s = 0; s < 2; s++)
++                for (int k = 0; k < n; k++) {
++                    u128 a;
++                    for (int i = 0; i < 4; i++) a._u32[i] = edge[(k + i * 7) % n] ^ (s ? 0x80000000u : 0);
++                    check_all(a, i8);
++                }
++            for (int k = 0; k < 20000; k++) {
++                u128 a;
++                for (int i = 0; i < 4; i++) a._u32[i] = next();
++                check_all(a, i8);
++            }
++        }
++    }
++    if (failed) { printf("%d mismatching lanes of %llu\n", failed, lanes); return 1; }
++    printf("OK: %llu lanes\n", lanes);
++    return 0;
++}
+diff --git a/tools/test_spu_convert_vector.py b/tools/test_spu_convert_vector.py
+new file mode 100644
+index 0000000..3bd7bf9
+--- /dev/null
++++ b/tools/test_spu_convert_vector.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""The vector cflts/cfltu/csflt/cuflt (runtime/spu/spu_helpers.h) agree with the per-lane reference
++for every i8 on boundary and pseudo-random words; with the scalar helpers forced, too."""
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main():
++    cc = shutil.which(os.environ.get("CC", "clang"))
++    assert cc, "C compiler required"
++    with tempfile.TemporaryDirectory() as tmp:
++        for defs in ([], ["-DSPU_SCALAR_HELPERS"]):
++            exe = Path(tmp) / "convert"
++            subprocess.run([cc, "-std=gnu17", "-O2", "-fwrapv", *defs, "-I", str(ROOT / "include"),
++                            "-I", str(ROOT / "runtime/spu"), "-I", str(ROOT / "runtime/platform"),
++                            str(ROOT / "runtime/spu/tests/test_spu_convert_vector.c"), "-o", str(exe)],
++                           check=True, capture_output=True, text=True)
++            p = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
++            assert p.returncode == 0 and p.stdout.startswith("OK:"), (defs, p.stdout, p.stderr)
++    print("PASS: vector float conversions match the per-lane reference")
++
++
++if __name__ == "__main__":
++    main()
