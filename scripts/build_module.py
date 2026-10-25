@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -28,6 +29,8 @@ CODE_END = 0xC9DA84
 CHUNK_LINES = 150000
 SPU_REGISTER_FN = "r3_spu_register_all"
 IG_REGIONS_C = "igjob_regions.c"
+# LS addresses the WWS job modules' lift gets as extra function entries (see lift()).
+WWS_JOB_EXTRA_ENTRIES = (0x5318,)
 
 # The lift reaches the host's trampoline state through exported accessors (toolkit patch 0010).
 MODULE_DEFS = ("-DPPU_MODULE_ACCESSORS", "-DSPU_MODULE_ACCESSORS")
@@ -40,9 +43,9 @@ class BuildError(RuntimeError):
     pass
 
 
-def run(cmd: list[str | Path], log_file: Path | None = None) -> None:
+def run(cmd: list[str | Path], log_file: Path | None = None, env: dict[str, str] | None = None) -> None:
     LOG.debug("%s", " ".join(map(str, cmd)))
-    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, env=env)
     if log_file:
         log_file.write_text(r.stdout + r.stderr)
     if r.returncode:
@@ -50,10 +53,11 @@ def run(cmd: list[str | Path], log_file: Path | None = None) -> None:
                          f"{(r.stdout + r.stderr)[-3000:]}")
 
 
-def tool(python: Path, script: Path, *args: str | Path, log_file: Path | None = None) -> None:
+def tool(python: Path, script: Path, *args: str | Path, log_file: Path | None = None,
+         env: dict[str, str] | None = None) -> None:
     # -E -s rather than -I: the toolkit's tools import their siblings (spu_elf), which needs the script's own directory
     # on sys.path. The game's files are arguments, never a directory Python searches.
-    run([python, "-E", "-s", script, *args], log_file)
+    run([python, "-E", "-s", script, *args], log_file, env)
 
 
 def lift(sdk: Path, elf: Path, work: Path, python: Path) -> tuple[Path, Path]:
@@ -82,8 +86,16 @@ def lift(sdk: Path, elf: Path, work: Path, python: Path) -> tuple[Path, Path]:
     ig_manifest = spu / "igjob_manifest.json"
     tool(python, ROOT / "scripts" / "extract_spu_raw.py", elf, "--tools", tools, "--images", spu / "images",
          "--jobmods", jobmods, "--ig-manifest", ig_manifest, log_file=work / "spu_extract_raw.log")
+    # Entries the WWS job lift cannot see. lift_jobmods.py takes them from its environment and offers each to every
+    # module whose code spans the address: 0x5318 is reached by an indirect branch into the middle of 0x5288 in
+    # jobmod_8f987d5458b2 (0xE9F800), ~20M interpreted steps in 100 s of a firefight in Haven, but it also starts a
+    # function in the other two modules (a loop of jobmod_b23cc96ca61e now branches between two lifted functions).
+    # TODO: entries per module (by its content hash) once lift_jobmods.py takes them.
+    extra = [*filter(None, os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",")),
+             *(hex(a) for a in WWS_JOB_EXTRA_ENTRIES)]
     tool(python, tools / "lift_jobmods.py", "--jobmods", jobmods, "--out", spu,
-         "--register", spu / "jobmods_register.c", "--symbol-prefix", "r3", log_file=work / "jobmods_lift.log")
+         "--register", spu / "jobmods_register.c", "--symbol-prefix", "r3", log_file=work / "jobmods_lift.log",
+         env={**os.environ, "LBP_JOBMOD_EXTRA_FUNCS": ",".join(extra)})
     modules = json.loads(ig_manifest.read_text())
     pic = [arg for m in modules if m.get("pic") for arg in ("--pic", m["name"])]
     extra = [arg for m in modules if m.get("extra_funcs")

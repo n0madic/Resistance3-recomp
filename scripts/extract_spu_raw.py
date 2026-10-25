@@ -60,11 +60,13 @@ IG_MODULE_LSA = 0x100
 # header below the PC: 0xDFF880 to 0xE03580, which igjob_00E06E80 loads at 0x2D00 while the player aims (0xE03580
 # alone ran ~45M interpreted steps/s, 4-6 fps), and 0xDB5680, 0xE66A80, 0xE6DC00 and 0xE7A280. 0xE45480 went to seven
 # addresses there, 0xDACF80 to eight; 0xE42480 to 0x6D80 as well as 0x6E80, so it is not listed here (see below).
+# 0xE37700 goes to 0x6800 as well as 0x6780 in a long firefight (a third census, 2026-10-25): the copy at 0x6800 ran
+# ~12M interpreted steps in 100 s, so it is not listed either.
 # TODO: take a census on the later levels; a module missing here runs in the interpreter, as before.
 IG_BUFFER_MODULES = (
     (0xDB5680, 0x11860), (0xDB7080, 0x0DF00), (0xDFF880, 0x02D00), (0xE00B00, 0x02D00), (0xE01980, 0x02D00),
     (0xE01F80, 0x02D00), (0xE02D00, 0x02D00), (0xE03580, 0x02D00),
-    (0xE35F00, 0x06600), (0xE37700, 0x06780),
+    (0xE35F00, 0x06600),
     (0xE62280, 0x20680), (0xE62780, 0x20680), (0xE63480, 0x20680), (0xE64080, 0x20680), (0xE65280, 0x20680),
     (0xE66080, 0x20680), (0xE66A80, 0x20680), (0xE69280, 0x21F00), (0xE6A980, 0x21F00), (0xE6C180, 0x21F00),
     (0xE6DC00, 0x21F00), (0xE74980, 0x21600),
@@ -98,11 +100,19 @@ IG_DISPATCHER = (0xE28A00, 0x3F580, 0x510)
 # Entries the lifter cannot see (functions the jobs reach through a pointer), by module guest address, at the link
 # address of its lift: the misses of the lookup inside resident modules while aiming in the Haven street fight
 # (igdat_00FF9400's 0x2C8 alone took ~3.5M interpreted lookups in 30 s).
+# A third census (a long firefight in the same fight, the interpreter's entries by the resident span they land in)
+# added the rest below: ~33M interpreted steps in 100 s between them, 0xD9F800's six alone 16M. The data-segment
+# modules load over each other at 0x10A00..0x12300, so their misses showed inside another module's span until a
+# census by the span each copy was loaded to placed them (another ~8M).
 # TODO: take this census on the later levels too.
 IG_EXTRA_ENTRIES = {
-    0xD9F800: (0x17B0,),
-    0xFF7180: (0x3B8, 0x3C0),
-    0xFF9400: (0x2C8, 0x3B8, 0x4C0, 0x4C8),
+    0xD7A480: (0xBF98, 0xF850, 0xFBB4),
+    0xD9F800: (0x1758, 0x1788, 0x17B0, 0x548C, 0x54A8, 0x5574, 0x5590),
+    0xE03580: (0x2F54, 0x308C, 0x3150, 0x31D8),
+    0xFF5180: (0x2D0, 0x4C0, 0x5D4, 0x5F8, 0x628, 0x6A0),
+    0xFF7180: (0x3B8, 0x3C0, 0x410, 0x468, 0x5CC, 0x650, 0x868, 0x8C8),
+    0xFF9400: (0x2C8, 0x3B8, 0x4C0, 0x4C8, 0x5E0, 0x62C),
+    0xFFB200: (0x2D4, 0x2F8, 0x3A4, 0x590, 0x5C0),
 }
 
 
@@ -309,9 +319,18 @@ def main() -> int:
         manifest.append({"name": name, "ea": ea, "span": size, "load_lsa": IG_PIC_LINK_LSA, "bytes": f"{name}.bin",
                          "pic": True, "code_offset": IG_DATA_MODULE_CODE})
         LOG.info("ig data-segment module %s: %d bytes, entry %#x", name, size, entry)
-    for module in manifest:
-        if module["ea"] in IG_EXTRA_ENTRIES:
-            module["extra_funcs"] = [hex(a) for a in IG_EXTRA_ENTRIES[module["ea"]]]
+    by_ea = {module["ea"]: module for module in manifest}
+    for ea, entries in IG_EXTRA_ENTRIES.items():
+        # A key or an address off its module would lose the entries without a word.
+        module = by_ea.get(ea)
+        if module is None:
+            raise ValueError(f"IG_EXTRA_ENTRIES: no Insomniac module at {ea:#x}")
+        link = module.get("load_lsa", IG_MODULE_LSA)
+        off = [a for a in entries if not link <= a < link + module["span"]]
+        if off:
+            raise ValueError(f"IG_EXTRA_ENTRIES: {', '.join(map(hex, off))} outside {module['name']} "
+                             f"[{link:#x}, {link + module['span']:#x})")
+        module["extra_funcs"] = [hex(a) for a in entries]
     args.ig_manifest.write_text(json.dumps(manifest, indent=1) + "\n")
 
     pos = n = 0
