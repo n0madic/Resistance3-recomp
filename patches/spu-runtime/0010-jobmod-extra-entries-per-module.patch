@@ -1,0 +1,135 @@
+lift_jobmods: an extra function entry may name its module (`<sha>:<addr>` in LBP_JOBMOD_EXTRA_FUNCS).
+
+All WWS job modules load at LS 0x4000, so a bare entry is offered to every module whose code spans it. In Resistance 3
+a firefight in Haven reached 0x5318 of jobmod_8f987d5458b2 through an indirect branch (~20M interpreted steps in
+100 s); the same address also cut a function in jobmod_b23cc96ca61e (a loop at 0x52F0 then took two trampolines a
+pass instead of a goto) and jobmod_e8edba4f27ff. The keyed form gives the entry to the module the census found it
+in only; a key that names no module, or an address outside its module, stops the lift with an error.
+
+Test: tools/test_lift_jobmods_extra_funcs.py (two synthetic modules: a bare entry splits both, a keyed one only
+its module; the two errors). After the module rebuild 0x5318 starts a function in jobmod_8f987d5458b2 only.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index 1c07c88..8595896 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -47,4 +47,6 @@ CODE_END = {
+ 
+-# Extra function entries, in LS addresses, applied to every module that
+-# contains them ($LBP_JOBMOD_EXTRA_FUNCS, comma-separated).
++# Extra function entries, in LS addresses ($LBP_JOBMOD_EXTRA_FUNCS,
++# comma-separated). A bare address is offered to every module that contains it;
++# `<sha>:<addr>` (sha = the 12 hex digits in the module's name) only to that
++# module.
+ #
+@@ -56,2 +58,5 @@ CODE_END = {
+ # actually spans the address, so modules that do not contain it are unchanged.
++# Modules that do contain it get a new function there, and in a loop that
++# crosses the address every pass then goes through a trampoline; once a census
++# names the module, the keyed form leaves the others alone.
+ EXTRA_FUNCS = [a.strip() for a in
+@@ -60,2 +65,30 @@ EXTRA_FUNCS = [a.strip() for a in
+ 
++def parse_extra_funcs(items):
++    """[(sha or None, LS address)] from EXTRA_FUNCS-style items."""
++    out = []
++    for item in items:
++        sha, _, addr = item.rpartition(":")
++        out.append((sha.lower() or None, int(addr, 0)))
++    return out
++
++
++def check_extra_funcs(extra, sizes):
++    """Error for a keyed entry whose module is missing or does not span it
++    (sizes: sha -> image size): a typo would otherwise drop it silently."""
++    for sha, addr in extra:
++        if sha is None:
++            continue
++        if sha not in sizes:
++            return f"LBP_JOBMOD_EXTRA_FUNCS: no module {sha} for 0x{addr:X}"
++        if not BASE <= addr < BASE + sizes[sha]:
++            return (f"LBP_JOBMOD_EXTRA_FUNCS: 0x{addr:X} is outside module {sha} "
++                    f"(0x{BASE:X}..0x{BASE + sizes[sha]:X})")
++    return None
++
++
++def extra_funcs_for(extra, sha, size):
++    """The entries offered to module `sha`, of `size` bytes at BASE."""
++    return [hex(a) for s, a in extra if s in (None, sha) and BASE <= a < BASE + size]
++
++
+ def manual_link_targets(raw, base=BASE):
+@@ -151,2 +184,6 @@ def main():
+         sys.exit(f"no jobmod_*.bin in {JOBMODS} -- run extract_jobmods.py first")
++    extra = parse_extra_funcs(EXTRA_FUNCS)
++    err = check_extra_funcs(extra, {os.path.basename(m).split("_")[1]: os.path.getsize(m) for m in mods})
++    if err:
++        sys.exit(err)
+     os.makedirs(OUTDIR, exist_ok=True)
+@@ -177,3 +214,3 @@ def main():
+         # Only offer addresses that fall inside THIS module's image.
+-        inside = [a for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
++        inside = extra_funcs_for(extra, sha, len(raw))
+         # The module's first function starts right after the 0x30-byte header
+diff --git a/tools/test_lift_jobmods_extra_funcs.py b/tools/test_lift_jobmods_extra_funcs.py
+new file mode 100644
+index 0000000..0ab521a
+--- /dev/null
++++ b/tools/test_lift_jobmods_extra_funcs.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""LBP_JOBMOD_EXTRA_FUNCS: a bare address splits every module that spans it, `<sha>:<addr>` only that module."""
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import tempfile
++
++NOP, BI_R0 = 0x40200000, 0x35000000
++SPLIT = 0x4040                          # inside the straight-line code of both modules
++
++
++def module(nops):
++    # 0x30-byte job header with the entry offset at 0x10, then the code: nops and `bi $r0`.
++    header = bytearray(0x30)
++    struct.pack_into(">I", header, 0x10, 0x30)
++    return bytes(header) + struct.pack(f">{nops + 1}I", *([NOP] * nops + [BI_R0]))
++
++
++def lift(root, extra):
++    out = root / "out"
++    r = subprocess.run([sys.executable, str(Path(__file__).with_name("lift_jobmods.py")),
++                        "--jobmods", str(root / "jobmods"), "--out", str(out)],
++                       env={**os.environ, "LBP_JOBMOD_EXTRA_FUNCS": extra},
++                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    split = {sha for sha in ("aaaaaaaaaaaa", "bbbbbbbbbbbb")
++             if r.returncode == 0 and f"spu_func_{SPLIT:08X}" in
++             (out / f"jobmod_{sha}_e0030" / "spu_recomp.c").read_text()}
++    return r, split
++
++
++def main():
++    with tempfile.TemporaryDirectory() as tmp:
++        root = Path(tmp)
++        (root / "jobmods").mkdir()
++        (root / "jobmods" / "jobmod_aaaaaaaaaaaa_e0030.bin").write_bytes(module(8))
++        (root / "jobmods" / "jobmod_bbbbbbbbbbbb_e0030.bin").write_bytes(module(9))
++        for extra, want in (("", set()), (hex(SPLIT), {"aaaaaaaaaaaa", "bbbbbbbbbbbb"}),
++                            (f"bbbbbbbbbbbb:{SPLIT:#x}", {"bbbbbbbbbbbb"}),
++                            (f"AAAAAAAAAAAA:{SPLIT:#x}", {"aaaaaaaaaaaa"})):
++            r, split = lift(root, extra)
++            assert r.returncode == 0, r.stderr
++            assert split == want, (extra, split)
++        for extra, message in (("cccccccccccc:0x4040", "no module cccccccccccc"),
++                               ("aaaaaaaaaaaa:0x5000", "outside module aaaaaaaaaaaa")):
++            r, _ = lift(root, extra)
++            assert r.returncode != 0 and message in r.stderr, (extra, r.returncode, r.stderr)
++    print("PASS: jobmod extra entries, bare and per module")
++
++
++if __name__ == "__main__":
++    main()

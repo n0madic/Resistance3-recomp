@@ -111,7 +111,7 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     every other second-layout header in the EBOOT is lifted position-independent (`--pic`, verified wherever it loads).
     Functions a job reaches only through a pointer are invisible to the lifter: `IG_EXTRA_ENTRIES` lists them per module
     (from a census of lookup misses), passed as `--extra-funcs`. Lifting with `--return-entries` hangs the boot.
-    The WWS job modules get theirs from `WWS_JOB_EXTRA_ENTRIES` in `build_module.py`. A census keyed by the resident
+    The WWS job modules get theirs from `WWS_JOB_EXTRA_ENTRIES` in `build_module.py`, keyed by module (`spu-runtime/0010`): they all load at LS 0x4000, so a bare address would also split every other module that spans it. A census keyed by the resident
     span an interpreter entry lands in (its load's source EA and the offset in it) is exact. Keyed by the module
     header below the PC, it misplaces the data-segment modules, which load over each other. After the 2026-10-25
     census of a long Haven firefight, what still runs interpreted there is `pm_wws`'s stores into its own code, where

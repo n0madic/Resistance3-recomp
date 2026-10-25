@@ -29,8 +29,8 @@ CODE_END = 0xC9DA84
 CHUNK_LINES = 150000
 SPU_REGISTER_FN = "r3_spu_register_all"
 IG_REGIONS_C = "igjob_regions.c"
-# LS addresses the WWS job modules' lift gets as extra function entries (see lift()).
-WWS_JOB_EXTRA_ENTRIES = (0x5318,)
+# Extra function entries for the WWS job modules' lift (see lift()): module (the content hash in its name) -> LS addresses.
+WWS_JOB_EXTRA_ENTRIES = {"8f987d5458b2": (0x5318,)}
 
 # The lift reaches the host's trampoline state through exported accessors (toolkit patch 0010).
 MODULE_DEFS = ("-DPPU_MODULE_ACCESSORS", "-DSPU_MODULE_ACCESSORS")
@@ -86,13 +86,12 @@ def lift(sdk: Path, elf: Path, work: Path, python: Path) -> tuple[Path, Path]:
     ig_manifest = spu / "igjob_manifest.json"
     tool(python, ROOT / "scripts" / "extract_spu_raw.py", elf, "--tools", tools, "--images", spu / "images",
          "--jobmods", jobmods, "--ig-manifest", ig_manifest, log_file=work / "spu_extract_raw.log")
-    # Entries the WWS job lift cannot see. lift_jobmods.py takes them from its environment and offers each to every
-    # module whose code spans the address: 0x5318 is reached by an indirect branch into the middle of 0x5288 in
-    # jobmod_8f987d5458b2 (0xE9F800), ~20M interpreted steps in 100 s of a firefight in Haven, but it also starts a
-    # function in the other two modules (a loop of jobmod_b23cc96ca61e now branches between two lifted functions).
-    # TODO: entries per module (by its content hash) once lift_jobmods.py takes them.
+    # Entries the WWS job lift cannot see. lift_jobmods.py takes them from its environment, keyed by module
+    # (spu-runtime/0010): a bare address would also start a function in every other module whose code spans it.
+    # 0x5318 is reached by an indirect branch into the middle of 0x5288 in jobmod_8f987d5458b2 (0xE9F800), ~20M
+    # interpreted steps in 100 s of a firefight in Haven.
     extra = [*filter(None, os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",")),
-             *(hex(a) for a in WWS_JOB_EXTRA_ENTRIES)]
+             *(f"{sha}:{a:#x}" for sha, addrs in WWS_JOB_EXTRA_ENTRIES.items() for a in addrs)]
     tool(python, tools / "lift_jobmods.py", "--jobmods", jobmods, "--out", spu,
          "--register", spu / "jobmods_register.c", "--symbol-prefix", "r3", log_file=work / "jobmods_lift.log",
          env={**os.environ, "LBP_JOBMOD_EXTRA_FUNCS": ",".join(extra)})
