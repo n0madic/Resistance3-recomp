@@ -1,0 +1,120 @@
+SPU: the runtime's non-local exits leave the signal mask alone (a setjmp + longjmp pair 380 -> 7.5 ns on Darwin).
+
+The SPU runtime leaves lifted code with longjmp: spu_halt and the guest stack reset to spu_run_with_halt, an
+interrupt return to the drain loop that took the interrupt (spu_drain_call's irq frame), and every run and every
+interrupt taken arms a setjmp. Darwin's setjmp and longjmp save and restore the signal mask, a sigprocmask system
+call each; in a Resistance 3 firefight that was 0.8-1.3% of the SPU threads' time (`sample`, 25 s, 3 runs:
+sigprocmask 85-128 samples of ~10.2k, under longjmp from spu_indirect_branch's interrupt return and
+spu_drain_call, and setjmp under the policy module's runs). None of these jumps leaves a signal handler (the
+fault handlers in ppu_loader.cpp resume or fall through), so the mask they would restore is the one already in
+place. spu_channels.c and spu_drain.c now use _setjmp/_longjmp (setjmp/longjmp on Windows), through a macro
+defined in each: a shared header would change the module ABI.
+
+Test: runtime/spu/tests/test_spu_lifted_start.c, test_halt_leaves_signal_mask: lifted code blocks a signal and
+halts; the mask stays as it left it (with setjmp/longjmp the check fails; 192 checks).
+Micro-benchmark (setjmp + longjmp out of a called function, best of 9): 380 -> 7.5 ns.
+In the game (`sample`, 25 s of the Haven firefight, 3 runs each, same module): sigprocmask 85-128 -> 0 samples.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 096d88f..a977a8a 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -25,2 +25,12 @@
+ #include <setjmp.h>
++/* The SPU runtime's non-local exits (halt, stack reset, interrupt return) never leave a signal
++ * handler, so they need not save and restore the signal mask. Darwin's setjmp/longjmp do, with a
++ * sigprocmask system call each: ~1.5% of the SPU threads' time in a Resistance 3 firefight. */
++#if defined(_WIN32)
++#  define SPU_SETJMP(env)        setjmp(env)
++#  define SPU_LONGJMP(env, val)  longjmp(env, val)
++#else
++#  define SPU_SETJMP(env)        _setjmp(env)
++#  define SPU_LONGJMP(env, val)  _longjmp(env, val)
++#endif
+ #ifndef _WIN32
+@@ -120,3 +130,3 @@ void spu_restart_dispatch(spu_context* ctx)
+     g_spu_trampoline_fn = 0;
+-    if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
++    if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
+     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
+@@ -158,3 +168,3 @@ void spu_halt(spu_context* ctx)
+       } }
+-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
++    if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
+ }
+@@ -245,3 +255,3 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+     yz_lockstep_register(ctx);
+-    switch (setjmp(s_spu_halt_env)) {
++    switch (SPU_SETJMP(s_spu_halt_env)) {
+     case 1:
+@@ -1836,3 +1846,3 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+             g_spu_trampoline_fn = 0;
+-            longjmp(s_spu_halt_env, 2);
++            SPU_LONGJMP(s_spu_halt_env, 2);
+         }
+@@ -2638,3 +2648,3 @@ __attribute__((noinline)) static void spu_indirect_branch_full(spu_context* ctx)
+             g_spu_trampoline_fn = 0;
+-            longjmp(s_spu_halt_env, 2);
++            SPU_LONGJMP(s_spu_halt_env, 2);
+         }
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index cecaa9c..00620ab 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -9,2 +9,10 @@
+ #include <setjmp.h>
++/* Jumps that leave the signal mask alone, as in spu_channels.c (a header would change the module ABI). */
++#if defined(_WIN32)
++#  define SPU_SETJMP(env)        setjmp(env)
++#  define SPU_LONGJMP(env, val)  longjmp(env, val)
++#else
++#  define SPU_SETJMP(env)        _setjmp(env)
++#  define SPU_LONGJMP(env, val)  _longjmp(env, val)
++#endif
+ 
+@@ -285,3 +293,3 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
+                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
+-                    longjmp(f->env, 1);
++                    SPU_LONGJMP(f->env, 1);
+                 }
+@@ -462,3 +470,3 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+                     }
+-                    if (setjmp(f.env) == 0) {
++                    if (SPU_SETJMP(f.env) == 0) {
+                         vf(ctx);
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index f0219fc..83ce467 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -1305,2 +1305,24 @@ static void test_indirect_fast_path_guards(void)
+ 
++/* The halt's jump out of lifted code leaves the signal mask as the code left it: saving and
++ * restoring it cost a sigprocmask system call per jump on Darwin (spu_channels.c, SPU_SETJMP). */
++static void sm_block_and_halt(spu_context* ctx)
++{
++    sigset_t s; sigemptyset(&s); sigaddset(&s, SIGUSR2);
++    pthread_sigmask(SIG_BLOCK, &s, NULL);
++    spu_halt(ctx);
++}
++static void test_halt_leaves_signal_mask(void)
++{
++    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
++    if (!ctx) { check(0, "allocate signal mask context"); return; }
++    spu_context_init(ctx, 0);
++    sigset_t before, after, s;
++    sigemptyset(&s); sigaddset(&s, SIGUSR2);
++    pthread_sigmask(SIG_UNBLOCK, &s, &before);
++    check(spu_run_with_halt(sm_block_and_halt, ctx) == 1, "signal mask: the run halted");
++    pthread_sigmask(SIG_SETMASK, &before, &after);
++    check(sigismember(&after, SIGUSR2) == 1, "signal mask: the halt does not restore it");
++    free(ctx);
++}
++
+ int main(void)
+@@ -1330,2 +1352,3 @@ int main(void)
+     test_nonzero_link_return();
++    test_halt_leaves_signal_mask();
+ 
