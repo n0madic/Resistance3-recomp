@@ -1,0 +1,238 @@
+SPU: an indirect branch to a lifted function skips the resolver's special cases; the step check is inlined (12 -> 5.4 ns per indirect step, 3.9 -> 2.8 ns per direct step).
+
+Lifted SPU code reaches every computed target (bi, a return through a register) through spu_indirect_branch, and
+every trampoline step through the drain loop's spu_task_launch_check. In a Resistance 3 firefight these and their
+helpers took ~10.5% of the SPU threads' time (`sample`, 25 s, 3 runs: spu_drain_call ~385, spu_task_launch_check
+~260, spu_check_stack_reset ~150, spu_indirect_branch ~170, spu_lifted_lookup ~60, _tlv_get_addr ~120 of ~10.9k).
+The resolver tests a dozen special cases one by one inside a 0x340-byte frame (interrupt return, SPURS kernel
+services, the job-return address, the taskset's task region, diagnostic variables) before and after the lookup,
+and none applies to almost any target; the step check called spu_check_stack_reset, whose table is empty in this
+game, and looked the thread-local ring up again at each step.
+
+- spu_indirect_branch first checks that none of the special cases can apply (no interrupt return pending, not one
+  of their addresses, no task registered above the task region, no diagnostic variable set), takes the dispatch
+  cache's hit inline and tail-calls the target; anything else goes to the unchanged resolver
+  (spu_indirect_branch_full) from the top.
+- The step check's body is inlined into spu_drain_call's loop (spu_task_launch_check stays for SPU_DRAIN), and
+  spu_check_stack_reset is called only when an entry is registered (g_spu_stack_reset_count, was static).
+
+Test: runtime/spu/tests/test_spu_lifted_start.c, test_indirect_fast_path_guards: a lifted function registered at
+each special address (interrupt return, exit-to-kernel, selectWorkload, job return, a task entry, below the task
+region) must not run in its place; each guard left out fails its check, and the existing stack-reset checks fail
+without either count test (190 checks). No header changes: the module ABI is the same.
+Micro-benchmark (a function re-queued through spu_drain_call, directly or through spu_indirect_branch to one of 256
+registered targets): direct 3.8-4.4 -> 2.6-2.9 ns, indirect 11.7-13.2 -> 5.3-5.5 ns per step.
+In the game (`sample`, 25 s of the Haven firefight, 3 runs each, same module): these functions 10.4-10.6% ->
+7.6-8.2% of the SPU threads' time (13.4-13.9% -> 9.6-10.5% of the time in lifted code). What remains of the
+resolver's self time is mostly interrupt returns (the full path, ~60), of the drain loop the indirect calls.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 458b250..096d88f 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1618,2 +1618,13 @@ static void spu_dcache_shadow_stats(void)
+ }
++static inline spu_dcache_ent* spu_dcache_slot(uint32_t lsa, uint32_t id)
++{
++    return &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
++}
++static inline int spu_dcache_hit(const spu_dcache_ent* e, const spu_context* c, uint32_t id, uint32_t lsa,
++                                 uint32_t rgen)
++{
++    return e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
++           e->residency == c->dcache_residency && e->image == c->image_id &&
++           e->ovl == c->resident_ovl && e->task == c->resident_task;
++}
+ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+@@ -1631,6 +1642,4 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+     const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
+-    spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
+-    if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
+-        e->residency == c->dcache_residency && e->image == c->image_id &&
+-        e->ovl == c->resident_ovl && e->task == c->resident_task) {
++    spu_dcache_ent* e = spu_dcache_slot(lsa, id);
++    if (spu_dcache_hit(e, c, id, lsa, rgen)) {
+         if (mode == 2) {
+@@ -1809,8 +1818,8 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+ static struct { uint32_t entry; int image_id; } s_stack_reset[16];
+-static unsigned s_stack_reset_count;
++unsigned g_spu_stack_reset_count;   /* read by the trampoline step (spu_drain.c) before it calls the check */
+ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+ {
+-    if (s_stack_reset_count < 16) {
+-        s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
+-        s_stack_reset[s_stack_reset_count++].image_id = image_id;
++    if (g_spu_stack_reset_count < 16) {
++        s_stack_reset[g_spu_stack_reset_count].entry = entry & SPU_LS_MASK;
++        s_stack_reset[g_spu_stack_reset_count++].image_id = image_id;
+     }
+@@ -1822,6 +1831,4 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+ {
+-    /* The count first: it is a plain global, s_spu_halt_armed a thread-local (a call on Darwin), and this
+-     * runs at every trampoline step. */
+-    if (!s_stack_reset_count || !ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+-    for (unsigned i = 0; i < s_stack_reset_count; ++i)
++    if (!g_spu_stack_reset_count || !ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
++    for (unsigned i = 0; i < g_spu_stack_reset_count; ++i)
+         if (ctx->pc == s_stack_reset[i].entry &&
+@@ -2429,3 +2436,50 @@ static int spu_smc_microstep(spu_context* ctx)
+ 
++static void spu_indirect_branch_full(spu_context* ctx);
++
++/* Every guest indirect branch and every return through a register comes here. Most targets
++ * are a lifted function the dispatch cache knows, and none of the special cases below
++ * applies to them; checking that up front skips the rest of the resolver, whose frame and
++ * one-by-one tests cost about as much as the lookup in a Resistance 3 firefight. Anything
++ * else (an interrupt return pending, a kernel-service or job-return address, a taskset with
++ * registered tasks above its task region, a diagnostic variable set, a target that is not
++ * lifted) takes the full resolver from the top. */
+ void spu_indirect_branch(spu_context* ctx)
++{
++    static int s_diag = -1;
++    if (__builtin_expect(s_diag < 0, 0))
++        s_diag = getenv("SPU_IBCOV") || getenv("SPU_POLLTRACE") || getenv("SPU_JOBTRACE") ||
++                 getenv("LBP_HLE_JOBDONE") || getenv("SPU_JOBEXEC");
++    const uint32_t pc = (ctx->pc &= SPU_LS_MASK);
++    if (!s_diag && !ctx->irq_saved && ctx->image_id != SPU_RESOLVER_ONLY_IMAGE_ID &&
++        pc != SPURS_PM_EXIT_TO_KERNEL_LS && pc != SPURS_PM_SELECT_WORKLOAD_LS &&
++        pc != SPURS_TASKSET_PM_SYSCALL_LS && pc != 0xA00u && pc != SPU_JOB_RETURN_LS &&
++        (pc < SPU_TASKSET_TASK_LO || (!s_task_elf_count && !s_task_entry_count))) {
++        if (pc < SPU_TASKSET_TASK_LO) ctx->resident_task = 0;
++        /* The dispatch cache's hit, inline; anything else asks spu_lifted_lookup. */
++        spu_fn fn = NULL;
++        const uint32_t id = ctx->dcache_id;
++        if (id && spu_dcache_mode() == 1) {
++            const spu_dcache_ent* e = spu_dcache_slot(pc, id);
++            if (spu_dcache_hit(e, ctx, id, pc, __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE)))
++                fn = (spu_fn)e->fn;
++        }
++        if (!fn) fn = spu_lifted_lookup(ctx, pc);
++        if (fn) {
++            if (g_spu_stack_reset_count) spu_check_stack_reset(ctx, fn);
++#if defined(__clang__)
++            __attribute__((musttail)) return fn(ctx);
++#else
++            fn(ctx);
++            return;
++#endif
++        }
++    }
++#if defined(__clang__)
++    __attribute__((musttail)) return spu_indirect_branch_full(ctx);
++#else
++    spu_indirect_branch_full(ctx);
++#endif
++}
++
++__attribute__((noinline)) static void spu_indirect_branch_full(spu_context* ctx)
+ {
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 7fd05fb..cecaa9c 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -61,7 +61,10 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+ static void spu_task_launch_check_env(spu_context* ctx);
+-void spu_task_launch_check(spu_context* ctx, void* fn)
++extern unsigned g_spu_stack_reset_count;
++extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
++/* The body of spu_task_launch_check, inlined into spu_drain_call's loop: a call per step, and
++ * the thread-local ring's address looked up again in each, cost more than what it does. */
++static inline __attribute__((always_inline)) void spu_task_launch_step(spu_context* ctx, void* fn)
+ {
+     t_recent.pc[t_recent.n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+-    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+-    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
++    if (g_spu_stack_reset_count) spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+     /* Every trampoline step comes here. With none of the variables read below
+@@ -80,2 +83,6 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
+ }
++void spu_task_launch_check(spu_context* ctx, void* fn)
++{
++    spu_task_launch_step(ctx, fn);
++}
+ __attribute__((noinline, cold)) static void spu_task_launch_check_env(spu_context* ctx)
+@@ -443,3 +450,3 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       /* off: one load, no call */
+-            spu_task_launch_check(ctx, (void*)fn);
++            spu_task_launch_step(ctx, (void*)fn);
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index 94e3bc1..f0219fc 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -1239,2 +1239,68 @@ static void test_nonzero_link_return(void)
+ 
++/* spu_indirect_branch resolves a lifted target before its special cases only where none of
++ * them applies: each case below has a lifted function registered at its address, which the
++ * shortcut would run instead. Runs before any task ELF or task entry is registered: with
++ * one, every target in the task region takes the full resolver anyway. */
++extern void spu_taskset_register_task_entry(uint32_t entry, int image_id);
++static int s_fp_ran;
++static void fp_primary(spu_context* c) { (void)c; s_fp_ran = 1; }
++static void fp_task(spu_context* c) { (void)c; s_fp_ran = 2; }
++static void test_indirect_fast_path_guards(void)
++{
++    spu_context* c = (spu_context*)calloc(1, sizeof *c);
++    if (!c) { check(0, "allocate fast path context"); return; }
++    spu_context_init(c, 0);
++    spu_begin_image(126);
++    spu_register_function(0x2200, fp_primary); spu_register_function(0x9D0, fp_primary);
++    spu_register_function(0x9C0, fp_primary);
++    spu_register_function(0x3FF00, fp_primary); spu_register_function(0x2100, fp_primary);
++    spu_register_function(0x3E100, fp_primary);
++    spu_begin_image(127); spu_register_function(0x2100, fp_task); spu_register_function(0x3E100, fp_task);
++    spu_begin_image(0);
++    c->image_id = 126;
++
++    s_fp_ran = 0; c->pc = 0x2200;
++    spu_indirect_branch(c);
++    check(s_fp_ran == 1, "fast path: a lifted target runs");
++
++    /* The interrupt return: the saved register file comes back before the target runs. */
++    s_fp_ran = 0; c->pc = 0x2200; c->int_enable = 1;
++    c->irq_saved = 1; c->irq_resume_pc = 0x2200;
++    memcpy(c->irq_gpr, c->gpr, sizeof c->irq_gpr);
++    c->irq_gpr[7]._u32[0] = 42; c->gpr[7]._u32[0] = 1;
++    spu_indirect_branch(c);
++    check(s_fp_ran == 1 && c->gpr[7]._u32[0] == 42 && !c->irq_saved,
++          "fast path: an interrupt return restores the registers first");
++
++    /* A policy module's kernel services: exit to the kernel, then selectWorkload. */
++    s_fp_ran = 0; c->pc = 0x9C0; c->policy_mode = 1; c->status = 0;
++    spu_indirect_branch(c);
++    check(!s_fp_ran && c->status == SPU_STATUS_STOPPED_BY_STOP,
++          "fast path: the policy's exit to the kernel stops it");
++    s_fp_ran = 0; c->pc = 0x9D0;
++    c->gpr[0]._u32[0] = 0x2200; c->gpr[3]._u32[0] = 7;
++    spu_indirect_branch(c);
++    check(!s_fp_ran && c->gpr[3]._u32[0] == 0 && c->pc == 0x2200,
++          "fast path: the policy kernel service is not dispatched as code");
++    c->policy_mode = 0;
++
++    /* A job returning through the link the manager planted. */
++    s_fp_ran = 0; c->pc = 0x3FF00; c->status = 0;
++    spu_indirect_branch(c);
++    check(!s_fp_ran, "fast path: the job-return address ends the job");
++
++    /* Below the task region the resident task is dropped. */
++    s_fp_ran = 0; c->pc = 0x2100; c->resident_task = 127;
++    spu_indirect_branch(c);
++    check(s_fp_ran == 1 && c->resident_task == 0, "fast path: below the task region the task is not resident");
++
++    /* Above it, a registered task entry makes its task resident. */
++    spu_taskset_register_task_entry(0x3E100, 127);
++    s_fp_ran = 0; c->pc = 0x3E100;
++    spu_indirect_branch(c);
++    check(s_fp_ran == 2 && c->resident_task == 127, "fast path: a task entry selects its task");
++    g_spu_trampoline_fn = 0;
++    free(c);
++}
++
+ int main(void)
+@@ -1256,2 +1322,3 @@ int main(void)
+     test_dispatch_cache();
++    test_indirect_fast_path_guards();
+     test_lle_taskset_syscall();
