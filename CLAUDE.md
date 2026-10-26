@@ -148,7 +148,8 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   instead gave a black frame at the onset of a heavy hit, binding it whole a yellow band at the bottom).
   Tile 4 is bound over main memory (IO 0x30000, pitch 8192, bank 2). While aiming, NV3089 downsamples the scene into
   it for an SPU depth-of-field job that reads and writes the tiled layout. Every RSX access to a main-memory tile
-  goes through the tiling (`gcm-rsx/0021`). The address math is `rsx_tiling.h`, a port of RPCS3's `tiled_dma_copy`.
+  goes through the tiling (`gcm-rsx/0021`). The address math is `rsx_tiling.h`, from envytools'
+  `tile_translate_addr` (MIT; upstream will not take GPL ports such as RPCS3's).
   `rsx_tiling.c` holds the one tile table and the range copies used by the 2D engines, NV0039, and the draw engine's
   surfaces, textures and fetches. Before that, the job's output showed as bands and the blur never appeared. Only
   the NV3089 and texture paths are reached in the scenes checked.

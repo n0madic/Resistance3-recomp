@@ -9,10 +9,12 @@ rectangle, tiled, covers exactly those linear rows) and showed as horizontal ban
 appeared at all.
 
 A tile is an address translation in the RSX's memory interface, so every RSX client sees the region through it
-(envytools' NV40 VRAM notes); RPCS3 tiles NV3089 destinations and texture reads only. This does it for all of them
+(envytools' model of the NV40-family tiling); RPCS3 tiles NV3089 destinations and texture reads only. This does it for all of them
 through one layer:
 
-- rsx_tiling.h: the tiled address of a byte, a port of RPCS3's rsx::tiled_dma_copy (link and commit in the file).
+- rsx_tiling.h: the tiled address of a byte, from envytools' tile_translate_addr (nvhw/tile.c, MIT; pinned link
+  and its notice in the file) with the RSX's memory configuration. Four in-block bits and the anchoring of the
+  block grid are the RSX's own (the layout the game's SPU job reads and writes); the pitches are envytools'.
 - rsx_tiling.c (new): the one table of bound main-memory tiles (rsx_tiling_set; a lock for writers and readers, a
   bit mask so a client pays one load while none is bound), range copies (rsx_tiled_read / rsx_tiled_write: a range
   may start before a tile, cross several and end past them; guest memory reached an IO page at a time, so IO pages
@@ -27,8 +29,9 @@ through one layer:
   (the fetch plan keeps pointers for the whole draw); texture change hashes cover the footprint.
 - Not covered: rsx_live_draw.c (its guest reader comes from its caller), reports and semaphores in a tile.
 
-test_rsx_tiling (tools/test_rsx_tiling.py; now built with rsx_tiling.c): addresses for four pitch classes against a
-separate port of the RPCS3 function, the tiling permutes the tile's 32-byte blocks, a row round-trips, a range
+test_rsx_tiling (tools/test_rsx_tiling.py; now built with rsx_tiling.c): addresses for four pitch classes computed by
+envytools' tile_translate_addr, built unmodified with that configuration (the four RSX bits set as rsx_tiling.h
+says), the tiling permutes the tile's 32-byte blocks, a row round-trips, a range
 across two tiles, scattered IO pages, an unbacked page (zero-filled, reported), a local tile, unbinding, and every
 byte of several ranges inside their footprint. test_rsx_draw_engine: targets, textures, an indexed draw's indices
 and vertices and a fragment program in a tiled region go through the tiling. test_nv3089_engine_read: NV3089 into
@@ -42,12 +45,17 @@ bound (1 ns otherwise); the game keeps tile 4 bound and makes ~400k such lookups
 0.2 ms of the render thread a frame. A/B aiming runs (3 each, against the NV3089-and-engine-only version) gave
 medians of 19.9 and 19.4 fps, within the noise of that machine.
 
+The address math was written from envytools alone after the licence review of PR #569 (an earlier version ported
+it from a GPL source). It gives the earlier version's address for every 32-byte block of tile 4 and for 1.3M
+sampled addresses over every valid pitch, banks 0-3 and five tile offsets; a pitch outside cellGcmSetTile's list
+now has no tiled address.
+
 Upstream: PR #569 (on master: without the NV0039 part, as master has no NV0039 yet (gcm-rsx/0004), and with
 the fetch tests standing alone; when the pin has it, keep only the NV0039 lines here).
 ---
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 5f9dd5c..7a65cc3 100644
+index 5f9dd5c..a27e672 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -12,2 +12,3 @@
@@ -221,7 +229,7 @@ index 5f9dd5c..7a65cc3 100644
 @@ -3578,3 +3706,5 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
      s_tiles[index].bank   = bank;
 -    s_tiles[index].bound  = 0;
-+    /* SetTile binds too (RPCS3 cellGcmSys.cpp: tile.bound = pitch > 0); a
++    /* SetTile binds too (as it does on RPCS3), so a
 +     * title that never calls BindTile still has its tiles in force. */
 +    s_tiles[index].bound  = pitch > 0;
  
@@ -613,10 +621,10 @@ index 0000000..686c3ab
 +}
 diff --git a/libs/video/rsx_tiling.h b/libs/video/rsx_tiling.h
 new file mode 100644
-index 0000000..31e4ae8
+index 0000000..0dd81e9
 --- /dev/null
 +++ b/libs/video/rsx_tiling.h
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,160 @@
 +/*
 + * RSX tiled main memory.
 + *
@@ -631,15 +639,19 @@ index 0000000..31e4ae8
 + * and writes the tiled layout, and sampled linearly its output showed as
 + * bands (rows 0-15 of every 64).
 + *
-+ * The address math is a port of RPCS3's rsx::tiled_dma_copy
-+ * (https://github.com/RPCS3/rpcs3/blob/06ae1af55161e8a9e8ad77395a97455d493b5cb3/rpcs3/Emu/RSX/Common/tiled_dma_copy.hpp),
-+ * itself from envytools' NV40 VRAM notes
-+ * (https://envytools.readthedocs.io/en/latest/hw/memory/vram.html).
-+ * RPCS3 takes the tile's effective address as the base; the location offset
-+ * used here differs from it only above bit 19 (IO pages are 1 MB), and those
-+ * bits cancel in the result. RPCS3 goes through the tiling for NV3089
-+ * destinations and texture reads only; the tile table and the range copies
-+ * below (rsx_tiling.c) let every client do it.
++ * The address math is envytools' model of the NV40-family tiling,
++ * tile_translate_addr() in nvhw/tile.c
++ * (https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/nvhw/tile.c),
++ * PFB_NV41 path, with the RSX's memory configuration: G7x, VRAM mode,
++ * mcbits 3, partbits 1, colbits_lo 10 (blocks of 256 bytes x 64 rows, 16 KB),
++ * partshift 7, the tile's bank as bankoff. Four in-block bits differ from that
++ * model on the RSX: bit 4 carries over, and bits 7, 9 and 10 are the hashes
++ * below instead of the NV41 partition bit and its G7x undo. Those bits and
++ * the block grid anchored at the tile's first 16 KB block are the RSX's
++ * layout as Resistance 3's depth-of-field job reads and writes it. The pitches
++ * are envytools' (tile_pitch_valid), the list cellGcmSetTile takes. The tile
++ * table and the range copies below (rsx_tiling.c) let every client go through
++ * it.
 + */
 +#ifndef RSX_TILING_H
 +#define RSX_TILING_H
@@ -662,48 +674,66 @@ index 0000000..31e4ae8
 +
 +/* Where the RSX keeps the byte at linear location offset `lin` of tile `t`:
 + * a location offset, or RSX_TILE_NO_ADDRESS when it falls outside the tile.
-+ * Bits 0-4 carry over, so 32 aligned linear bytes stay together. */
++ * Bits 0-4 carry over, so 32 aligned linear bytes stay together.
++ *
++ * Derived from envytools' tile_translate_addr (see the top of this file):
++ *
++ * Copyright (C) 2012 Marcelina Kościelnicka <mwk@0x04.net>
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE. */
 +static inline u32 rsx_tile_address(const rsx_tile* t, u32 lin)
 +{
-+    static const u32 bank_lut[16] = { 0, 1, 2, 3, 2, 3, 0, 1, 1, 2, 3, 0, 3, 0, 1, 2 };
-+    const u32 base = t->offset;
-+    /* tiles per row: pitch / 256 = prime * factor, prime the odd part */
-+    u32 factor = t->pitch >> 8;
-+    if (t->pitch & (t->pitch - 1u)) {
-+        static const u32 primes[5] = { 3, 5, 7, 11, 13 };
-+        u32 k = 0;
-+        while (k < 5u && factor % primes[k]) k++;
-+        if (k == 5u) return RSX_TILE_NO_ADDRESS;
-+        factor /= primes[k];
++    const u32 pitch = t->pitch;
++    const u32 cols = pitch >> 8;               /* 256-byte columns per row */
++    /* the pitches cellGcmSetTile takes: 512 to 64 KB, factor << (8 + shift) */
++    if ((pitch & 0xffu) || cols < 2u || cols > 0x100u || lin < t->offset) return RSX_TILE_NO_ADDRESS;
++    u32 shift = 0;
++    while (!(cols >> shift & 1u)) shift++;
++    switch (cols >> shift) {
++    case 1: case 3: case 5: case 7: case 13: break;
++    default: return RSX_TILE_NO_ADDRESS;
 +    }
-+    const u32 per_row = t->pitch >> 8;
-+    if (!per_row || lin < base) return RSX_TILE_NO_ADDRESS;
 +
-+    const u32 texel = (lin - base) / 256u;
-+    const u32 tile_x = texel % per_row;
-+    const u32 tile_y = (texel / per_row) / 64u;
-+    const u32 tile_id = tile_y * per_row + tile_x;
-+    const u32 sel = (tile_id + (base >> 14)) & 0x3ffffu;
-+    const u32 row_address = (sel >> 2) & 0xffffu;
++    const u32 a = lin - t->offset;
++    const u32 x = a % pitch, y = a / pitch;
++    const u32 ix = lin & 0xffu, iy = y & 0x3fu; /* byte and row inside the 16 KB block */
++    const u32 bx = x >> 8, by = y >> 6;         /* block column and block row */
++    const u32 base = t->offset >> 14;           /* 16 KB block of the tile's start */
++    const u32 block = base + by * cols + bx;
 +
-+    u32 bank = 0;
-+    if (factor == 1u)      bank = sel & 3u;
-+    else if (factor == 2u) bank = bank_lut[((sel + ((tile_y & 1u) << 1)) & 3u) * 4u + (tile_y & 3u)];
-+    else if (factor >= 4u) bank = bank_lut[(sel & 3u) * 4u + (tile_y & 3u)];
-+    bank = (bank + t->bank) & 3u;
++    /* The bank (block bits 0-1) is swizzled by column unless the pitch is an
++     * odd multiple of 256, then offset by the tile's bank. */
++    const u32 col = base + bx;
++    u32 bank = shift ? ((col >> 1 & 1u) | (col << 1 & 2u)) + by : block;
++    bank += t->bank;
 +
-+    const u32 line = (texel / per_row) % 64u;
-+    u32 column = 0;
-+    column |= ((line >> 3) & 7u) << 7;
-+    column |= ((lin >> 5) & 7u) << 4;
-+    column |= (line & 3u) << 2;
-+    const u32 partition = (((line >> 2) & 1u) + ((lin >> 6) & 1u)) & 1u;
-+
-+    u32 a = (row_address << 16) | (bank << 14) | (((column >> 4) & 0x3fu) << 8) |
-+            (partition << 7) | (((column >> 2) & 3u) << 5) | (lin & 0x1fu);
-+    a ^= (((a >> 12) ^ ((bank ^ sel) & 1u) ^ (a >> 14)) & 1u) << 9;
-+    a ^= ((a >> 11) & 1u) << 10;
-+    return (a - base < t->size) ? a : RSX_TILE_NO_ADDRESS;
++    const u32 in = (ix & 0x1fu)
++        | (iy & 3u) << 5
++        | ((iy >> 2 ^ ix >> 6) & 1u) << 7
++        | (ix >> 5 & 1u) << 8
++        | ((ix >> 6 ^ iy >> 4 ^ block) & 1u) << 9
++        | ((ix >> 7 ^ iy >> 3) & 1u) << 10
++        | (iy >> 3) << 11;
++    const u32 r = in | ((block & ~3u) | (bank & 3u)) << 14;
++    return (r - t->offset < t->size) ? r : RSX_TILE_NO_ADDRESS;
 +}
 +
 +/* ---- the bound tiles (rsx_tiling.c) ----------------------------------------
@@ -1160,14 +1190,15 @@ index 9f57254..ad117ba 100644
      test_transfer_supersedes_other_targets();
 diff --git a/libs/video/tests/test_rsx_tiling.c b/libs/video/tests/test_rsx_tiling.c
 new file mode 100644
-index 0000000..ef2ac05
+index 0000000..56d7e96
 --- /dev/null
 +++ b/libs/video/tests/test_rsx_tiling.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,207 @@
 +/* rsx_tiling.h / rsx_tiling.c: where the RSX keeps a byte of a tiled main-memory region, and the range copies
 + * every RSX client goes through.
 + *
-+ * The vectors come from a separate (Python) port of RPCS3's rsx::tiled_dma_copy, one per pitch class the function
++ * The vectors come from envytools' tile_translate_addr (nvhw/tile.c) itself, built unmodified with the RSX's memory
++ * configuration, with the four in-block bits rsx_tiling.h names set the RSX's way; one per pitch class the function
 + * distinguishes: a power of two (factor 32, 8 and 2) and a prime multiple (5120 = 5 x 4 x 256). The first is
 + * Resistance 3's tile 4 (main 0x30000, 0x580000 bytes, pitch 8192, bank 2). Then, for that tile: every 32-byte block
 + * lands on a distinct block inside the tile. Then the range copies: a row into the tiling and back, a range that
@@ -1242,7 +1273,7 @@ index 0000000..ef2ac05
 +          rsx_tile_address(&tile4, at) != at, "a row written through the tiling reads back the same, at its tiled address");
 +
 +    /* a range from before a tile through it and a second tile right after it, to past both; each tile whole
-+     * 64-row bands (a partial band's tiled addresses run past the tile, and those bytes are skipped, as RPCS3 does) */
++     * 64-row bands (a partial band's tiled addresses run past the tile, and those bytes are skipped) */
 +    const rsx_tile a = { 0x600000u, 0x10000u, 512u, 3u }, b = { 0x610000u, 0x50000u, 5120u, 1u };
 +    rsx_tiling_set(0, RSX_LOCATION_MAIN, a.offset, a.size, a.pitch, a.bank);
 +    rsx_tiling_set(1, RSX_LOCATION_MAIN, b.offset, b.size, b.pitch, b.bank);
@@ -1332,17 +1363,17 @@ index 0000000..ef2ac05
 +int main(void)
 +{
 +    static const u32 r3_tile4[][2] = {
-+        { 0x2c7349, 0x2f8ce9 }, { 0x358983, 0x359483 }, { 0xc4586, 0xc4a46 },
-+        { 0x31cee3, 0x2e3543 }, { 0x43f3ad, 0x4747ed }, { 0x7cca5, 0x6a5c5 } };
++        { 0x123f52, 0x12beb2 }, { 0x2be4de, 0x2cc67e }, { 0x43526f, 0x47c3cf },
++        { 0x448368, 0x434d08 }, { 0x55d763, 0x58d343 }, { 0x102334, 0xbaf34 } };
 +    static const u32 pitch2048[][2] = {
-+        { 0x1de07a, 0x1cbd1a }, { 0x123c4f, 0x13426f }, { 0x12e71b, 0x131c9b },
-+        { 0x11e427, 0x113f87 }, { 0x1724c3, 0x17e603 }, { 0x1cb183, 0x1c14c3 } };
++        { 0x172525, 0x176385 }, { 0x1d75ad, 0x1d2bcd }, { 0x1fb57d, 0x1f735d },
++        { 0x1e1d73, 0x1f41f3 }, { 0x17ad8a, 0x1774aa }, { 0x1014c3, 0x1106c3 } };
 +    static const u32 pitch5120[][2] = {
-+        { 0x3898c2, 0x391402 }, { 0x2217b2, 0x1fb592 }, { 0x6b4ca9, 0x6b9ba9 },
-+        { 0x1e27b3, 0x228733 }, { 0x2e4406, 0x2e9206 }, { 0x301857, 0x30a277 } };
++        { 0x14aa4e, 0x168e8e }, { 0x1c593a, 0x1d2f5a }, { 0x498893, 0x47e8b3 },
++        { 0x1919e9, 0x1a05a9 }, { 0x731c94, 0x750434 }, { 0x2f0ee, 0x3672e } };
 +    static const u32 pitch512[][2] = {
-+        { 0x1c784, 0x1a664 }, { 0x17a0d, 0x1fead }, { 0x4f8bb, 0x4bb9b },
-+        { 0x3835d, 0x380bd }, { 0x4a017, 0x49217 }, { 0x365ef, 0x377cf } };
++        { 0x4ec1b, 0x4b2db }, { 0x3838c, 0x3862c }, { 0x2ae8a, 0x296ea },
++        { 0x42d80, 0x4d4c0 }, { 0x30319, 0x34239 }, { 0x3c800, 0x32080 } };
 +    const rsx_tile tile4 = { 0x30000u, 0x580000u, 8192u, 2u };
 +    vectors("pitch 8192, bank 2 (Resistance 3's tile 4)", tile4, r3_tile4, 6);
 +    vectors("pitch 2048, bank 0", (rsx_tile){ 0x100000u, 0x100000u, 2048u, 0u }, pitch2048, 6);
