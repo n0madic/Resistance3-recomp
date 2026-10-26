@@ -32,8 +32,12 @@ IG_REGIONS_C = "igjob_regions.c"
 # Extra function entries for the WWS job modules' lift (see lift()): module (the content hash in its name) -> LS addresses.
 WWS_JOB_EXTRA_ENTRIES = {"8f987d5458b2": (0x5318,)}
 
-# The lift reaches the host's trampoline state through exported accessors (toolkit patch 0010).
-MODULE_DEFS = ("-DPPU_MODULE_ACCESSORS", "-DSPU_MODULE_ACCESSORS")
+# The PPU lift reaches the host's thread-locals directly: on macOS a module binds to the host's TLS variables when it is
+# loaded. PPU_MODULE_ACCESSORS (module-abi/0001) would put a call in front of each access: ~1% of the PPU threads' time
+# in a firefight (2026-10-26, `sample`: accessor + _tlv_get_addr 1.3-1.7% with it, 0.4-0.7% without). The SPU lift keeps
+# SPU_MODULE_ACCESSORS for the trampoline slot cached in spu_context (module-abi/0002): direct access put the SPU
+# threads' _tlv_get_addr at 1.0-1.5%, the cached slot at 0.35-0.43%.
+MODULE_DEFS = ("-DSPU_MODULE_ACCESSORS",)
 PPU_FLAGS = ("-std=gnu++20", "-O3", "-DNDEBUG", "-w", "-ffp-contract=off", "-fno-strict-aliasing", "-fPIC")
 SPU_FLAGS = ("-std=gnu17", "-O2", "-DNDEBUG", "-w", "-DSPU_USE_DISPATCH_MT", "-fno-strict-aliasing", "-fPIC")
 CC, CXX = "/usr/bin/clang", "/usr/bin/clang++"   # the compilers the host was built with
