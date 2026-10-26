@@ -1,0 +1,226 @@
+SPU: lifted code built as a module queues its transfers through a slot pointer cached in the context.
+
+With SPU_MODULE_ACCESSORS every `g_spu_trampoline_fn = f` of the lift (683 in one Resistance 3 job module) called
+the host's spu_tramp_slot() through a dyld stub, which asked _tlv_get_addr for an address that never changes for
+the thread: ~1.5-2% of the SPU threads' time in a firefight (`sample`: spu_tramp_slot + its stub ~110, its
+_tlv_get_addr ~55 of ~9-12k). spu_context.tramp_slot now holds the running thread's slot: spu_run_with_halt sets
+it, every lift reaches it there (a context runs on one host thread), and the module writes through it, falling
+back to the accessor while it is NULL (a context lifted code reaches outside spu_run_with_halt). spu_drain_call
+compares it with its thread's slot on entry and rebinds it with a log line if another thread left it. Without
+SPU_MODULE_ACCESSORS nothing changes but the field.
+
+Test: tools/test_spu_module_tramp_slot.py (runtime/spu/tests/test_spu_module_tramp_slot.c with a "module" TU built
+with SPU_MODULE_ACCESSORS: the accessor without a slot, the slot when set, the binding by spu_run_with_halt on this
+and on another thread, the rebinding by spu_drain_call; 7 checks, each of the three host changes left out fails
+some). Micro-benchmark (a module-built function re-queued through spu_drain_call, static link): 7.5-7.8 ->
+6.8-7.2 ns per step.
+In the game (`sample`, 25 s of the Haven firefight, 2 runs each): spu_tramp_slot + stub 1.6% -> none of the SPU
+threads' samples, _tlv_get_addr 1.6-2.0% -> 1.1-1.4%; no rebinding was logged.
+
+Upstream: not proposed. Same as 0001.
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index e0992b7..ffb5b4e 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -240,2 +240,3 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
++    ctx->tramp_slot = &g_spu_trampoline_fn;         /* where a module's lifted code queues its transfers */
+     /* Lockstep gate (env SPU_LOCKSTEP, default off): join the round-robin
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index b600524..3ad7826 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -405,2 +405,8 @@ typedef struct spu_context {
+     uint32_t drain_ret_pc;
++
++    /* The trampoline slot (g_spu_trampoline_fn) of the host thread running
++     * this context, for lifted code built as a separate module: it writes
++     * its transfers here instead of calling spu_tramp_slot(). Set by
++     * spu_run_with_halt (and checked by spu_drain_call); NULL until then. */
++    void (**tramp_slot)(struct spu_context*);
+ } spu_context;
+@@ -806,3 +812,8 @@ uint32_t (*spu_pch_arr(void))[8];
+ unsigned *spu_pch_n_slot(void);
+-#  define g_spu_trampoline_fn (*spu_tramp_slot())
++/* Lifted code always has its context in `ctx`: the slot it cached, else the accessor. */
++static inline void (**spu_tramp_slot_of(spu_context* c))(spu_context*)
++{
++    return __builtin_expect(c->tramp_slot != 0, 1) ? c->tramp_slot : spu_tramp_slot();
++}
++#  define g_spu_trampoline_fn (*spu_tramp_slot_of(ctx))
+ #  define g_spu_pch           (*spu_pch_arr())
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 237ebec..f99e7f4 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -403,2 +403,16 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+ 
++/* A context whose cached trampoline slot (spu_context.tramp_slot) is not this
++ * thread's: unset (lifted code reached outside spu_run_with_halt) or another
++ * thread's, where a module's transfers would have gone. */
++__attribute__((noinline, cold)) static void spu_tramp_slot_bind(spu_context* ctx)
++{
++    if (ctx->tramp_slot) {
++        static int _n = 0;
++        if (PS3_LOG_FIRST(_n, 4))
++            fprintf(stderr, "[spu] img=%d pc=0x%05X runs on another host thread than its trampoline slot; rebound\n",
++                    ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK));
++    }
++    ctx->tramp_slot = &g_spu_trampoline_fn;
++}
++
+ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+@@ -406,2 +420,3 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+     spu_depth_guard(ctx);
++    if (ctx->tramp_slot != &g_spu_trampoline_fn) spu_tramp_slot_bind(ctx);
+     /* The frame an interrupt taken in THIS loop returns to. It stays armed
+diff --git a/runtime/spu/tests/test_spu_module_tramp_slot.c b/runtime/spu/tests/test_spu_module_tramp_slot.c
+new file mode 100644
+index 0000000..311a2e8
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_module_tramp_slot.c
+@@ -0,0 +1,86 @@
++/* Lifted code built as a separate module queues its transfers through the context's cached trampoline slot
++ * (spu_context.tramp_slot), else through spu_tramp_slot(); spu_run_with_halt binds the slot to the running
++ * thread and spu_drain_call rebinds one left by another thread. Built with tools/test_spu_module_tramp_slot.py. */
++#include "../spu_context.h"
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++/* Link-only boundaries outside the SPU runtime (as in test_spu_interpreter_handoff.c). */
++void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
++void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
++unsigned long long ps3_ms_now(void) { return 0; }
++uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
++int g_resv_store_active;
++uint32_t g_barrier_sync_watch;
++uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
++void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
++void ydkj_wake_all_event_flags(void) { abort(); }
++void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
++    (void)c; (void)a; (void)b; (void)d; abort();
++}
++uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
++extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
++extern void m_queue_target(spu_context*);
++extern void m_target(spu_context*);
++extern int m_target_runs;
++
++static int passed, failed;
++static void check(int ok, const char* what)
++{
++    if (ok) passed++; else { failed++; printf("FAIL: %s\n", what); }
++}
++static spu_context* fresh(void)
++{
++    spu_context* c = (spu_context*)calloc(1, sizeof *c);
++    if (!c) { puts("out of memory"); exit(1); }
++    spu_context_init(c, 0);
++    return c;
++}
++static void (**s_thread_slot)(spu_context*);
++static void* run_on_thread(void* arg)
++{
++    spu_run_with_halt(m_queue_target, (spu_context*)arg);
++    s_thread_slot = &g_spu_trampoline_fn;
++    return NULL;
++}
++
++int main(void)
++{
++    spu_context* c = fresh();
++    check(c->tramp_slot == NULL, "a new context has no cached slot");
++    g_spu_trampoline_fn = 0;
++    m_queue_target(c);
++    check(g_spu_trampoline_fn == m_target, "without a cached slot the module queues through the accessor");
++
++    void (*other)(spu_context*) = 0;
++    g_spu_trampoline_fn = 0;
++    c->tramp_slot = &other;
++    m_queue_target(c);
++    check(other == m_target && !g_spu_trampoline_fn, "a cached slot takes the module's transfer");
++
++    spu_context* r = fresh();
++    m_target_runs = 0;
++    spu_run_with_halt(m_queue_target, r);
++    check(r->tramp_slot == &g_spu_trampoline_fn && m_target_runs == 1,
++          "spu_run_with_halt binds the slot to its thread and runs the queued transfer");
++
++    c->pc = 0x100; g_spu_trampoline_fn = 0;
++    spu_drain_call(c, 0x100);
++    check(c->tramp_slot == &g_spu_trampoline_fn, "spu_drain_call rebinds a slot of another thread");
++
++    spu_context* t = fresh();
++    pthread_t th;
++    m_target_runs = 0;
++    if (pthread_create(&th, NULL, run_on_thread, t) || pthread_join(th, NULL)) { puts("pthread failed"); return 1; }
++    check(t->tramp_slot == s_thread_slot && s_thread_slot != &g_spu_trampoline_fn && m_target_runs == 1,
++          "a run on another thread binds that thread's slot");
++    spu_run_with_halt(m_queue_target, t);
++    check(t->tramp_slot == &g_spu_trampoline_fn && m_target_runs == 2, "the next run on this thread rebinds it here");
++
++    printf("SPU module trampoline slot: %d passed, %d failed\n", passed, failed);
++    return failed != 0;
++}
+diff --git a/runtime/spu/tests/test_spu_module_tramp_slot_lift.c b/runtime/spu/tests/test_spu_module_tramp_slot_lift.c
+new file mode 100644
+index 0000000..0754889
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_module_tramp_slot_lift.c
+@@ -0,0 +1,7 @@
++/* The "module" side of test_spu_module_tramp_slot.c: built with -DSPU_MODULE_ACCESSORS, as a separately loaded
++ * lift is, so g_spu_trampoline_fn here is the context's cached slot or the host's accessor. */
++#include "../spu_context.h"
++
++int m_target_runs;
++void m_target(spu_context* ctx) { (void)ctx; m_target_runs++; }
++void m_queue_target(spu_context* ctx) { ctx->pc = 0x200; g_spu_trampoline_fn = m_target; }
+diff --git a/tools/test_spu_module_tramp_slot.py b/tools/test_spu_module_tramp_slot.py
+new file mode 100644
+index 0000000..ef5d3a1
+--- /dev/null
++++ b/tools/test_spu_module_tramp_slot.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""A lift built as a separate module (SPU_MODULE_ACCESSORS) queues its trampoline transfers through the context's
++cached slot, bound to the running thread by spu_run_with_halt (runtime/spu/tests/test_spu_module_tramp_slot.c)."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++SPU = ROOT / 'runtime/spu'
++SOURCES = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
++           'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
++           'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
++
++
++def main() -> int:
++    cc = os.environ.get('CC', 'cc')
++    inc = ['-I' + str(ROOT / 'include'), '-I' + str(SPU), '-I' + str(ROOT / 'runtime/platform')]
++    with tempfile.TemporaryDirectory(prefix='spu-tramp-slot-') as tmp:
++        out = Path(tmp)
++        subprocess.run([cc, '-std=gnu17', '-O2', '-w', '-DSPU_MODULE_ACCESSORS', *inc, '-c',
++                        str(SPU / 'tests/test_spu_module_tramp_slot_lift.c'), '-o', str(out / 'lift.o')], check=True)
++        subprocess.run([cc, '-std=gnu17', '-O1', '-w', *inc, str(SPU / 'tests/test_spu_module_tramp_slot.c'),
++                        str(out / 'lift.o'), *[str(SPU / name) for name in SOURCES],
++                        str(ROOT / 'runtime/platform/win32_compat.c'), '-pthread', '-lm', '-o', str(out / 'test')],
++                       check=True)
++        env = {k: v for k, v in os.environ.items() if not k.startswith(('SPU_', 'SPURS_'))}
++        r = subprocess.run([str(out / 'test')], capture_output=True, text=True, timeout=30, env=env)
++    print(r.stdout.strip())
++    if r.returncode:
++        print(r.stderr[-2000:], file=sys.stderr)
++    return r.returncode
++
++
++if __name__ == '__main__':
++    sys.exit(main())
