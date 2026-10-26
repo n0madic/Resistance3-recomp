@@ -17,23 +17,26 @@ some). Micro-benchmark (a module-built function re-queued through spu_drain_call
 In the game (`sample`, 25 s of the Haven firefight, 2 runs each): spu_tramp_slot + stub 1.6% -> none of the SPU
 threads' samples, _tlv_get_addr 1.6-2.0% -> 1.1-1.4%; no rebinding was logged.
 
+#452 (v0.18.0) resolves the slot once per spu_drain_call on the host side; the lifted module's own stores are
+what this caches.
+
 Upstream: not proposed. Same as 0001.
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index e0992b7..ffb5b4e 100644
+index 5fc50208..f95d70b3 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -240,2 +240,3 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+@@ -327,2 +327,3 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
 +    ctx->tramp_slot = &g_spu_trampoline_fn;         /* where a module's lifted code queues its transfers */
      /* Lockstep gate (env SPU_LOCKSTEP, default off): join the round-robin
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index b600524..3ad7826 100644
+index a052008a..bbd930a0 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -405,2 +405,8 @@ typedef struct spu_context {
-     uint32_t drain_ret_pc;
+@@ -427,2 +427,8 @@ typedef struct spu_context {
+     int coh_listed;
 +
 +    /* The trampoline slot (g_spu_trampoline_fn) of the host thread running
 +     * this context, for lifted code built as a separate module: it writes
@@ -41,7 +44,7 @@ index b600524..3ad7826 100644
 +     * spu_run_with_halt (and checked by spu_drain_call); NULL until then. */
 +    void (**tramp_slot)(struct spu_context*);
  } spu_context;
-@@ -806,3 +812,8 @@ uint32_t (*spu_pch_arr(void))[8];
+@@ -874,3 +880,8 @@ uint32_t (*spu_pch_arr(void))[8];
  unsigned *spu_pch_n_slot(void);
 -#  define g_spu_trampoline_fn (*spu_tramp_slot())
 +/* Lifted code always has its context in `ctx`: the slot it cached, else the accessor. */
@@ -52,10 +55,10 @@ index b600524..3ad7826 100644
 +#  define g_spu_trampoline_fn (*spu_tramp_slot_of(ctx))
  #  define g_spu_pch           (*spu_pch_arr())
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index 237ebec..f99e7f4 100644
+index b041f62c..4c3b6703 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
-@@ -403,2 +403,16 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+@@ -544,2 +544,15 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
  
 +/* A context whose cached trampoline slot (spu_context.tramp_slot) is not this
 + * thread's: unset (lifted code reached outside spu_run_with_halt) or another
@@ -70,15 +73,14 @@ index 237ebec..f99e7f4 100644
 +    }
 +    ctx->tramp_slot = &g_spu_trampoline_fn;
 +}
-+
- void spu_drain_call(spu_context* ctx, uint32_t return_pc)
-@@ -406,2 +420,3 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
-     spu_depth_guard(ctx);
+ 
+@@ -549,2 +562,3 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+     spu_depth_guard_check(ctx);
 +    if (ctx->tramp_slot != &g_spu_trampoline_fn) spu_tramp_slot_bind(ctx);
-     /* The frame an interrupt taken in THIS loop returns to. It stays armed
+     /* On the way out, the enclosing drain's return pc is the innermost one
 diff --git a/runtime/spu/tests/test_spu_module_tramp_slot.c b/runtime/spu/tests/test_spu_module_tramp_slot.c
 new file mode 100644
-index 0000000..311a2e8
+index 00000000..311a2e8c
 --- /dev/null
 +++ b/runtime/spu/tests/test_spu_module_tramp_slot.c
 @@ -0,0 +1,86 @@
@@ -170,7 +172,7 @@ index 0000000..311a2e8
 +}
 diff --git a/runtime/spu/tests/test_spu_module_tramp_slot_lift.c b/runtime/spu/tests/test_spu_module_tramp_slot_lift.c
 new file mode 100644
-index 0000000..0754889
+index 00000000..0754889f
 --- /dev/null
 +++ b/runtime/spu/tests/test_spu_module_tramp_slot_lift.c
 @@ -0,0 +1,7 @@
@@ -183,7 +185,7 @@ index 0000000..0754889
 +void m_queue_target(spu_context* ctx) { ctx->pc = 0x200; g_spu_trampoline_fn = m_target; }
 diff --git a/tools/test_spu_module_tramp_slot.py b/tools/test_spu_module_tramp_slot.py
 new file mode 100644
-index 0000000..ef5d3a1
+index 00000000..ef5d3a1d
 --- /dev/null
 +++ b/tools/test_spu_module_tramp_slot.py
 @@ -0,0 +1,37 @@

@@ -7,32 +7,31 @@ own size is sampled linearly, one shown at its size stays point-sampled. PS3RECO
 sets the initial size.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index e0694f8..1e4e57e 100644
+index 30bf38bd..dea8a63a 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
-@@ -84,2 +84,5 @@
+@@ -94,2 +94,5 @@
  #endif
 +/* The window's content size in device pixels, kept current by the message pump (main thread) and read
 + * by the present path, which sizes the drawable to it. 0 until the first pump. */
 +static volatile u32        s_win_px_w, s_win_px_h;
  static int                 s_ready;
-@@ -3573,3 +3576,4 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -4205,3 +4208,4 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
   * PS3_SHARPEN this pass sharpens it as it samples. Either one that is off or
 - * fails is skipped. */
 + * fails is skipped. The picture keeps its aspect ratio: it is fitted into the drawable and
 + * centred, and the rest is black (letterbox). */
  static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
-@@ -3596,3 +3600,4 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -4228,3 +4232,4 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
      rp.colorAttachments[0].texture     = dst;
 -    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
 +    rp.colorAttachments[0].loadAction  = MTLLoadActionClear;
 +    rp.colorAttachments[0].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-@@ -3600,5 +3605,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -4232,5 +4237,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
      if (!e) return;
 +    const double dw = (double)[dst width], dh = (double)[dst height];
 +    const double sw = (double)[src width], sh = (double)[src height];
@@ -45,7 +44,7 @@ index e0694f8..1e4e57e 100644
 +    const int scaled = (vw != sw || vh != sh);
 +    [e setFragmentSamplerState:(scaled ? s_default_sampler : s_eng_point_sampler) atIndex:0];
      /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
-@@ -3640,2 +3651,10 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -4281,2 +4292,10 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              } else {
 +                /* The drawable is the window's size in device pixels, so the compositor does not
 +                 * stretch it; eng_blit_to_display fits the game picture into it. */
@@ -56,7 +55,7 @@ index e0694f8..1e4e57e 100644
 +                    fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
 +                }
                  drawable = [s_layer nextDrawable];
-@@ -4023,2 +4042,8 @@ static int pump_messages_impl(void)
+@@ -4698,2 +4717,8 @@ static int pump_messages_impl(void)
          }
 +        if (s_window) {
 +            NSView* v = [s_window contentView];

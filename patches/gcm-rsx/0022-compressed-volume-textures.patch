@@ -26,10 +26,10 @@ Upstream: PR #585 (on master the test also turns engine_up into engine_up_with(b
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 42f8e42..9e37883 100644
+index eb7514a3..847fe307 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1280,2 +1280,23 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d,
+@@ -1337,2 +1337,23 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d,
  
 +/* Slice z of a block-compressed 3D level in NVIDIA's VTC layout
 + * (https://registry.khronos.org/OpenGL/extensions/NV/NV_texture_compression_vtc.txt),
@@ -53,23 +53,23 @@ index 42f8e42..9e37883 100644
 +}
 +
  /* One hash per cached texture per presented frame. Word-at-a-time FNV over
-@@ -1363,5 +1384,8 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1423,5 +1444,8 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
 -     * first slice and sampled in 2D it darkened whole boxes round every prop. */
 +     * first slice and sampled in 2D it darkened whole boxes round every prop.
 +     * A DXT volume too: Resistance 3's explosion smoke is a 256x256x16 DXT5
 +     * animation, and its first 64 KB read as one 2D image (four slices'
 +     * blocks interleaved) drew dark squares where the smoke was. */
-     if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
+     if (!into && depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
 -        !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
 +        (lv[0].tl.compressed || lv[0].tl.bytes_per_texel)) {
          const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
-@@ -1376,2 +1400,4 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1436,2 +1460,4 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              const rsx_tex_layout* tl = &lv[m].tl;
 +            const int vtc = tl->compressed && !(lv[m].w & (lv[m].w - 1u)) &&
 +                            !(lv[m].h & (lv[m].h - 1u));
              const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
-@@ -1382,3 +1408,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1442,3 +1468,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              for (u32 z = 0; z < d; z++) {
 -                if (tl->swizzled) {
 +                if (vtc) {
@@ -79,10 +79,10 @@ index 42f8e42..9e37883 100644
 +                } else if (tl->swizzled) {
                      u8* lin = g.tex_staging + tl->dst_row_bytes * tl->rows;
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index 4d3c31d..31ec760 100644
+index ff9caeb9..163e5f3c 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
-@@ -2807,2 +2807,7 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+@@ -3121,2 +3121,7 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
      if (!t || !src || !row_bytes) return;
 +    /* A block-compressed slice is rows of 4x4 blocks. */
 +    const MTLPixelFormat pf = [t pixelFormat];
@@ -90,16 +90,16 @@ index 4d3c31d..31ec760 100644
 +                   pf == MTLPixelFormatBC3_RGBA;
 +    const u32 rows = bc ? (h + 3u) / 4u : h;
      [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
-@@ -2812,3 +2817,3 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+@@ -3126,3 +3131,3 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
           bytesPerRow:row_bytes
 -       bytesPerImage:(NSUInteger)row_bytes * h];
 +       bytesPerImage:(NSUInteger)row_bytes * rows];
  }
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index ad117ba..4c811e4 100644
+index 3a33bd2e..71d6c1fc 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -891,2 +891,130 @@ static void test_texture_sparse_rehash(void)
+@@ -892,2 +892,130 @@ static void test_texture_sparse_rehash(void)
  
 +/* A block-compressed volume (dimension 3, DXT) goes up slice by slice as a
 + * 3D texture. Resistance 3's explosion smoke is a 256x256x16 DXT5 volume;
@@ -230,7 +230,7 @@ index ad117ba..4c811e4 100644
 +}
 +
  static void test_pipeline_key(void)
-@@ -2434,2 +2562,3 @@ int main(void)
+@@ -2817,2 +2945,3 @@ int main(void)
      test_texture_sparse_rehash();
 +    test_compressed_volume();
      test_pipeline_key();

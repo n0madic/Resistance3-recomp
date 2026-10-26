@@ -12,30 +12,29 @@ Test: libs/input/tests/test_pad_keyboard_fps.c test_menu_keys (both keys in and 
 change, no hook). Scripted run: the host's query follows the title screen, menus, pause and gameplay.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 276d768..2572ba5 100644
+index eb2f83e2..8c2973ca 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -422,2 +422,5 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+@@ -480,2 +480,5 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
  
 +static int (*s_menu_query)(void);
 +void cellPad_set_menu_query(int (*in_menu)(void)) { s_menu_query = in_menu; }
 +
  /* PAD_KEYBOARD_LAYOUT=fps: a PC shooter's keyboard and mouse in place of the
-@@ -427,3 +430,4 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+@@ -485,3 +488,4 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
   * G/F = L2/R2, Shift = L3, V = R3, arrows and 1/2/3/4 = d-pad (up, right,
 - * down, left), Esc/Enter = START, Tab = SELECT. What a button does is the
 + * down, left), Enter/Esc = CROSS/CIRCLE in a menu and START elsewhere,
 + * Tab = SELECT. What a button does is the
   * title's; this follows the usual shooter one (R1 fires, L1 aims, L3 sprints,
-@@ -443,3 +447,2 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+@@ -501,3 +505,2 @@ static u16 pad_keyboard_fps(PadHostState* hs)
          { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_4,      CELL_PAD_CTRL_LEFT },
 -        { PADKEY_ESCAPE, CELL_PAD_CTRL_START },   { PADKEY_RETURN, CELL_PAD_CTRL_START },
          { PADKEY_TAB,    CELL_PAD_CTRL_SELECT },
-@@ -451,2 +454,15 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+@@ -509,2 +512,15 @@ static u16 pad_keyboard_fps(PadHostState* hs)
  
 +    /* Enter and Esc confirm and go back in a menu (cellPad_set_menu_query) and press START (start, pause, skip)
 +     * elsewhere. A key keeps the button it got when it went down until it is released: Esc pauses, the pause menu
@@ -52,10 +51,10 @@ index 276d768..2572ba5 100644
 +
      const int lx = pad_key_down(PADKEY_D) - pad_key_down(PADKEY_A);
 diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
-index 89c58ab..42761fc 100644
+index b35fcb6d..fd592eba 100644
 --- a/libs/input/cellPad.h
 +++ b/libs/input/cellPad.h
-@@ -202,2 +202,7 @@ void cellPad_poll(void);
+@@ -204,2 +204,7 @@ void cellPad_poll(void);
  
 +/* Host hook for the keyboard fallback's shooter layout (PAD_KEYBOARD_LAYOUT=fps): non-zero while the title shows a
 + * menu, where Enter confirms (CROSS) and Esc goes back (CIRCLE) instead of pressing START. Called from the pad poll,
@@ -64,7 +63,7 @@ index 89c58ab..42761fc 100644
 +
  #ifdef __cplusplus
 diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
-index 5b5f340..4448758 100644
+index 5b5f3405..4448758c 100644
 --- a/libs/input/tests/test_pad_keyboard_fps.c
 +++ b/libs/input/tests/test_pad_keyboard_fps.c
 @@ -141,2 +141,40 @@ static void test_fps_layout(void)

@@ -9,14 +9,16 @@ in only; a key that names no module, or an address outside its module, stops the
 Test: tools/test_lift_jobmods_extra_funcs.py (two synthetic modules: a bare entry splits both, a keyed one only
 its module; the two errors). After the module rebuild 0x5318 starts a function in jobmod_8f987d5458b2 only.
 
+Each module's range is the span at its own link base (module_base, #488), so a keyed entry is checked against that.
+
 Upstream: not proposed yet.
 ---
 
 diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
-index 1c07c88..8595896 100644
+index f8783799..be22d62b 100644
 --- a/tools/lift_jobmods.py
 +++ b/tools/lift_jobmods.py
-@@ -47,4 +47,6 @@ CODE_END = {
+@@ -67,4 +67,6 @@ CODE_END = {
  
 -# Extra function entries, in LS addresses, applied to every module that
 -# contains them ($LBP_JOBMOD_EXTRA_FUNCS, comma-separated).
@@ -25,13 +27,13 @@ index 1c07c88..8595896 100644
 +# `<sha>:<addr>` (sha = the 12 hex digits in the module's name) only to that
 +# module.
  #
-@@ -56,2 +58,5 @@ CODE_END = {
+@@ -76,2 +78,5 @@ CODE_END = {
  # actually spans the address, so modules that do not contain it are unchanged.
 +# Modules that do contain it get a new function there, and in a loop that
 +# crosses the address every pass then goes through a trampoline; once a census
 +# names the module, the keyed form leaves the others alone.
  EXTRA_FUNCS = [a.strip() for a in
-@@ -60,2 +65,30 @@ EXTRA_FUNCS = [a.strip() for a in
+@@ -80,2 +85,40 @@ EXTRA_FUNCS = [a.strip() for a in
  
 +def parse_extra_funcs(items):
 +    """[(sha or None, LS address)] from EXTRA_FUNCS-style items."""
@@ -42,41 +44,70 @@ index 1c07c88..8595896 100644
 +    return out
 +
 +
-+def check_extra_funcs(extra, sizes):
++def check_extra_funcs(extra, spans):
 +    """Error for a keyed entry whose module is missing or does not span it
-+    (sizes: sha -> image size): a typo would otherwise drop it silently."""
++    (spans: sha -> (link base, image size)): a typo would otherwise drop it
++    silently."""
 +    for sha, addr in extra:
 +        if sha is None:
 +            continue
-+        if sha not in sizes:
++        if sha not in spans:
 +            return f"LBP_JOBMOD_EXTRA_FUNCS: no module {sha} for 0x{addr:X}"
-+        if not BASE <= addr < BASE + sizes[sha]:
++        base, size = spans[sha]
++        if not base <= addr < base + size:
 +            return (f"LBP_JOBMOD_EXTRA_FUNCS: 0x{addr:X} is outside module {sha} "
-+                    f"(0x{BASE:X}..0x{BASE + sizes[sha]:X})")
++                    f"(0x{base:X}..0x{base + size:X})")
 +    return None
 +
 +
-+def extra_funcs_for(extra, sha, size):
-+    """The entries offered to module `sha`, of `size` bytes at BASE."""
-+    return [hex(a) for s, a in extra if s in (None, sha) and BASE <= a < BASE + size]
++def extra_funcs_for(extra, sha, size, base=BASE):
++    """The entries offered to module `sha`, of `size` bytes at `base` (a module
++    named by no sha gets the bare ones only)."""
++    return [a for s, a in extra if s in (None, sha) and base <= a < base + size]
++
++
++def module_sha(name):
++    """The 12 hex digits of a jobmod_<sha>_e<entry> name, the key of
++    LBP_JOBMOD_EXTRA_FUNCS (None for any other name)."""
++    parts = name.split("_")
++    return parts[1].lower() if len(parts) >= 3 and parts[0] == "jobmod" else None
 +
 +
  def manual_link_targets(raw, base=BASE):
-@@ -151,2 +184,6 @@ def main():
+@@ -212,3 +255,3 @@ def module_code_end(raw, name, base=BASE):
+     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
+-    seeds |= {int(a, 0) for a in EXTRA_FUNCS}
++    seeds |= {a for s, a in parse_extra_funcs(EXTRA_FUNCS) if s in (None, module_sha(name))}
+     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
+@@ -225,6 +268,6 @@ def module_code_end(raw, name, base=BASE):
+ 
+-def module_seeds(raw, base=BASE):
++def module_seeds(raw, base=BASE, sha=None):
+     """Extra function entries offered to the lifter for one module."""
+     # Only offer addresses that fall inside THIS module's image.
+-    inside = [a for a in EXTRA_FUNCS if base <= int(a, 0) < base + len(raw)]
++    inside = [hex(a) for a in extra_funcs_for(parse_extra_funcs(EXTRA_FUNCS), sha, len(raw), base)]
+     # The module's first function starts right after the 0x30-byte header
+@@ -270,3 +313,3 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
+         cmd += ["--merge-chunks"]
+-    inside = module_seeds(raw, base)
++    inside = module_seeds(raw, base, module_sha(name))
+     if code_end:
+@@ -363,2 +406,11 @@ def main():
          sys.exit(f"no jobmod_*.bin in {JOBMODS} -- run extract_jobmods.py first")
 +    extra = parse_extra_funcs(EXTRA_FUNCS)
-+    err = check_extra_funcs(extra, {os.path.basename(m).split("_")[1]: os.path.getsize(m) for m in mods})
++    spans = {}
++    for m in mods:
++        with open(m, "rb") as f:
++            raw = f.read()
++        spans[module_sha(os.path.splitext(os.path.basename(m))[0])] = (module_base(raw), len(raw))
++    err = check_extra_funcs(extra, spans)
 +    if err:
 +        sys.exit(err)
      os.makedirs(OUTDIR, exist_ok=True)
-@@ -177,3 +214,3 @@ def main():
-         # Only offer addresses that fall inside THIS module's image.
--        inside = [a for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
-+        inside = extra_funcs_for(extra, sha, len(raw))
-         # The module's first function starts right after the 0x30-byte header
 diff --git a/tools/test_lift_jobmods_extra_funcs.py b/tools/test_lift_jobmods_extra_funcs.py
 new file mode 100644
-index 0000000..0ab521a
+index 00000000..0ab521a3
 --- /dev/null
 +++ b/tools/test_lift_jobmods_extra_funcs.py
 @@ -0,0 +1,53 @@

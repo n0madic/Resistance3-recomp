@@ -5,14 +5,13 @@ overflowed the 1 MB stack inside an Insomniac job (igjob_00DC0200) and the host 
 spu_workload.c already reserves 256 MB for its async SPU thread for the same reason (the Bink decoder).
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index a99b577..ea144d0 100644
+index 2606b914..f6aec2ff 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -1795,2 +1795,10 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -1874,2 +1874,10 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
      memset(si->idle, 0, sizeof(si->idle));
 +    /* The workers run lifted SPU job code, whose brsl chains are deep host call chains: Resistance 3's level load
 +     * overflowed a 1 MB stack in an Insomniac job (igjob_00DC0200) and the host died with SIGBUS on the guard page.
@@ -23,7 +22,7 @@ index a99b577..ea144d0 100644
 +    const DWORD pm_stack_flags = 0;
 +#endif
      for (u32 sn = 0; sn < si->nspus; sn++) {
-@@ -1799,3 +1807,3 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -1878,3 +1886,3 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
          slot->instance = si; slot->spu_num = sn;
 -        slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
 +        slot->thread = CreateThread(NULL, 256u << 20, spurs_pm_worker, slot, pm_stack_flags, NULL);

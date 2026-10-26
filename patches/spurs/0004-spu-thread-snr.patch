@@ -4,21 +4,20 @@ cellSpursGetInfo now reports pseudo ids for spuThreadGroup/spuThreads[]; a signa
 contexts of that SPU (or waits for the first one). Resistance 3 wakes its own policy module (igPm) this way.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index ea144d0..4ebea4a 100644
+index f6aec2ff..2678629a 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -464,2 +464,6 @@ static void spurs_scheduler_forget(u32 wid);
+@@ -500,2 +500,6 @@ static void spurs_scheduler_forget(u32 wid);
  
 +/* Pseudo ids of a SPURS instance's SPU threads: instance index and SPU number under a tag byte. */
 +#define SPURS_SPU_TID_BASE 0x70000000u
 +#define SPURS_SPU_TID(inst, spu) (SPURS_SPU_TID_BASE | ((u32)(inst) << 4) | (u32)(spu))
 +
  static struct SpursInst* spurs_inst_find(u32 ea)
-@@ -3076,3 +3080,11 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
+@@ -3186,3 +3190,11 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
          vm_write32((u32)info_ea, si ? si->nspus : 1);   /* nSpus */
 -        for (int o = 4; o < 0x28; o += 4) vm_write32((u32)info_ea + o, 0);
 +        for (int o = 4; o < 0x48; o += 4) vm_write32((u32)info_ea + o, 0);
@@ -31,7 +30,7 @@ index ea144d0..4ebea4a 100644
 +                vm_write32((u32)info_ea + 0x28 + 4 * n, SPURS_SPU_TID(idx, n));
 +        }
      }
-@@ -3081,2 +3093,13 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
+@@ -3191,2 +3203,13 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
  
 +/* sys_spu_thread_write_snr on a pseudo SPU thread id of cellSpursGetInfo (see SPURS_SPU_TID). */
 +int cellSpurs_post_snr(u32 tid, u32 num, u32 val)
@@ -46,25 +45,25 @@ index ea144d0..4ebea4a 100644
 +
  s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
 diff --git a/runtime/spu/spu_workload.h b/runtime/spu/spu_workload.h
-index f8a726e..2220555 100644
+index 09c982f9..69292e58 100644
 --- a/runtime/spu/spu_workload.h
 +++ b/runtime/spu/spu_workload.h
-@@ -73,2 +73,3 @@ void spurs_policy_release_instance(uint32_t spurs_ea);
+@@ -95,2 +95,3 @@ void spurs_policy_release_instance(uint32_t spurs_ea);
  int spurs_policy_release_workload(uint32_t spurs_ea, uint32_t wid);
 +int spurs_policy_post_snr(uint32_t spurs_ea, uint32_t spu_num, uint32_t num, uint32_t val);
  
 diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
-index 5d1c63d..d793211 100644
+index 905b3517..e42fc9cc 100644
 --- a/runtime/spu/spurs_policy.c
 +++ b/runtime/spu/spurs_policy.c
-@@ -52,2 +52,6 @@ static struct PmInstance {
+@@ -53,2 +53,6 @@ static struct PmInstance {
      uint32_t ea;
 +    /* SNR values posted by the PPU (sys_spu_thread_write_snr) that no resident context could take yet;
 +     * applied when a context for that SPU is created. Guarded by s_pm_directory_lock. */
 +    uint32_t snr_val[6][2];
 +    uint8_t  snr_set[6][2];
      struct PmSlot slots[16][6];
-@@ -85,2 +89,50 @@ static struct PmSlot* policy_slot(uint32_t ea, uint32_t wid, uint32_t lane)
+@@ -86,2 +90,50 @@ static struct PmSlot* policy_slot(uint32_t ea, uint32_t wid, uint32_t lane)
  
 +/* Post a signal-notification value from the PPU to a virtual SPU of a SPURS instance. Every resident policy
 + * context of that SPU takes it (a policy module that never reads SNR leaves it unread); with none yet, it waits in
@@ -115,28 +114,28 @@ index 5d1c63d..d793211 100644
 +}
 +
  static void policy_slot_release(struct PmSlot* slot)
-@@ -200,3 +252,2 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+@@ -201,3 +253,2 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          if (!ctx) { policy_slot_release(resident); return -1; }
 -        resident->ctx = ctx;
          first = 1;
-@@ -214,2 +265,3 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+@@ -215,2 +266,3 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          spu_context_init(ctx, 0);
 +        policy_publish_ctx(resident, ctx, spu_num);
      } else if (s_fresh || resident->data != wkl_data ||
-@@ -226,2 +278,4 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+@@ -227,2 +279,4 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          first = 1;
 +        /* TODO: a reload on real hardware keeps the SPU's signal channels; this reset drops a signal still unread. */
 +        policy_publish_ctx(resident, NULL, spu_num);
          spu_coh_unregister(ctx);
-@@ -230,2 +284,3 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+@@ -231,2 +285,3 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          spu_context_init(ctx, 0);
 +        policy_publish_ctx(resident, ctx, spu_num);
      }
 diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
-index a45a555..803dcfb 100644
+index 96266731..e94dc409 100644
 --- a/runtime/syscalls/lv2_register.c
 +++ b/runtime/syscalls/lv2_register.c
-@@ -2361,2 +2361,8 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
+@@ -2367,2 +2367,8 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
      if (!t) {
 +        /* A SPU thread of a SPURS instance (ids from cellSpursGetInfo), which has no spu_thread_t of its own. */
 +        extern int cellSpurs_post_snr(uint32_t tid, uint32_t num, uint32_t val) __attribute__((weak));

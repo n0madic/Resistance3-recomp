@@ -7,24 +7,23 @@ the lifted code reaches g_trampoline_fn, g_spu_trampoline_fn, g_spu_pch and g_sp
 SPU_THREAD_LOCAL macro as the rest. Without the macros the headers are unchanged.
 
 Upstream: not proposed. The loader and lifter side is shared with other ports that load their lift as a module.
-
 ---
 
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index f54150d..b3282fa 100644
+index 9309f2d3..f0899b7c 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
-@@ -1986,2 +1986,5 @@ void flow_lookup_alloc(unsigned int p) {
+@@ -2109,2 +2109,5 @@ void flow_lookup_alloc(unsigned int p) {
  extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
 +/* The slot for a lift built as a separate module, which cannot import a TLS variable (see PPU_MODULE_ACCESSORS
 + * in the lifter's chunk prologue). */
 +extern "C" void (**ppu_tramp_slot(void))(void*) { return &g_trampoline_fn; }
  
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index f46d415..b1d39ae 100644
+index c5ccbec7..a052008a 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -772,2 +772,13 @@ void spu_indirect_branch(spu_context* ctx);
+@@ -867,2 +867,13 @@ void spu_indirect_branch(spu_context* ctx);
  
 +#ifdef SPU_MODULE_ACCESSORS
 +/* Lifted images built as a separate loadable module (dll/dylib/so) cannot import the thread-local
@@ -38,15 +37,15 @@ index f46d415..b1d39ae 100644
 +#  define g_spu_pch_n         (*spu_pch_n_slot())
 +#else
  /* Pending cross-function transfer target; NULL when none. Thread-local: each
-@@ -781,2 +792,3 @@ extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
+@@ -876,2 +887,3 @@ extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
  extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 +#endif
  
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index fc3cea1..237ebec 100644
+index 49bc2b94..b041f62c 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
-@@ -23,2 +23,7 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+@@ -34,2 +34,7 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
  
 +/* Accessors for lifted images built as a separate module (see SPU_MODULE_ACCESSORS in spu_context.h). */
 +void (**spu_tramp_slot(void))(spu_context*) { return &g_spu_trampoline_fn; }
@@ -55,7 +54,7 @@ index fc3cea1..237ebec 100644
 +
  /* yz_lockstep_tick now has its real body in spu_lockstep.c (milestone 2). */
 diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
-index bb8f122..7afffe7 100644
+index bb8f1226..7afffe71 100644
 --- a/runtime/spu/spurs_job.c
 +++ b/runtime/spu/spurs_job.c
 @@ -148,4 +148,4 @@ SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
@@ -66,10 +65,10 @@ index bb8f122..7afffe7 100644
 +SPU_THREAD_LOCAL int g_spurs_job_mbox_valid;
  /* The SPU number a job sees (cellSpursGetCurrentSpuId, kernel LS 0x1C8). A host
 diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
-index 9d9df71..cc4159f 100644
+index a657ba61..8926c963 100644
 --- a/tools/ppu_lifter.py
 +++ b/tools/ppu_lifter.py
-@@ -476,4 +476,12 @@ extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
+@@ -591,4 +591,12 @@ extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
  /* Trampoline function pointer for cross-fragment branches (TLS).
 - * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
 + * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above.

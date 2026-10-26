@@ -4,11 +4,10 @@ Titles tell their saves apart by SAVEDATA_LIST_PARAM. Resistance 3 keeps a count
 profile slots; with the field left empty its funcFixed answered ERR_NODATA and the profile never loaded.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
-index 4b4e906..8370118 100644
+index 95a1a1a4..e7e6b632 100644
 --- a/libs/system/cellSaveData.c
 +++ b/libs/system/cellSaveData.c
 @@ -449,2 +449,18 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di

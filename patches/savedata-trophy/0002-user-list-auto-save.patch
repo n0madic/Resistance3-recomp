@@ -5,14 +5,13 @@ and the stat/file callbacks write it. Resistance 3 saves campaign progress and s
 was saved.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
-index 2705091..4b4e906 100644
+index c6d70e06..95a1a1a4 100644
 --- a/libs/system/cellSaveData.c
 +++ b/libs/system/cellSaveData.c
-@@ -1231,2 +1231,17 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
+@@ -1254,2 +1254,17 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
  
 +/* ListAutoSave mirrors ListAutoLoad: funcFixed picks the directory, then the
 + * usual stat/file callbacks write it. */
@@ -30,7 +29,7 @@ index 2705091..4b4e906 100644
 +}
 +
  s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
-@@ -1588,2 +1603,19 @@ static void hle_cellSaveDataUserListAutoLoad(ppu_context* ctx)
+@@ -1611,2 +1626,19 @@ static void hle_cellSaveDataUserListAutoLoad(ppu_context* ctx)
  
 +/* UserListAutoSave takes the same ten arguments as UserListAutoLoad. Resistance 3
 + * saves its campaign progress and settings through it. */
@@ -50,7 +49,7 @@ index 2705091..4b4e906 100644
 +}
 +
  void cellSaveData_register_ctx_handlers(void)
-@@ -1594,2 +1626,4 @@ void cellSaveData_register_ctx_handlers(void)
+@@ -1617,2 +1649,4 @@ void cellSaveData_register_ctx_handlers(void)
                           hle_cellSaveDataUserListAutoLoad);
 +    ps3_hle_register_ctx(0x0E091C36u, "cellSaveDataUserListAutoSave",
 +                         hle_cellSaveDataUserListAutoSave);

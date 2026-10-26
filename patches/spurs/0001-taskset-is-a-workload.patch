@@ -10,18 +10,17 @@ Resistance 3 creates one taskset with an LFQueue consumer; without this its task
 leaves it (the SPU side logs "sleeping Ns in WAIT_SIGNAL" for task 0).
 
 Upstream: not proposed.
-
 ---
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 015913a..efa3043 100644
+index 82ea66c6..453bea4d 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -454,2 +454,3 @@ static struct SpursInst {
+@@ -459,2 +459,3 @@ static struct SpursInst {
      u32 cursor, pass_no;
 +    u32 next_taskset_wid; /* workload id of the next taskset (SPU side reads it from the taskset) */
  } s_inst[MAX_SPURS_INST];
-@@ -494,2 +495,24 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+@@ -530,2 +531,24 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
  
 +/* Every taskset the HLE creates is a workload of the instance, numbered in creation order.
 + * The SPU side reads the id from the taskset (CSTS_WID) and records it when a task parks on
@@ -46,11 +45,11 @@ index 015913a..efa3043 100644
 +}
 +
  static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
-@@ -517,2 +540,3 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -553,2 +576,3 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      si->nspus = (nspus > 0 && nspus <= CELL_SPURS_MAX_SPU) ? nspus : 1;
 +    si->next_taskset_wid = 0;
      memset(si->prefix, 0, sizeof(si->prefix));
-@@ -526,2 +550,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -562,2 +586,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
 +    /* libsre's own entry points (e.g. _cellSpursLFQueueInitialize, taken from the real
 +     * library when a port lifts it) validate the instance before touching it: the
@@ -58,7 +57,7 @@ index 015913a..efa3043 100644
 +     * real initialiser. Bit 31 (workload 0) is the first workload a title creates. */
 +    vm_write32(spurs_ea + SPURS_WKL_ENABLED, 0x8000FFFFu);
  
-@@ -873,3 +902,4 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+@@ -909,3 +938,4 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
       * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
 -    spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
 +    const u32 taskset_wid = spurs_register_taskset_workload(spurs_ea, taskset_ea);

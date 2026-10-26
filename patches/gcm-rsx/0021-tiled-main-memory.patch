@@ -54,15 +54,23 @@ Upstream: PR #569 (on master: without the NV0039 part, as master has no NV0039 y
 the fetch tests standing alone; when the pin has it, keep only the NV0039 lines here).
 ---
 
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0db1a8ea..c71e52e0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -542,2 +542,3 @@ if(UNIX)
+                 libs/video/tests/test_metal_poly_offset.m
++                libs/video/rsx_tiling.c
+                 libs/video/rsx_shader_msl.cpp
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 5f9dd5c..a27e672 100644
+index b0a5d106..d26a4cfc 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -12,2 +12,3 @@
  #include "rsx_draw_engine.h"
 +#include "rsx_tiling.h"
  #include "cellGcmSys.h"
-@@ -318,2 +319,16 @@ static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
+@@ -342,2 +343,16 @@ static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
  
 +/* Every RSX client reads and writes tiled main memory through the tiling
 + * (rsx_tiling.h): publish what is bound. */
@@ -79,16 +87,16 @@ index 5f9dd5c..a27e672 100644
 +}
 +
  /* Zcull configuration (8 zcull regions) */
-@@ -484,2 +499,3 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+@@ -514,2 +529,3 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      memset(s_tiles, 0, sizeof(s_tiles));
 +    gcm_tiles_publish();
      memset(s_zcull, 0, sizeof(s_zcull));
-@@ -1033,3 +1049,3 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
+@@ -1106,3 +1122,3 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
   * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
 -static void gcm_row_copy(u32 d, u32 s, u32 n)
 +static void gcm_store(u32 d, const u8* src, u32 n)
  {
-@@ -1039,5 +1055,5 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
+@@ -1112,5 +1128,5 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
      for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
 -    if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
 +    if (!reserved) { memmove(vm_base + d, src, n); return; }
@@ -96,7 +104,7 @@ index 5f9dd5c..a27e672 100644
 -    memmove(vm_base + d, vm_base + s, n);
 +    memmove(vm_base + d, src, n);
      for (u32 a = l0; a <= l1; a += 128)
-@@ -1047,2 +1063,52 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
+@@ -1120,2 +1136,52 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
  
 +static void gcm_row_copy(u32 d, u32 s, u32 n)
 +{
@@ -149,7 +157,7 @@ index 5f9dd5c..a27e672 100644
 +}
 +
  static void nv3089_blit(void)
-@@ -1122,2 +1188,8 @@ static void nv3089_blit(void)
+@@ -1195,2 +1261,8 @@ static void nv3089_blit(void)
          nv3089_engine_read(in_pitch, out_w, out_h);
 +        /* A source in tiled main memory is read a row at a time through the
 +         * tiling, up to the last texel the row samples. */
@@ -158,7 +166,7 @@ index 5f9dd5c..a27e672 100644
 +        u8* trow = stiled ? gcm_rows(sw * 4u) : NULL;
 +        if (stiled && !trow) return;
          /* Copy words verbatim through raw pointers rather than vm_read32/
-@@ -1131,2 +1203,7 @@ static void nv3089_blit(void)
+@@ -1204,2 +1276,7 @@ static void nv3089_blit(void)
                const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
 +              if (stiled) {
 +                  rsx_tiled_read(&s_gcm_mem, RSX_LOCATION_MAIN, s_nv3089.in_off + (u32)(sv >> 20) * in_pitch,
@@ -166,7 +174,7 @@ index 5f9dd5c..a27e672 100644
 +                  srow = trow;
 +              }
                for (u32 x = 0; x < out_w; x++) {
-@@ -1201,2 +1278,32 @@ static void nv3089_blit(void)
+@@ -1274,2 +1351,32 @@ static void nv3089_blit(void)
      if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
 +    /* A side in tiled main memory goes through the tiling (rsx_tiling.h).
 +     * Resistance 3 downsamples its scene and depth into a tiled main-memory
@@ -199,7 +207,7 @@ index 5f9dd5c..a27e672 100644
 +        }
 +    } else
      if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
-@@ -1300,2 +1407,17 @@ static void nv0039_buffer_notify(void)
+@@ -1373,2 +1480,17 @@ static void nv0039_buffer_notify(void)
      }
 +    /* Either side in tiled main memory: a line at a time through the tiling.
 +     * Both spans are inside their 32-bit DMA windows here. */
@@ -217,7 +225,7 @@ index 5f9dd5c..a27e672 100644
 +        return;
 +    }
      if (pin == len && pout == len) memmove(dst, src, (size_t)len * lines);
-@@ -1389,2 +1511,8 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+@@ -1462,2 +1584,8 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                           s_gcm2d.dst_dma, px, py, dst_pitch, data); }
 +            const u32 at = s_gcm2d.dst_offset + py * dst_pitch + px * 4;
 +            if (gcm_rect_tiled(local, at, 4, 1)) {
@@ -226,38 +234,38 @@ index 5f9dd5c..a27e672 100644
 +                return;
 +            }
              vm_write32(base + py * dst_pitch + px * 4, data);
-@@ -3578,3 +3706,5 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
+@@ -3918,3 +4046,5 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
      s_tiles[index].bank   = bank;
 -    s_tiles[index].bound  = 0;
 +    /* SetTile binds too (as it does on RPCS3), so a
 +     * title that never calls BindTile still has its tiles in force. */
 +    s_tiles[index].bound  = pitch > 0;
  
-@@ -3583,2 +3713,3 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
+@@ -3923,2 +4053,3 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
      s_tiles[index].limit = offset + size - 1;
 +    gcm_tile_publish(index);
  
-@@ -3623,2 +3754,3 @@ s32 cellGcmBindTile(u8 index)
+@@ -3963,2 +4094,3 @@ s32 cellGcmBindTile(u8 index)
      s_tiles[index].bound = 1;
 +    gcm_tile_publish(index);
      return CELL_OK;
-@@ -3645,2 +3777,3 @@ s32 cellGcmUnbindTile(u8 index)
+@@ -3985,2 +4117,3 @@ s32 cellGcmUnbindTile(u8 index)
      s_tiles[index].bound = 0;
 +    gcm_tile_publish(index);
      return CELL_OK;
-@@ -3850,2 +3983,3 @@ void cellGcmTerminate(void)
+@@ -4191,2 +4324,3 @@ void cellGcmTerminate(void)
      memset(s_tiles, 0, sizeof(s_tiles));
 +    gcm_tiles_publish();
      memset(s_zcull, 0, sizeof(s_zcull));
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index e9b8fc8..42f8e42 100644
+index 875ea8b5..eb7514a3 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -17,2 +17,3 @@
  #include "rsx_restart_cuts.h"
 +#include "rsx_tiling.h"
  #include "rsx_vertex_formats.h"
-@@ -278,2 +279,92 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
+@@ -291,2 +292,92 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
  
 +/* Guest memory as the engine reaches it, for the tiled range copies (rsx_tiling.h). */
 +static u8* eng_tiled_ptr(void* user, u32 location, u32 offset, u32 len)
@@ -350,42 +358,42 @@ index e9b8fc8..42f8e42 100644
 +}
 +
  static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
-@@ -612,3 +703,3 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
+@@ -625,3 +716,3 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
      if (!tl.face_bytes || !tl.dst_row_bytes) return NULL;
 -    const u8* src = eng_guest_ptr(NULL, location, offset, tl.face_bytes);
 +    const u8* src = eng_guest_linear(location, offset, tl.face_bytes);
      if (!src) return NULL;
-@@ -917,3 +1008,4 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -937,3 +1028,4 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
          }
 -        memcpy(dst, src + skip, bytes);
 +        if (rsx_tiling_active()) rsx_tiled_write(&s_eng_mem, location, offset + r * pitch, src + skip, bytes);
 +        else                     memcpy(dst, src + skip, bytes);
      }
-@@ -975,3 +1067,3 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -995,3 +1087,3 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
      for (u32 r = 0; r < h; r++) {
 -        const u8* src = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
 +        const u8* src = eng_guest_linear(location, offset + r * pitch, w * 4u);
          if (!src) return;
-@@ -1194,2 +1286,4 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
+@@ -1251,2 +1343,4 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
  {
 +    /* in tiled main memory, every byte the texture's texels are stored in */
 +    if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
      const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
-@@ -1220,2 +1314,3 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
+@@ -1277,2 +1371,3 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
  {
 +    if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
      const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
-@@ -1272,3 +1367,3 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1332,3 +1427,3 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
          const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
 -        const u8* src = eng_guest_ptr(NULL, location, offset, span);
 +        const u8* src = eng_guest_linear(location, offset, span);
          if (!src) return 0;
-@@ -1310,3 +1405,3 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1370,3 +1465,3 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
      const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
 -    const u8* src = eng_guest_ptr(NULL, location, offset, span);
 +    const u8* src = eng_guest_linear(location, offset, span);
      if (!src) return 0;
-@@ -1535,5 +1630,17 @@ static int eng_zdepth_to_guest(u32 slot)
+@@ -1642,12 +1737,24 @@ static int eng_zdepth_to_guest(u32 slot)
      }
 +    /* Rows of a zeta in tiled main memory are built here and stored through the tiling. */
 +    const int tiled = !image && eng_tiled(z->location, z->offset, z->pitch * h);
@@ -398,17 +406,25 @@ index e9b8fc8..42f8e42 100644
 +        tile_row_cap = w * bpp;
 +    }
      for (u32 r = 0; r < h; r++) {
-         u8* row = image;
+         const float* src = s_depth_rows + (size_t)r * w;
 -        if (!image) {
-+        if (tiled) {
-+            row = tile_row;
-+        } else if (!image) {
-             row = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
-@@ -1561,2 +1668,3 @@ static int eng_zdepth_to_guest(u32 slot)
+-            u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+-            if (!dst) return 0;
+-            eng_depth_row_to_guest(dst, src, w, bpp);
++        if (image) {
++            for (u32 c = 0; c < w; c++)
++                eng_depth_row_to_guest(image + rsx_swizzle_offset(c, r, log2w, log2h) * bpp, src + c, 1, bpp);
+             continue;
          }
-+        if (tiled) rsx_tiled_write(&s_eng_mem, z->location, z->offset + r * z->pitch, row, w * bpp);
+-        for (u32 c = 0; c < w; c++)
+-            eng_depth_row_to_guest(image + rsx_swizzle_offset(c, r, log2w, log2h) * bpp, src + c, 1, bpp);
++        u8* dst = tiled ? tile_row
++                        : (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
++        if (!dst) return 0;
++        eng_depth_row_to_guest(dst, src, w, bpp);
++        if (tiled) rsx_tiled_write(&s_eng_mem, z->location, z->offset + r * z->pitch, tile_row, w * bpp);
      }
-@@ -1712,4 +1820,7 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+@@ -1824,4 +1931,7 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
          fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
 +        /* in tiled main memory: as far as the size scan may look, detiled */
 +        const int fp_tiled = fp_uc && eng_tiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
@@ -417,28 +433,28 @@ index e9b8fc8..42f8e42 100644
 -        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
 +        if (fp_size && !fp_tiled) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
          if (!fp_uc) fp_size = 0;
-@@ -2243,3 +2354,3 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -2390,3 +2500,3 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                  start + bytes <= 0x100000000ull)
 -                run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
 +                run = eng_fetch_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
              if (run) {
-@@ -2251,3 +2362,3 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -2398,3 +2508,3 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                  const u8* p = run ? run + (size_t)i * esz
 -                    : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
 +                    : eng_fetch_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
                  if (!p) { dc.fetch_ok = 0; break; }
-@@ -2281,3 +2392,3 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -2428,3 +2538,3 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
      dc.layout = *layout;
 -    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
 +    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_fetch_ptr, NULL);
      rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
-@@ -2954,2 +3065,3 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3186,2 +3296,3 @@ static void sink_end(void* user, const rsx_dispatch* r)
      if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
 +    eng_arena_reset();
      /* Mixed geometry sources have no defined concatenation here. Reject the
 diff --git a/libs/video/rsx_tiling.c b/libs/video/rsx_tiling.c
 new file mode 100644
-index 0000000..686c3ab
+index 00000000..686c3abd
 --- /dev/null
 +++ b/libs/video/rsx_tiling.c
 @@ -0,0 +1,177 @@
@@ -621,7 +637,7 @@ index 0000000..686c3ab
 +}
 diff --git a/libs/video/rsx_tiling.h b/libs/video/rsx_tiling.h
 new file mode 100644
-index 0000000..0dd81e9
+index 00000000..0dd81e9d
 --- /dev/null
 +++ b/libs/video/rsx_tiling.h
 @@ -0,0 +1,160 @@
@@ -786,7 +802,7 @@ index 0000000..0dd81e9
 +
 +#endif /* RSX_TILING_H */
 diff --git a/libs/video/tests/test_color_feedback_metal.m b/libs/video/tests/test_color_feedback_metal.m
-index 8cce3e9..f6aceb7 100644
+index 8cce3e99..f6aceb7d 100644
 --- a/libs/video/tests/test_color_feedback_metal.m
 +++ b/libs/video/tests/test_color_feedback_metal.m
 @@ -6,2 +6,3 @@
@@ -794,7 +810,7 @@ index 8cce3e9..f6aceb7 100644
 +#include "rsx_tiling.c"
  #undef eng_texture_upload
 diff --git a/libs/video/tests/test_gcm_fifo_user_command.c b/libs/video/tests/test_gcm_fifo_user_command.c
-index c653a23..fb7aa29 100644
+index c1ef1854..cb5e741d 100644
 --- a/libs/video/tests/test_gcm_fifo_user_command.c
 +++ b/libs/video/tests/test_gcm_fifo_user_command.c
 @@ -15,2 +15,3 @@
@@ -802,15 +818,15 @@ index c653a23..fb7aa29 100644
 +#include "../rsx_tiling.c"
  #include <stdio.h>
 diff --git a/libs/video/tests/test_gcm_flip_stream.c b/libs/video/tests/test_gcm_flip_stream.c
-index 364aa75..24684b1 100644
+index 0db6ccff..f18a4a1c 100644
 --- a/libs/video/tests/test_gcm_flip_stream.c
 +++ b/libs/video/tests/test_gcm_flip_stream.c
-@@ -28,2 +28,3 @@
+@@ -30,2 +30,3 @@
  #include "../cellGcmSys.c"
 +#include "../rsx_tiling.c"
  #include <stdio.h>
 diff --git a/libs/video/tests/test_gcm_flip_wrap.c b/libs/video/tests/test_gcm_flip_wrap.c
-index 6868923..88f411a 100644
+index b4667524..565ecd81 100644
 --- a/libs/video/tests/test_gcm_flip_wrap.c
 +++ b/libs/video/tests/test_gcm_flip_wrap.c
 @@ -17,2 +17,3 @@
@@ -818,7 +834,7 @@ index 6868923..88f411a 100644
 +#include "../rsx_tiling.c"
  #include <stdio.h>
 diff --git a/libs/video/tests/test_gcm_get_on_jump.c b/libs/video/tests/test_gcm_get_on_jump.c
-index adf0fd5..4b682a7 100644
+index 24c40f99..976ec3d3 100644
 --- a/libs/video/tests/test_gcm_get_on_jump.c
 +++ b/libs/video/tests/test_gcm_get_on_jump.c
 @@ -19,2 +19,3 @@
@@ -826,7 +842,7 @@ index adf0fd5..4b682a7 100644
 +#include "../rsx_tiling.c"
  #include <stdio.h>
 diff --git a/libs/video/tests/test_gcm_get_on_release.c b/libs/video/tests/test_gcm_get_on_release.c
-index 7920eed..fe21a5c 100644
+index b762f68c..44c99721 100644
 --- a/libs/video/tests/test_gcm_get_on_release.c
 +++ b/libs/video/tests/test_gcm_get_on_release.c
 @@ -24,2 +24,3 @@
@@ -834,15 +850,47 @@ index 7920eed..fe21a5c 100644
 +#include "../rsx_tiling.c"
  #include <stdio.h>
 diff --git a/libs/video/tests/test_gcm_legacy_state_filter.c b/libs/video/tests/test_gcm_legacy_state_filter.c
-index e3e9d31..319c8fd 100644
+index 02126946..6591b95b 100644
 --- a/libs/video/tests/test_gcm_legacy_state_filter.c
 +++ b/libs/video/tests/test_gcm_legacy_state_filter.c
 @@ -13,2 +13,3 @@
  #include "../cellGcmSys.c"
 +#include "../rsx_tiling.c"
  #include <stdio.h>
+diff --git a/libs/video/tests/test_gcm_nop_runs.c b/libs/video/tests/test_gcm_nop_runs.c
+index 31ed59ef..91767343 100644
+--- a/libs/video/tests/test_gcm_nop_runs.c
++++ b/libs/video/tests/test_gcm_nop_runs.c
+@@ -14,2 +14,3 @@
+ #include "../cellGcmSys.c"
++#include "../rsx_tiling.c"
+ #include <stdio.h>
+diff --git a/libs/video/tests/test_gcm_park_reuse.c b/libs/video/tests/test_gcm_park_reuse.c
+index 30cfb62f..d548ddc1 100644
+--- a/libs/video/tests/test_gcm_park_reuse.c
++++ b/libs/video/tests/test_gcm_park_reuse.c
+@@ -22,2 +22,3 @@
+ #include "../cellGcmSys.c"
++#include "../rsx_tiling.c"
+ #include <stdio.h>
+diff --git a/libs/video/tests/test_gcm_resync_labels.c b/libs/video/tests/test_gcm_resync_labels.c
+index cc591fd4..391a9d3a 100644
+--- a/libs/video/tests/test_gcm_resync_labels.c
++++ b/libs/video/tests/test_gcm_resync_labels.c
+@@ -20,2 +20,3 @@
+ #include "../cellGcmSys.c"
++#include "../rsx_tiling.c"
+ #include <stdio.h>
+diff --git a/libs/video/tests/test_gcm_walker_prof.c b/libs/video/tests/test_gcm_walker_prof.c
+index 065fb54d..278a263e 100644
+--- a/libs/video/tests/test_gcm_walker_prof.c
++++ b/libs/video/tests/test_gcm_walker_prof.c
+@@ -13,2 +13,3 @@
+ #include "../cellGcmSys.c"
++#include "../rsx_tiling.c"
+ #include <stdio.h>
 diff --git a/libs/video/tests/test_nv3089_engine_read.c b/libs/video/tests/test_nv3089_engine_read.c
-index e0f368d..5611d32 100644
+index 733d77d1..ca61bdc3 100644
 --- a/libs/video/tests/test_nv3089_engine_read.c
 +++ b/libs/video/tests/test_nv3089_engine_read.c
 @@ -13,2 +13,8 @@
@@ -858,7 +906,7 @@ index e0f368d..5611d32 100644
  #include "../cellGcmSys.c"
 +#include "../rsx_tiling.c"
  #include <stdio.h>
-@@ -60,2 +67,13 @@ int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g,
+@@ -64,2 +71,13 @@ int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g,
  
 +/* Main memory for the tiled cases: IO page 0 at EA 1 MB. Tile 4 as Resistance 3 sets it, scaled down. */
 +#define MAIN_EA   0x00100000u
@@ -872,7 +920,7 @@ index e0f368d..5611d32 100644
 +}
 +
  /* A non-zero pixel that names the source position it stands for. */
-@@ -64,4 +82,6 @@ static u32 src_pixel(u32 col, u32 row) { return 0xFF000000u | (row << 12) | col;
+@@ -68,4 +86,6 @@ static u32 src_pixel(u32 col, u32 row) { return 0xFF000000u | (row << 12) | col;
  static int s_reads;
 +static u32 s_src_off = SRC_OFF;     /* the blit source's first pixel */
  
@@ -880,7 +928,7 @@ index e0f368d..5611d32 100644
 +/* What the engine does for a transfer: the pixels of the surface in this rectangle, as 32-bit guest words, as the
 + * RSX stores them (a main-memory source at its tiled addresses). */
  void rsx_draw_engine_guest_read(u32 loc, u32 off, u32 pitch, u32 w, u32 h)
-@@ -70,5 +90,7 @@ void rsx_draw_engine_guest_read(u32 loc, u32 off, u32 pitch, u32 w, u32 h)
+@@ -74,5 +94,7 @@ void rsx_draw_engine_guest_read(u32 loc, u32 off, u32 pitch, u32 w, u32 h)
      for (u32 y = 0; y < h; y++)
 -        for (u32 x = 0; x < w; x++)
 -            vm_write32(cellGcmResolveLocated(loc == 0u /* RSX_LOCATION_LOCAL */, off + y * pitch + x * 4u),
@@ -891,7 +939,7 @@ index e0f368d..5611d32 100644
 +                       src_pixel((off - s_src_off) % pitch / 4u + x, (off - s_src_off) / pitch + y));
 +        }
  }
-@@ -112,2 +134,133 @@ static void blit_case(const char* what, u32 out, u32 scale, u32 uv, u32 interp)
+@@ -116,2 +138,133 @@ static void blit_case(const char* what, u32 out, u32 scale, u32 uv, u32 interp)
  
 +static void blit_tiled_case(const char* what, u32 out, u32 scale)
 +{
@@ -1025,7 +1073,7 @@ index e0f368d..5611d32 100644
 +}
 +
  int main(void)
-@@ -128,2 +281,12 @@ int main(void)
+@@ -132,2 +285,12 @@ int main(void)
      blit_case("4:1 resolve, one texel source offset", 16, 4, 0x10, 1);
 +    s_ea_address_table[TILE_IO >> 20] = (u16)(MAIN_EA >> 20);
 +    cellGcmSetTile(4, 1 /* main */, s_tile.offset, s_tile.size, s_tile.pitch, 0, 3, (u8)s_tile.bank);
@@ -1039,26 +1087,26 @@ index e0f368d..5611d32 100644
 +    inline_tiled_case();
      printf("[nv3089_engine_read] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 9f57254..ad117ba 100644
+index 9f561cda..3a33bd2e 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
 @@ -17,2 +17,3 @@
  #include "rsx_test_programs.h"
 +#include "rsx_tiling.c"        /* the engine looks the bound tiles up there */
  
-@@ -128,2 +129,5 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
+@@ -129,2 +130,5 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
  
 +/* The first 16 bytes of the last upload: four R,G,B,A texels. */
 +static u8 g_upload_first[16];
 +
  static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
-@@ -132,3 +136,4 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
+@@ -133,3 +137,4 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
      (void)u; (void)t; (void)face; (void)mip; (void)w; (void)h;
 -    (void)src; (void)row; (void)rows;
 +    (void)row; (void)rows;
 +    if (src) memcpy(g_upload_first, src, sizeof g_upload_first);
      stub.n_texture_upload++;
-@@ -1310,2 +1315,63 @@ static void test_transfer_coherence(void)
+@@ -1311,2 +1316,63 @@ static void test_transfer_coherence(void)
  
 +/* A tile bound over main memory: the RSX's reads and writes of it go through the tiling, the guest's bytes lie
 + * where the tiling puts them. Resistance 3 downsamples its scene into such a region with NV3089 for an SPU
@@ -1122,7 +1170,7 @@ index 9f57254..ad117ba 100644
 +}
 +
  /* A transfer that writes over a target at another pitch leaves its pixels older than guest memory: Resistance 3
-@@ -1733,2 +1799,60 @@ static void test_antialiased_wpos(void)
+@@ -1857,2 +1923,60 @@ static void test_antialiased_wpos(void)
  
 +/* Vertex, index and fragment program fetches out of a tile bound over main memory read through the tiling too:
 + * every RSX client sees the region that way. Each byte is put only at its tiled address. */
@@ -1175,7 +1223,7 @@ index 9f57254..ad117ba 100644
 +    m(0x1D60, 0x40u);                                      /* SHADER_CONTROL: fp32 exports */
 +    g_wpos_ps[0] = 0;
 +    draw_triangle();
-+    CHECK(stub.n_draw == 2 && strstr(g_wpos_ps, "(input.position).") != NULL,
++    CHECK(stub.n_draw == 2 && strstr(g_wpos_ps, "_rsx_wpos(input.position)") != NULL,
 +          "a fragment program in the tile is read through the tiling");
 +    m(0x08E4, 0);
 +    rsx_tiling_set(0, 0, 0, 0, 0, 0);
@@ -1183,14 +1231,14 @@ index 9f57254..ad117ba 100644
 +}
 +
  /* ---- 10. a zeta or a target read in a texture format of its own --------- */
-@@ -2319,2 +2443,4 @@ int main(void)
+@@ -2703,2 +2827,4 @@ int main(void)
      test_transfer_coherence();
 +    test_tiled_main_memory();
 +    test_tiled_fetches();
      test_transfer_supersedes_other_targets();
 diff --git a/libs/video/tests/test_rsx_tiling.c b/libs/video/tests/test_rsx_tiling.c
 new file mode 100644
-index 0000000..56d7e96
+index 00000000..56d7e963
 --- /dev/null
 +++ b/libs/video/tests/test_rsx_tiling.c
 @@ -0,0 +1,207 @@
@@ -1401,8 +1449,16 @@ index 0000000..56d7e96
 +    printf("[rsx_tiling] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
 +    return fails ? 1 : 0;
 +}
+diff --git a/tests/test_gcm_ea2io_range.c b/tests/test_gcm_ea2io_range.c
+index 151e8568..93630b6e 100644
+--- a/tests/test_gcm_ea2io_range.c
++++ b/tests/test_gcm_ea2io_range.c
+@@ -7,2 +7,3 @@
+ #include "../libs/video/cellGcmSys.c"
++#include "../libs/video/rsx_tiling.c"
+ #include <assert.h>
 diff --git a/tests/test_gcm_io_alloc.c b/tests/test_gcm_io_alloc.c
-index 5b749f9..42572a0 100644
+index 5b749f9e..42572a0f 100644
 --- a/tests/test_gcm_io_alloc.c
 +++ b/tests/test_gcm_io_alloc.c
 @@ -8,2 +8,3 @@
@@ -1411,7 +1467,7 @@ index 5b749f9..42572a0 100644
  #include <assert.h>
 diff --git a/tools/test_rsx_tiling.py b/tools/test_rsx_tiling.py
 new file mode 100644
-index 0000000..8a224cc
+index 00000000..8a224ccc
 --- /dev/null
 +++ b/tools/test_rsx_tiling.py
 @@ -0,0 +1,18 @@

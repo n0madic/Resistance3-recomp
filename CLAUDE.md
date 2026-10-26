@@ -19,8 +19,9 @@ data, the lifted module, build products and logs must never be committed. `build
   copy. `PACKED/GAME/*.PSARC` is uppercase locally; the host FS is case-insensitive.
 - Runtime state written by the game: `gamedata/dev_hdd0/` (HDD install, saves, trophies), `cache/BCES01118` (FIOS
   disk cache; delete it if a data-path bug may have poisoned it). The host keeps translated shaders in `cache/msl`
-  (`PS3RECOMP_MSL_CACHE`, gcm-rsx/0015): a first run stalls on every new shader, later runs do not. The files stay
-  valid across host rebuilds; an edit to `rsx_shader_msl.cpp`/`.h` (their hash is the key) retires them.
+  (`PS3RECOMP_MSL_CACHE`, upstream #511; `gcm-rsx/0015` names the translator by a hash of its sources): a first run
+  stalls on every new shader, later runs do not. The files stay valid across host rebuilds; an edit to
+  `rsx_shader_msl.cpp`/`.h` (their hash is the key) retires them.
 
 ## Commands
 
@@ -50,19 +51,21 @@ cmake -S build/ps3recomp -B <scratch>/build-tests -G Ninja -DPS3RECOMP_BUILD_TES
       -DCMAKE_PREFIX_PATH="$PWD/build/deps/prefix" -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
       -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON
 cmake --build <scratch>/build-tests -- -k 0     # keep going past a target that does not link
-ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 17
+ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 24
 ```
 
-Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (83 of them with
+Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (126 of them with
 the patches; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
 Some runtime unit tests (e.g. `runtime/spu/tests/test_spu_thread_ls_dma.c`) are built directly with clang from the
-toolkit dir against the runtime sources they need. The Metal ones that translate guest programs
+toolkit dir against the runtime sources they need: the "run:" steps of `.github/workflows/macos.yml` give the line
+(28 of them; `test_spu_lifted_start` also needs a `void cellSpurs_post_snr(void) {}` stub with the spurs patches).
+The Metal ones that translate guest programs
 (`libs/video/tests/test_shadow_compare_metal.m`) need the translator: compile `rsx_shader_msl.cpp` with
 `-DPS3RECOMP_HAVE_MSL_TRANSLATION=1 -DPS3RECOMP_MSL_TRANSLATOR_ID='"<any 23 chars>"'` and `-I build/deps/prefix/include`
 (+ `/spirv_cross`), and link glslang, SPIRV, SPIRV-Tools(-opt) and the spirv-cross static libraries from
 `build/deps/prefix/lib`; without it the stub reports "translation was not built" and 32 of 37 checks fail (with it,
-133/133 pass). On the pinned v0.17.0 all 17 ctest tests and all 83 scripts pass with
-the patches on (`test_metal_frame_rate` needs a usable display), so a new failure is ours. A patch that moves a symbol or
+133/133 pass). On the pinned v0.18.0 all 24 ctest tests, all 126 scripts and the 28 workflow tests pass
+with the patches on (`test_metal_frame_rate` needs a usable display), so a new failure is ours. A patch that moves a symbol or
 changes a code path can break a fixture's link line or stub (the loader fixtures stub `cellGcm_on_put_store`): fix the
 fixture in the same patch.
 
@@ -128,20 +131,21 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   immediately (the game injects command blocks at get and reuses their memory). The draw engine goes to Metal.
   The game reads its Z24S8 depth buffers as A8R8G8B8 several times a frame (one of them while it is still the
   bound zeta), and its Z16 shadow maps as DEPTH16; the backend converts both on the GPU (`depth_as_color`,
-  `gcm-rsx/0012` + `0013`; `PS3RECOMP_ENG_DEPTH_VIA_GUEST=1` brings back the store through guest memory, which cost
+  upstream #499 since v0.18.0; `PS3RECOMP_ENG_DEPTH_VIA_GUEST=1` brings back the store through guest memory, which cost
   ~3 fps).
-  Lamp shadows need `gcm-rsx/0014`: the light shaders read the DEPTH16 maps through crossbar 0xA900 (depth formats
+  Lamp shadows need upstream #501 and #499 (ours, in v0.18.0): the light shaders read the DEPTH16 maps through
+  crossbar 0xA900 (depth formats
   present depth on every lane), and the engine's 64-entry surface/zeta tables evict the least recently used entry
   (before, the maps Home renders at load got no depth target). The compare order is PR #424's (depth FUNC ref).
   Close to a lamp the game switches its map to a swizzled power-of-two Z16 surface (zeta pitch 64), read as swizzled
   DEPTH16 (`gcm-rsx/0016`; before, the lamp's light vanished near it).
   The menu atlases (DXT) share local memory with the level's post-processing targets and the engine's target table
-  outlives the level: a block-compressed unit never reads a target (upstream PR #508, imported; before, the menu
+  outlives the level: a block-compressed unit never reads a target (upstream #508; before, the menu
   after leaving a mission was noise on a flat background).
   An NV3089 copy that lands over a target it does not update (another pitch) makes guest memory the newer copy until
   the target is drawn again (`gcm-rsx/0018`; before, the hurt screen showed a stretched bloom target over black).
   A vertex attribute at frequency 1 with its divider-operation bit set (modulo) is element 0 for every vertex: the
-  tracer trails pass their start point and colours that way (`gcm-rsx/0019`; before, trails drew wedges across the
+  tracer trails pass their start point and colours that way (upstream #547; before, trails drew wedges across the
   screen).
   Under load the game drops its scene from 704 to 640 rows at the same addresses; the engine keeps the 704-row target
   and a texture descriptor smaller than a target reads a copy of its top-left (`gcm-rsx/0020`; recreating the target
@@ -169,7 +173,8 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   mouse turns the hero's orientation matrix directly, `host/r3_input.cpp` via `patches/input/0006`; in menus and
   cutscenes it moves the right stick, capped at the game's top stick rate):
   - WASD walk, mouse look (cursor captured while the window is in front and no menu is up, `patches/input/0007`;
-    Cmd+Tab frees it too). Cmd+Q or the window's close button quits (`patches/metal/0001`);
+    Cmd+Tab frees it too). The window's close button quits at once (`host/main.cpp`); Cmd+Q asks the game to quit
+    (upstream `ps3_host_quit`, #544: REQUEST_EXITGAME, then exit after `PS3_QUIT_GRACE_MS`, 3 s);
   - left button = R1 (fire), right = L1 (aim), middle or V = R3 (melee), wheel or Q = triangle (weapons);
   - Space = cross (jump), C/Ctrl/Backspace = circle (crouch, back), E/R = square (reload, use);
   - G/F = L2/R2 (grenade, secondary fire), Shift = L3 (sprint);
@@ -179,8 +184,9 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   - `PAD_MOUSE_SENS` = degrees per point, `PAD_MOUSE_AIM_SCALE` = its factor while aiming (defaults in
     `host/main.cpp`); `PAD_KEYBOARD_LAYOUT=pad` gives the pad-shaped layout (arrows, I/J/K/L camera, Z/X/A/S face
     buttons).
-- **Scripted input**: `PAD_FILE=<file>`, where the file holds `mask polls [lx ly rx ry]`, e.g. `echo "0x4000 8" > f`
-  presses cross.
+- **Scripted input**: `PAD_FILE=<file>`, where the file holds `mask reports [lx ly rx ry]` (a report is a pad read that
+  returned data, #570), e.g. `echo "0x4000 8" > f` presses cross. Add `PAD_NO_KEYBOARD=1` to a scripted run: else
+  bringing its window to the front captures the mouse, which turns the camera.
 - **Screenshots**: `RSX_ENGINE_SNAP_DIR=<dir> RSX_ENGINE_SNAP_EVERY_S=5`; per-pass dumps: `RSX_ENGINE_PASS_DUMP`.
 - **Logs**: `PS3_VERBOSE=1` brings back the toolkit's per-wait lines (`[WAIT] ...`); the host turns them off because
   the toolkit enables them whenever stderr is redirected. Other traces have their own variables (`PS3_FSLOG`,

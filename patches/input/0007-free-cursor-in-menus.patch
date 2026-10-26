@@ -11,21 +11,20 @@ Test: libs/input/tests/test_pad_keyboard_fps.c test_menu_keys (released in a men
 without the change). In play: the pause menu shows the cursor, resuming hides it.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 7617caa..6dbc45c 100644
+index 1f9fa8f7..5f8248db 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -465,3 +465,5 @@ static void pad_mouse_view(const PadMouseInput* m, double dt, PadHostState* hs)
+@@ -523,3 +523,5 @@ static void pad_mouse_view(const PadMouseInput* m, double dt, PadHostState* hs)
   * title's; this follows the usual shooter one (R1 fires, L1 aims, L3 sprints,
 - * R3 melees). The cursor is captured while the window is in the foreground. */
 + * R3 melees). The cursor is captured while the window is in the foreground and
 + * no menu is up (cellPad_set_menu_query): in a menu it is free to reach the
 + * window's close button or another app. */
  static u16 pad_keyboard_fps(PadHostState* hs)
-@@ -493,5 +495,6 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+@@ -551,5 +553,6 @@ static u16 pad_keyboard_fps(PadHostState* hs)
      static u16 ctx_held[sizeof ctx_keys / sizeof ctx_keys[0]];
 +    const int in_menu = s_menu_query && s_menu_query();
      for (unsigned i = 0; i < sizeof ctx_keys / sizeof ctx_keys[0]; i++) {
@@ -33,13 +32,13 @@ index 7617caa..6dbc45c 100644
 -        else if (!ctx_held[i]) ctx_held[i] = s_menu_query && s_menu_query() ? ctx_keys[i].menu_btn : CELL_PAD_CTRL_START;
 +        else if (!ctx_held[i]) ctx_held[i] = in_menu ? ctx_keys[i].menu_btn : CELL_PAD_CTRL_START;
          btns |= ctx_held[i];
-@@ -505,3 +508,3 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+@@ -563,3 +566,3 @@ static u16 pad_keyboard_fps(PadHostState* hs)
      PadMouseInput m;
 -    pad_mouse_poll(1, &m);
 +    pad_mouse_poll(!in_menu, &m);
      const double now = pad_now_s();
 diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
-index 1f179d8..29a8a31 100644
+index 1f179d84..29a8a31e 100644
 --- a/libs/input/tests/test_pad_keyboard_fps.c
 +++ b/libs/input/tests/test_pad_keyboard_fps.c
 @@ -155,4 +155,6 @@ static void test_menu_keys(void)

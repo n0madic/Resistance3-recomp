@@ -19,23 +19,22 @@ dropped (a strided and a packed span wrapping 32 bits, a range wrapping the IO s
 window), each in a child process: without these checks all four run and die on SIGSEGV/SIGBUS.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index bdd2f85..afe37e3 100644
+index 250d8d2c..5fc01f22 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -400,2 +400,4 @@ if(PS3RECOMP_BUILD_TESTS)
+@@ -402,2 +402,4 @@ if(PS3RECOMP_BUILD_TESTS)
      if(UNIX)
 +        # ...NV0039 buffer copies, and the spans they must not run past.
 +        add_subdirectory(tests/gcm_nv0039)
          add_subdirectory(tests/gcm_reports)
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 3d70d76..f06c888 100644
+index fd525d21..60e7e7b2 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1249,2 +1249,57 @@ static void nv3089_blit(void)
+@@ -1322,2 +1322,57 @@ static void nv3089_blit(void)
  
 +/* NV0039 (memory-to-memory buffer copy), libgcm's subchannel 1: cellGcmSetTransferData
 + * and friends. BUFFER_NOTIFY runs the copy, LINE_COUNT lines of LINE_LENGTH bytes, each
@@ -93,7 +92,7 @@ index 3d70d76..f06c888 100644
 +}
 +
  static void gcm_2d_method(u32 subch, u32 method, u32 data)
-@@ -1279,2 +1334,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+@@ -1352,2 +1407,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
       * headers); other versions use the classic 2 / 4. Accept both. */
 +    if (subch == 1) {                        /* NV0039 buffer copy */
 +        switch (method) {
@@ -110,12 +109,12 @@ index 3d70d76..f06c888 100644
 +        }
 +    }
      if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
-@@ -2293,5 +2362,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2660,5 +2729,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   * same reason the live engine does, and masks them itself. */
 +                /* Only what the 3D path takes, plus the driver methods: the engine
 +                 * strips the subchannel, so a 2D engine's state (NV0039's OFFSET_OUT
 +                 * is 0x310) would land on an NV4097 register (BLEND_ENABLE). */
-                 { static int eng = -1;
+                 if (wdiag) { static int eng = -1;
                    if (eng < 0) eng = rsx_draw_engine_enabled();
 -                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
 +                  if (eng && (subch == 0 || (subch == 1 && !s1_2d) || ((subch << 13) | m) >= 0xE000u))
@@ -123,7 +122,7 @@ index 3d70d76..f06c888 100644
  
 diff --git a/tests/gcm_nv0039/CMakeLists.txt b/tests/gcm_nv0039/CMakeLists.txt
 new file mode 100644
-index 0000000..074f49d
+index 00000000..074f49d4
 --- /dev/null
 +++ b/tests/gcm_nv0039/CMakeLists.txt
 @@ -0,0 +1,25 @@
@@ -154,7 +153,7 @@ index 0000000..074f49d
 +add_test(NAME gcm_nv0039 COMMAND test_gcm_nv0039)
 diff --git a/tests/gcm_nv0039/main.c b/tests/gcm_nv0039/main.c
 new file mode 100644
-index 0000000..c7cdde3
+index 00000000..c7cdde35
 --- /dev/null
 +++ b/tests/gcm_nv0039/main.c
 @@ -0,0 +1,208 @@

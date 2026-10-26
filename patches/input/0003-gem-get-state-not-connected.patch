@@ -5,11 +5,10 @@ compares the result with CELL_GEM_NOT_CONNECTED; the error code made it think a 
 calibrated, so it opened a "PlayStation Eye is not correctly connected" dialog that nothing closes.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/hardware/cellGem.c b/libs/hardware/cellGem.c
-index 001fd5a..1f5265a 100644
+index 001fd5a3..1f5265a1 100644
 --- a/libs/hardware/cellGem.c
 +++ b/libs/hardware/cellGem.c
 @@ -57,3 +57,6 @@ s32 cellGemGetState(u32 gemNum, u32 flag, u64 timestamp, CellGemState* state)
@@ -21,7 +20,7 @@ index 001fd5a..1f5265a 100644
 +    return CELL_GEM_NOT_CONNECTED;
  }
 diff --git a/libs/hardware/cellGem.h b/libs/hardware/cellGem.h
-index 76c5505..4b048e9 100644
+index 76c5505f..4b048e9d 100644
 --- a/libs/hardware/cellGem.h
 +++ b/libs/hardware/cellGem.h
 @@ -33,2 +33,6 @@ extern "C" {

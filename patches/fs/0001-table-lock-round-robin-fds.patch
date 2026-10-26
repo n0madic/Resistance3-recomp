@@ -6,30 +6,31 @@ and the use crashed in ftello on the freed stream. The handlers now hold one rec
 tables (the AIO completion callback runs outside it). Descriptors are also allocated round-robin instead of
 lowest-free, so a late call on a number that was just closed cannot reach a file that reopened it at once.
 
-Upstream: not proposed yet. Kept on top of upstream/pr456 (its g_fd_dir reset goes into fd_alloc_file).
+Upstream #430 (v0.18.0) allocates and releases under a lock and reads each slot once, which keeps a close from
+handing a reader NULL; a reader's snapshot can still be fclose'd under it, which is this crash. So the handlers keep
+holding g_fs_lock for as long as they use the slot, and allocation (under #430's g_fd_lock) goes round-robin.
 
+Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index 6508777..33bd01d 100644
+index f73907c2..69e57773 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -26,2 +26,3 @@
- #include <atomic>
-+#include <mutex>
- #include <sys/stat.h>
-@@ -229,6 +230,27 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir
- 
-+/* The tables are shared by every guest thread. A title's I/O threads open and
-+ * close descriptors while others seek and read (Resistance 3's FIOS scheduler
-+ * and media threads cycle one fd hundreds of times a level), so a lookup and
-+ * its use must not straddle a close: that dereferenced a freed FILE. Recursive,
-+ * because the handlers call one another's helpers. */
+@@ -236,2 +236,23 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir
+ static std::mutex g_fd_lock;
++/* A snapshot alone does not stop a close from freeing the FILE while another
++ * thread still reads through it (Resistance 3's FIOS scheduler and media
++ * threads cycle one fd hundreds of times a level; a close between the lookup
++ * and the use crashed in ftello on the freed stream). So every handler also
++ * holds g_fs_lock for as long as it uses its slot. Recursive, because the
++ * handlers call one another's helpers. */
 +static std::recursive_mutex g_fs_lock;
 +#define FS_LOCKED() std::lock_guard<std::recursive_mutex> fs_guard_(g_fs_lock)
 +
 +/* Hand descriptors out round-robin rather than lowest-free: a late call on a
-+ * just-closed number would otherwise reach whatever file reopened it at once. */
++ * just-closed number would otherwise reach whatever file reopened it at once.
++ * Called under g_fd_lock. */
 +static int fd_alloc_slot(void)
 +{
 +    static int next = 3;
@@ -40,69 +41,77 @@ index 6508777..33bd01d 100644
 +    return -1;
 +}
  static int fd_alloc_file(FILE* f)
- {
--    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; g_fd_dir[i] = 0; return i; }
+@@ -239,9 +260,8 @@ static int fd_alloc_file(FILE* f)
+     std::lock_guard<std::mutex> hold(g_fd_lock);
+-    for (int i = 3; i < FS_MAX; i++)
+-        if (!g_files[i] && !g_dirs[i]) {
+-            g_fd_dir[i] = 0;
+-            __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
+-            return i;
+-        }
 -    return -1;
-+    FS_LOCKED();
 +    const int i = fd_alloc_slot();
-+    if (i >= 0) { g_files[i] = f; g_fd_dir[i] = 0; }
++    if (i >= 0) {
++        g_fd_dir[i] = 0;
++        __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
++    }
 +    return i;
  }
-@@ -236,4 +258,6 @@ static int fd_alloc_dir(DIR* d)
- {
--    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = d; return i; }
+@@ -250,5 +270,5 @@ static int fd_alloc_dir(DIR* d)
+     std::lock_guard<std::mutex> hold(g_fd_lock);
+-    for (int i = 3; i < FS_MAX; i++)
+-        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
 -    return -1;
-+    FS_LOCKED();
 +    const int i = fd_alloc_slot();
-+    if (i >= 0) g_dirs[i] = d;
++    if (i >= 0) __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE);
 +    return i;
  }
-@@ -413,2 +437,3 @@ static void cellFsClose(ppu_context* ctx)
+@@ -436,2 +456,3 @@ static void cellFsClose(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -447,2 +472,3 @@ static void cellFsRead(ppu_context* ctx)
+@@ -477,2 +498,3 @@ static void cellFsRead(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd          = (int)(uint32_t)ctx->gpr[3];
-@@ -518,2 +544,3 @@ static void cellFsWrite(ppu_context* ctx)
+@@ -549,2 +571,3 @@ static void cellFsWrite(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd          = (int)(uint32_t)ctx->gpr[3];
-@@ -582,2 +609,3 @@ static void cellFsFGetBlockSize(ppu_context* ctx)
+@@ -614,2 +637,3 @@ static void cellFsFGetBlockSize(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -599,2 +627,3 @@ static void cellFsLseek(ppu_context* ctx)
+@@ -631,2 +655,3 @@ static void cellFsLseek(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd        = (int)(uint32_t)ctx->gpr[3];
-@@ -654,2 +683,3 @@ static void cellFsFstat(ppu_context* ctx)
+@@ -687,2 +712,3 @@ static void cellFsFstat(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd      = (int)(uint32_t)ctx->gpr[3];
-@@ -699,2 +729,3 @@ static void cellFsReaddir(ppu_context* ctx)
+@@ -733,2 +759,3 @@ static void cellFsReaddir(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd          = (int)(uint32_t)ctx->gpr[3];
-@@ -724,2 +755,3 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
+@@ -759,2 +786,3 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
  {
 +    FS_LOCKED();
      const uint32_t fd = (uint32_t)ctx->gpr[3];
-@@ -773,2 +805,3 @@ static void cellFsClosedir(ppu_context* ctx)
+@@ -809,2 +837,3 @@ static void cellFsClosedir(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -817,2 +850,3 @@ static void cellFsFsync(ppu_context* ctx)
+@@ -859,2 +888,3 @@ static void cellFsFsync(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -911,2 +945,4 @@ static void cellFsAioRead(ppu_context* ctx)
+@@ -953,2 +983,4 @@ static void cellFsAioRead(ppu_context* ctx)
      int32_t err = CELL_FS_ENOENT;
 +    {
 +    FS_LOCKED();   /* the table, not the completion: the guest callback runs unlocked */
-     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
-@@ -930,2 +966,3 @@ static void cellFsAioRead(ppu_context* ctx)
+     if (FILE* f = fd_file(fd)) {
+@@ -971,2 +1003,3 @@ static void cellFsAioRead(ppu_context* ctx)
      }
 +    }
      if (getenv("PS3_FSLOG"))

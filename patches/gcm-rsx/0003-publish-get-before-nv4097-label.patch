@@ -1,6 +1,6 @@
 cellGcmSys: publish `get` before an NV4097 semaphore release, as for NV406E RELEASE.
 
-The pin's cellGcmSys (#401) publishes `get` past an NV406E SEMAPHORE_RELEASE before its label lands. The NV4097 back-end
+cellGcmSys (#401) publishes `get` past an NV406E SEMAPHORE_RELEASE before its label lands. The NV4097 back-end
 write (0x1D70) and texture-read (0x1D74) releases write their label inside rsx_process_method and still left `get` at
 the start of the pass. Resistance 3 waits on a label, snapshots `get` and spins until `put` equals it: with `get`
 still inside a command buffer the pass had called into, the snapshot never matched and its level start hung.
@@ -8,24 +8,42 @@ still inside a command buffer the pass had called into, the snapshot never match
 test_gcm_get_on_release now also drives one of each NV4097 release through the walker, with and without
 GCM_GET_EQ_PUT (the stub method handler records `get` when it is handed the method).
 
-Upstream: not proposed yet (a candidate: #401 covers NV406E only). Kept on top of upstream/pr466 (its method filter).
+The publish is in gcm_3d_method, which both the per-word walk and the 3D method-run fast path (#554) call.
 
+Upstream: not proposed yet (a candidate: #401 covers NV406E only).
 ---
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index f42486c..3d70d76 100644
+index 298ee7de..fd525d21 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -2323,2 +2323,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2001,6 +2001,12 @@ static int gcm_word_diag(void)
+ /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
+- * plus the methods whose answer the walker writes itself. */
+-static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
++ * plus the methods whose answer the walker writes itself. `end_off`: the IO
++ * offset just past the command the word belongs to. */
++static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live, u32 end_off)
+ {
+     extern u32 g_rsx_last_reference;
++    /* NV4097 back-end write / texture-read semaphore release: the label lands
++     * inside rsx_process_method, so publish `get` past the command first, as
++     * for NV406E RELEASE. */
++    if ((m == 0x1D70u || m == 0x1D74u) && !gcm_get_eq_put())
++        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, end_off);
+     /* #466: rsx_state feeds only the legacy vtable backend. With the draw
+@@ -2531,3 +2537,3 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method,
+-                                      vm_read32(dea + i * 4), legacy_state_live);
++                                      vm_read32(dea + i * 4), legacy_state_live, s_fifo_getoff + 4 + count * 4);
+                     s_fifo_getoff += 4 + count * 4;
+@@ -2684,3 +2690,3 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-+                    /* NV4097 back-end write / texture-read semaphore release: the label lands inside
-+                     * rsx_process_method, so publish `get` past the command first, as for NV406E
-+                     * RELEASE above. */
-+                    if (subch == 0 && (m == 0x1D70u || m == 0x1D74u) && !gcm_get_eq_put())
-+                        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
-                     if (legacy_state_live || gcm_legacy_method_has_effect(m))
+-                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
++                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live, s_fifo_getoff + 4 + count * 4);
+                 } else
 diff --git a/libs/video/tests/test_gcm_get_on_release.c b/libs/video/tests/test_gcm_get_on_release.c
-index 4503f69..7920eed 100644
+index 67094140..b762f68c 100644
 --- a/libs/video/tests/test_gcm_get_on_release.c
 +++ b/libs/video/tests/test_gcm_get_on_release.c
 @@ -45,3 +45,12 @@ void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why;
@@ -41,8 +59,8 @@ index 4503f69..7920eed 100644
 +        sema4097_get[sema4097_n++] = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
 +    return 0;
 +}
- int  rsx_draw_engine_enabled(void) { return 0; }
-@@ -137,2 +146,8 @@ int main(int argc, char** argv)
+ /* No microcode or constant runs here: the walker hands every word to
+@@ -141,2 +150,8 @@ int main(int argc, char** argv)
      io = put_probe(io, 3);
 +    /* NV4097 back-end write release, then texture-read release. */
 +    const u32 be_val = 0x33u, tex_val = 0x44u;
@@ -51,7 +69,7 @@ index 4503f69..7920eed 100644
 +    io = put_cmd(io, 0, 0x1D74u, 1, &tex_val);
 +    const u32 end_tex = io;
      const u32 put = io;
-@@ -156,2 +171,9 @@ int main(int argc, char** argv)
+@@ -160,2 +175,9 @@ int main(int argc, char** argv)
      }
 +    check(sema4097_n == 2, "the NV4097 semaphore releases reached the method handler");
 +    if (!eq_put) {

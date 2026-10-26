@@ -18,11 +18,10 @@ release on focus loss; build line in the file). test_pad_rumble stubs the new mo
 turning in the first level with the layout on.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9e468f3..29583a1 100644
+index c333473c..34461934 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -71,2 +71,4 @@ if(APPLE)
@@ -30,19 +29,19 @@ index 9e468f3..29583a1 100644
 +    # The pad's host mouse (pad_mouse.h), also Objective-C.
 +    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_mouse_macos.m")
  endif()
-@@ -175,2 +177,3 @@ if(APPLE)
+@@ -174,2 +176,3 @@ if(APPLE)
          "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
 +        "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_mouse_macos.m"
          PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index ed4e454..276d768 100644
+index 42b08e9a..eb2f83e2 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -21,2 +21,3 @@
+@@ -22,2 +22,3 @@
  #include "ps3emu/log_first.h"
 +#include "pad_mouse.h"
  
-@@ -182,2 +183,14 @@ static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0;
+@@ -240,2 +241,14 @@ static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0;
  #define PADKEY_V 'V'
 +#define PADKEY_D 'D'
 +#define PADKEY_E 'E'
@@ -57,7 +56,7 @@ index ed4e454..276d768 100644
 +#define PADKEY_SHIFT VK_LSHIFT
 +#define PADKEY_CTRL VK_LCONTROL
  #elif defined(__APPLE__)
-@@ -224,2 +237,14 @@ static int pad_key_down(int key)
+@@ -282,2 +295,14 @@ static int pad_key_down(int key)
  #define PADKEY_V 9
 +#define PADKEY_D 2
 +#define PADKEY_E 14
@@ -72,7 +71,7 @@ index ed4e454..276d768 100644
 +#define PADKEY_SHIFT 56
 +#define PADKEY_CTRL 59
  #elif PAD_BACKEND_SDL2
-@@ -256,2 +281,14 @@ static int pad_key_down(int key)
+@@ -314,2 +339,14 @@ static int pad_key_down(int key)
  #define PADKEY_V SDL_SCANCODE_V
 +#define PADKEY_D SDL_SCANCODE_D
 +#define PADKEY_E SDL_SCANCODE_E
@@ -87,7 +86,7 @@ index ed4e454..276d768 100644
 +#define PADKEY_SHIFT SDL_SCANCODE_LSHIFT
 +#define PADKEY_CTRL SDL_SCANCODE_LCTRL
  #endif
-@@ -259,2 +296,175 @@ static int pad_key_down(int key)
+@@ -317,2 +354,175 @@ static int pad_key_down(int key)
  #if defined(_WIN32) || defined(__APPLE__) || PAD_BACKEND_SDL2
 +#ifndef __APPLE__
 +/* TODO: a host mouse on Windows and the SDL hosts (pad_mouse.h); until then the
@@ -263,19 +262,19 @@ index ed4e454..276d768 100644
 +}
 +
  static void pad_poll_keyboard(void)
-@@ -265,2 +475,5 @@ static void pad_poll_keyboard(void)
+@@ -323,2 +533,5 @@ static void pad_poll_keyboard(void)
  
 +    static int fps = -1;
 +    if (fps < 0) { const char* e = getenv("PAD_KEYBOARD_LAYOUT"); fps = e && !strcmp(e, "fps"); }
 +
      PadHostState* hs = &s_host_state[0];
-@@ -269,3 +482,4 @@ static void pad_poll_keyboard(void)
+@@ -327,3 +540,4 @@ static void pad_poll_keyboard(void)
          /* Release everything on focus loss, or a key held while alt-tabbing
 -         * would stay down forever. */
 +         * would stay down forever. The mouse goes back to the desktop. */
 +        if (fps) { PadMouseInput m; pad_mouse_poll(0, &m); }
          hs->buttons = 0;
-@@ -277,2 +491,8 @@ static void pad_poll_keyboard(void)
+@@ -335,2 +549,8 @@ static void pad_poll_keyboard(void)
  
 +    u16 btns = 0;
 +    if (fps) {
@@ -284,16 +283,16 @@ index ed4e454..276d768 100644
 +    }
 +
      static const struct { int vk; u16 btn; } map[] = {
-@@ -288,3 +508,2 @@ static void pad_poll_keyboard(void)
+@@ -346,3 +566,2 @@ static void pad_poll_keyboard(void)
  
 -    u16 btns = 0;
      for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-@@ -292,4 +511,2 @@ static void pad_poll_keyboard(void)
+@@ -350,4 +569,2 @@ static void pad_poll_keyboard(void)
  
 -    hs->buttons   = btns;
 -    hs->connected = 1;
      hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-@@ -300,2 +517,5 @@ static void pad_poll_keyboard(void)
+@@ -358,2 +575,5 @@ static void pad_poll_keyboard(void)
      hs->analog_ry = (u8)(pad_key_down(PADKEY_I) ? 0 : pad_key_down(PADKEY_K) ? 255 : 128);
 +done:
 +    hs->buttons   = btns;
@@ -301,7 +300,7 @@ index ed4e454..276d768 100644
      hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
 diff --git a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
 new file mode 100644
-index 0000000..5029b9c
+index 00000000..5029b9c8
 --- /dev/null
 +++ b/libs/input/pad_mouse.h
 @@ -0,0 +1,39 @@
@@ -346,7 +345,7 @@ index 0000000..5029b9c
 +#endif /* PS3RECOMP_PAD_MOUSE_H */
 diff --git a/libs/input/pad_mouse_macos.m b/libs/input/pad_mouse_macos.m
 new file mode 100644
-index 0000000..ce81301
+index 00000000..ce813017
 --- /dev/null
 +++ b/libs/input/pad_mouse_macos.m
 @@ -0,0 +1,136 @@
@@ -486,9 +485,29 @@ index 0000000..ce81301
 +        out->buttons = 0;
 +    }
 +}
+diff --git a/libs/input/tests/test_pad_file_reports.c b/libs/input/tests/test_pad_file_reports.c
+index edc7f523..a63a7498 100644
+--- a/libs/input/tests/test_pad_file_reports.c
++++ b/libs/input/tests/test_pad_file_reports.c
+@@ -24,2 +24,5 @@ void spu_lockline_lock(void){}
+ void spu_lockline_unlock(void){}
++#ifdef __APPLE__
++void pad_mouse_poll(int capture, PadMouseInput* out) { (void)capture; memset(out, 0, sizeof *out); }   /* pad_mouse_macos.m */
++#endif
+ u32 cellGcm_flip_request_count(void){return 0;}
+diff --git a/libs/input/tests/test_pad_hotplug.c b/libs/input/tests/test_pad_hotplug.c
+index 6903c4cd..ced5b737 100644
+--- a/libs/input/tests/test_pad_hotplug.c
++++ b/libs/input/tests/test_pad_hotplug.c
+@@ -30,2 +30,5 @@ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
++#ifdef __APPLE__
++void pad_mouse_poll(int capture, PadMouseInput* out) { (void)capture; memset(out, 0, sizeof *out); }   /* pad_mouse_macos.m */
++#endif
+ 
 diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
 new file mode 100644
-index 0000000..5b5f340
+index 00000000..5b5f3405
 --- /dev/null
 +++ b/libs/input/tests/test_pad_keyboard_fps.c
 @@ -0,0 +1,166 @@
@@ -659,9 +678,19 @@ index 0000000..5b5f340
 +    return 0;
 +}
 diff --git a/libs/input/tests/test_pad_rumble.c b/libs/input/tests/test_pad_rumble.c
-index b5dec8a..85972a8 100644
+index b5dec8a6..85972a8f 100644
 --- a/libs/input/tests/test_pad_rumble.c
 +++ b/libs/input/tests/test_pad_rumble.c
+@@ -24,2 +24,5 @@ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
++#ifdef __APPLE__
++void pad_mouse_poll(int capture, PadMouseInput* out) { (void)capture; memset(out, 0, sizeof *out); }   /* pad_mouse_macos.m */
++#endif
+ 
+diff --git a/libs/input/tests/test_pad_sensor_mode.c b/libs/input/tests/test_pad_sensor_mode.c
+index 2889ff76..3fbeb587 100644
+--- a/libs/input/tests/test_pad_sensor_mode.c
++++ b/libs/input/tests/test_pad_sensor_mode.c
 @@ -24,2 +24,5 @@ void spu_lockline_lock(void) {}
  void spu_lockline_unlock(void) {}
 +#ifdef __APPLE__

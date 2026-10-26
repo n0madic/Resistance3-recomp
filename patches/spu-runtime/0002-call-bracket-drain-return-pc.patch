@@ -11,11 +11,10 @@ Each bracket now saves the outer value, sets its own before the call and restore
 fixture gains the direct-call case (it covered only the queued one), and a lifter self-check pins the emitted form.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/runtime/spu/tests/test_spu_interpreter_handoff.c b/runtime/spu/tests/test_spu_interpreter_handoff.c
-index aa13676..6c01dd5 100644
+index 8924a50d..73402ade 100644
 --- a/runtime/spu/tests/test_spu_interpreter_handoff.c
 +++ b/runtime/spu/tests/test_spu_interpreter_handoff.c
 @@ -43,2 +43,3 @@ static void nested_entry(spu_context* c) {
@@ -39,7 +38,7 @@ index aa13676..6c01dd5 100644
 +        entry = nested_entry; queued_call = strcmp(mode, "nested-return-direct") != 0;
          word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index 7cce85a..314afd1 100644
+index 35d8d428..4b334a01 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
 @@ -212,2 +212,16 @@ _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
@@ -59,7 +58,7 @@ index 7cce85a..314afd1 100644
 +
 +
  # Mnemonics that do NOT write the rt register (so we skip the post-trace).
-@@ -918,6 +932,10 @@ class SPULifter:
+@@ -928,6 +942,10 @@ class SPULifter:
                  # callee's own tail-chains so they don't grow the caller frame)
 -                # + image save/restore (adopt-on-serve cannot leak upward).
 +                # + image save/restore (adopt-on-serve cannot leak upward)
@@ -72,7 +71,7 @@ index 7cce85a..314afd1 100644
 +                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; "
 +                        f"{_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
              return f"{link} /* TODO spu: brsl unresolved target */;"
-@@ -984,5 +1002,6 @@ class SPULifter:
+@@ -995,5 +1013,6 @@ class SPULifter:
                      f"int32_t _si = (int32_t)ctx->image_id; "
 +                    f"{_drain_ret_open(addr + 4)}"
                      f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
@@ -81,17 +80,17 @@ index 7cce85a..314afd1 100644
 +                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
          # bisled: set link, branch to RA only if an external event is pending.
 diff --git a/tools/test_spu_interpreter_handoff.py b/tools/test_spu_interpreter_handoff.py
-index f7699b0..3d46d99 100644
+index 8d36febb..051468c2 100644
 --- a/tools/test_spu_interpreter_handoff.py
 +++ b/tools/test_spu_interpreter_handoff.py
 @@ -25,3 +25,3 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
      failed = []
 -    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-calls', 'stop-zero',
 +    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-return-direct', 'nested-calls', 'stop-zero',
-                  'nested-stop', 'stop-code', 'halt', 'smc', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
+                  'nested-stop', 'stop-code', 'halt', 'smc', 'smc-ldst', 'smc-ldst-diag', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
 diff --git a/tools/test_spu_lifter_call_bracket.py b/tools/test_spu_lifter_call_bracket.py
 new file mode 100644
-index 0000000..8708382
+index 00000000..8708382a
 --- /dev/null
 +++ b/tools/test_spu_lifter_call_bracket.py
 @@ -0,0 +1,49 @@

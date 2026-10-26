@@ -9,14 +9,13 @@ Test: scripted run (boot, Continue, gameplay): no [ch-block] lines without the v
 before.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index f9433e9..7d4b8cd 100644
+index 5fc50208..6eec987b 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1012,4 +1012,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+@@ -1183,4 +1183,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  
 -    { static unsigned long bn = 0; unsigned long n = ++bn;
 -      if (n <= 50 || (n % 512) == 0)

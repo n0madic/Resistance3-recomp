@@ -7,14 +7,13 @@ already print only with PS3_FSLOG; open now does too. Failed opens and FS_CALLER
 Test: scripted run (boot, Continue, gameplay): no "[fs] open" lines without PS3_FSLOG; with it the same lines as before.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index 430de13..da178b1 100644
+index 69e57773..898d8448 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -320,3 +320,3 @@ static void cellFsOpen(ppu_context* ctx)
+@@ -356,3 +356,3 @@ static void cellFsOpen(ppu_context* ctx)
            } }
 -      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
 +      else if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }

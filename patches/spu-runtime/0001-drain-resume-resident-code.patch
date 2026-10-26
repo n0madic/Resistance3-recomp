@@ -1,7 +1,7 @@
 SPU: the drain resume resolves through the resident code spans, like indirect dispatch and the interpreter rejoin.
 
 A registered code region that a DMA GET loaded owns its local-store span: inside it only that image's lift may run, and a
-miss there is interpreted. upstream/pr481 (with #419) makes spu_lifted_lookup and spu_indirect_branch resolve that way;
+miss there is interpreted. #481 (with #419) makes spu_lifted_lookup and spu_indirect_branch resolve that way;
 the drain's resume after a call bracket still looked up the overlay and then the context's own image, so it took the
 stale lift of the image underneath. Resistance 3's job dispatcher loads each job module at LS 0x100, over the policy
 module (igPm, 0xA00) that started it; a resume at a pc in 0xA00 found igPm's lift there, which went back to waiting for
@@ -9,20 +9,19 @@ a signal, and the job never completed. The resume now asks spu_lifted_lookup (wi
 
 Scripted run: boot, Continue, gameplay; jobs complete (no joblist hang).
 
-Upstream: not proposed yet (the drain-resume gap of PR #419/#481; tell upstream there). Kept on top of upstream/pr481.
-
+Upstream: not proposed yet (the drain-resume gap of PR #419/#481).
 ---
 
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index fc3cea1..1b2f2bc 100644
+index 49bc2b94..077a1b91 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
-@@ -397,2 +397,4 @@ typedef void (*spu_drain_fn)(spu_context*);
+@@ -538,2 +538,4 @@ typedef void (*spu_drain_fn)(spu_context*);
  extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 +/* The dispatch resolver (spu_channels.c, spu_interp.h): resident code spans first, then task, overlay, image. */
 +extern spu_drain_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
  
-@@ -452,4 +454,6 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+@@ -610,4 +612,6 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
              uint32_t pc = ctx->pc & SPU_LS_MASK;
 -            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
 -            if (!fn) fn = spu_lookup(pc, ctx->image_id);

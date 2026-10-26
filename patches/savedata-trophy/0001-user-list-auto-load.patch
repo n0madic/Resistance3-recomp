@@ -5,14 +5,13 @@ ninth and tenth slots of the caller's parameter save area. Resistance 3 loads it
 "Check Thread" at boot; unresolved, the title stayed on a black screen after the Insomniac logo.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
-index 286bf47..2705091 100644
+index 1fb1b120..c6d70e06 100644
 --- a/libs/system/cellSaveData.c
 +++ b/libs/system/cellSaveData.c
-@@ -1566,2 +1566,24 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
+@@ -1589,2 +1589,24 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
  
 +/* UserListAutoLoad is ListAutoLoad with userId inserted after version, which
 + * makes it the one ten-argument entry: errDialog is in r5, setList..funcFile in
@@ -37,7 +36,7 @@ index 286bf47..2705091 100644
 +}
 +
  void cellSaveData_register_ctx_handlers(void)
-@@ -1570,2 +1592,4 @@ void cellSaveData_register_ctx_handlers(void)
+@@ -1593,2 +1615,4 @@ void cellSaveData_register_ctx_handlers(void)
       * before the generic table. */
 +    ps3_hle_register_ctx(0x248BD1D8u, "cellSaveDataUserListAutoLoad",
 +                         hle_cellSaveDataUserListAutoLoad);

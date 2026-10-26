@@ -21,10 +21,10 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index 4ec4abd..1ee76a7 100644
+index 87535b3e..9dbb2299 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
-@@ -108,4 +108,9 @@ typedef struct rsx_be_render_state {
+@@ -116,4 +116,9 @@ typedef struct rsx_be_render_state {
   * least recently used one. Public so the eviction test can be exact about
 - * where the boundary is rather than assuming a number. */
 + * where the boundary is rather than assuming a number. A title whose frame
@@ -36,10 +36,10 @@ index 4ec4abd..1ee76a7 100644
 +#endif
  
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index 31ec760..cafdd40 100644
+index 163e5f3c..16e8dd9b 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
-@@ -2200,3 +2200,6 @@ static void release_surfaces(void)
+@@ -2485,3 +2485,6 @@ static void release_surfaces(void)
  
 -#define ENG_MAX_OBJECTS  4096
 +/* Textures share the table with targets, views and per-draw copies, and a
@@ -48,10 +48,10 @@ index 31ec760..cafdd40 100644
 +#define ENG_MAX_OBJECTS  (2048 + 2 * RSX_DRAW_ENGINE_TEXTURE_CACHE)
  #define ENG_MAX_PIPES    4096
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 4c811e4..2eee4ff 100644
+index 71d6c1fc..569817c7 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -709,2 +709,7 @@ static void test_mrt_set(void)
+@@ -710,2 +710,7 @@ static void test_mrt_set(void)
  
 +#ifdef RSX_TEST_EXPECT_TEXTURE_CACHE
 +_Static_assert(RSX_DRAW_ENGINE_TEXTURE_CACHE == RSX_TEST_EXPECT_TEXTURE_CACHE,
@@ -60,7 +60,7 @@ index 4c811e4..2eee4ff 100644
 +
  static void test_texture_cache(void)
 diff --git a/tools/test_rsx_immediate_vertices.py b/tools/test_rsx_immediate_vertices.py
-index 4722489..464259c 100644
+index 47224895..464259ce 100644
 --- a/tools/test_rsx_immediate_vertices.py
 +++ b/tools/test_rsx_immediate_vertices.py
 @@ -15,8 +15,12 @@ def main():

@@ -13,14 +13,13 @@ New test runtime/spu/tests/test_spu_thread_ls_dma.c (also run by the macOS and L
 test_mfc_resume_elements does not link spurs_policy.c: it stubs spu_thread_ls_peer (no peer).
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/.github/workflows/linux.yml b/.github/workflows/linux.yml
-index 01c0693..5c6a236 100644
+index 99c0b20c..0d73b40b 100644
 --- a/.github/workflows/linux.yml
 +++ b/.github/workflows/linux.yml
-@@ -484 +484,18 @@ jobs:
+@@ -573 +573,18 @@ jobs:
            /tmp/test_spurs_job_stack
 +
 +      # MFC transfers to the SPU thread local-store window (0xF0000000 +
@@ -40,10 +39,10 @@ index 01c0693..5c6a236 100644
 +            -lpthread -lm
 +          /tmp/test_spu_thread_ls_dma
 diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
-index aa4565e..219ded4 100644
+index aeb9e948..5eac3857 100644
 --- a/.github/workflows/macos.yml
 +++ b/.github/workflows/macos.yml
-@@ -517 +517,18 @@ jobs:
+@@ -647 +647,18 @@ jobs:
            /tmp/test_spurs_job_stack
 +
 +      # MFC transfers to the SPU thread local-store window (0xF0000000 +
@@ -63,10 +62,10 @@ index aa4565e..219ded4 100644
 +            -lpthread -lm
 +          /tmp/test_spu_thread_ls_dma
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index 19dd1d1..b2dd43a 100644
+index c5ccbec7..f18df065 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -427,2 +427,10 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
+@@ -474,2 +474,10 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
  
 +/* Effective-address window of the SPU thread group's local stores. */
 +#define SPU_THREAD_EA_BASE   0xF0000000u
@@ -78,10 +77,10 @@ index 19dd1d1..b2dd43a 100644
 +
  static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
-index 9820cc2..ad32c8e 100644
+index 8c4ccaa8..799df8f3 100644
 --- a/runtime/spu/spu_dma.h
 +++ b/runtime/spu/spu_dma.h
-@@ -414,2 +414,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+@@ -415,2 +415,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
  
 +    /* SPU thread local stores are mapped into the effective-address space at
 +     * 0xF0000000 + spu_num * 0x100000 (lv2 SYS_SPU_THREAD_BASE_LOW and
@@ -106,14 +105,14 @@ index 9820cc2..ad32c8e 100644
 +
      /* Reject transfers whose main-memory range is not committed guest memory,
 diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
-index 5d1c63d..dd1c089 100644
+index 905b3517..0004ec58 100644
 --- a/runtime/spu/spurs_policy.c
 +++ b/runtime/spu/spurs_policy.c
-@@ -53,2 +53,3 @@ static struct PmInstance {
+@@ -54,2 +54,3 @@ static struct PmInstance {
      struct PmSlot slots[16][6];
 +    spu_context* running[6];   /* context last entered on each SPU (spu_thread_ls_peer) */
  } s_pm_instances[SPURS_PM_INSTANCES];
-@@ -153,2 +154,25 @@ void spurs_policy_release_instance(uint32_t ea)
+@@ -154,2 +155,25 @@ void spurs_policy_release_instance(uint32_t ea)
  
 +/* The context whose local store SPU spu_num of self's SPURS instance holds:
 + * self when spu_num is self's own SPU, else the context that entered that SPU
@@ -139,7 +138,7 @@ index 5d1c63d..dd1c089 100644
 +}
 +
  int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
-@@ -289,2 +313,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+@@ -290,2 +314,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
  
 +    /* This context is now what runs on SPU spu_num: its local store is the
 +     * one that SPU's mapped-LS effective addresses reach. */
@@ -148,7 +147,7 @@ index 5d1c63d..dd1c089 100644
 +
      g_spurs_pm_polls  = 0;
 diff --git a/runtime/spu/tests/test_mfc_resume_elements.c b/runtime/spu/tests/test_mfc_resume_elements.c
-index 2a930b5..616db87 100644
+index 2a930b50..616db879 100644
 --- a/runtime/spu/tests/test_mfc_resume_elements.c
 +++ b/runtime/spu/tests/test_mfc_resume_elements.c
 @@ -30,2 +30,3 @@ void spu_coh_notify_write_except(uint32_t ea,const void* c) { (void)ea;(void)c;
@@ -157,7 +156,7 @@ index 2a930b5..616db87 100644
  void spu_lockline_unlock(void) {}
 diff --git a/runtime/spu/tests/test_spu_thread_ls_dma.c b/runtime/spu/tests/test_spu_thread_ls_dma.c
 new file mode 100644
-index 0000000..e56b4c1
+index 00000000..e56b4c1a
 --- /dev/null
 +++ b/runtime/spu/tests/test_spu_thread_ls_dma.c
 @@ -0,0 +1,108 @@

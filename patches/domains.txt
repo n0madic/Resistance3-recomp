@@ -15,4 +15,4 @@ metal               darwin
 #   SDL gamepad thread (hot-plug after start); Windows audio block pacing;
 #   MinGW GCC fixes in ppu_loader.cpp; optional LGPL-free ATRAC build; queue-ready WAIT_SIGNAL wake and taskset
 #   generations (spu_workload.c); GPU-kept resolves and whole-surface readback cache (perf, rsx_draw_engine.c);
-#   thread-priority-at-start ordering (sys_ppu_thread.c); offline NetStartDialog answer (cellNetCtl.c).
+#   (thread-priority-at-start ordering and the offline NetStartDialog answer are upstream since v0.18.0: #416, #503).

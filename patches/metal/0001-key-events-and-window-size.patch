@@ -1,0 +1,32 @@
+Metal backend: no system alert for key presses; PS3RECOMP_METAL_WINDOW sets the window's initial size.
+
+The pad polls the keyboard itself, so key events have no consumer: the window would answer each one with the system
+alert sound. The message pump drops key down/up events, after the Cmd+Q check upstream added (#544, ps3_host_quit).
+PS3RECOMP_METAL_WINDOW=<w>x<h> gives the window's initial content size in points (default: the game's size).
+
+Upstream: not proposed.
+---
+
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index ad8db0b5..30bf38bd 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -833,3 +833,10 @@ static int create_window_impl(const char* title)
+ 
++    /* PS3RECOMP_METAL_WINDOW=<w>x<h>: initial content size in points (default: the game's size). */
+     NSRect frame = NSMakeRect(0, 0, (CGFloat)s_width, (CGFloat)s_height);
++    {
++        unsigned ww = 0, wh = 0;
++        const char* ws = getenv("PS3RECOMP_METAL_WINDOW");
++        if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 90 && ww <= 16384 && wh <= 16384)
++            frame.size = NSMakeSize((CGFloat)ww, (CGFloat)wh);
++    }
+     s_window = [[NSWindow alloc]
+@@ -4684,2 +4691,7 @@ static int pump_messages_impl(void)
+             }
++            /* The pad reads the keyboard by polling, so key events have no consumer here: the window would
++             * answer each with the system alert sound. */
++            if ([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) {
++                continue;
++            }
+             [NSApp sendEvent:ev];

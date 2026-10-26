@@ -6,11 +6,10 @@ RegisterContext now writes the trophy file (the HLE's record of an installed set
 The registration test also builds again: cellSysutil.c defines g_ps3_guest_caller and calls two more hooks.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
-index d956e6d..eb577c3 100644
+index d956e6dd..eb577c36 100644
 --- a/libs/network/sceNpTrophy.c
 +++ b/libs/network/sceNpTrophy.c
 @@ -41,2 +41,5 @@
@@ -56,21 +55,22 @@ index d956e6d..eb577c3 100644
 +           context, (unsigned long long)required);
      return CELL_OK;
 diff --git a/libs/network/tests/test_trophy_registration.c b/libs/network/tests/test_trophy_registration.c
-index cdbee09..d9cd823 100644
+index cdbee09e..ea9356b5 100644
 --- a/libs/network/tests/test_trophy_registration.c
 +++ b/libs/network/tests/test_trophy_registration.c
-@@ -15,3 +15,4 @@ void spu_lockline_lock(void) {}
+@@ -15,3 +15,5 @@ void spu_lockline_lock(void) {}
  void spu_lockline_unlock(void) {}
 -ps3_guest_caller_fn g_ps3_guest_caller;
 +void cellMsgDialog_tick(void) {}
 +void np_psnr_pump(void) {}
++void ps3_np_eula_tick(void) {}   /* cellSysutil.c: the PSN terms check (#542) */
  static unsigned calls;
-@@ -35,2 +36,4 @@ int main(void)
+@@ -35,2 +37,4 @@ int main(void)
      assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
 +    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
 +    assert(vm_read64(0x208) == TROPHY_PACK_SIZE);
      assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == SCE_NP_TROPHY_ERROR_UNKNOWN);
-@@ -39,2 +42,5 @@ int main(void)
+@@ -39,2 +43,5 @@ int main(void)
      assert(calls == 1 && s_contexts[1].registered);
 +    /* Registration installed the set: nothing more to install. */
 +    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);

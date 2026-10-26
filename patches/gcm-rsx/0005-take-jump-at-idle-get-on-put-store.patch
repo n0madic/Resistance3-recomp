@@ -15,41 +15,42 @@ backend on the present thread. A put store made by the walker itself (the ring r
 tests/gcm_put_jump drives that injection through the walker with no backend: get is back at G as soon as put is
 stored, and the block's memory overwritten afterwards is never executed.
 
-The put word's store reaches cellGcm_on_put_store from vm_write32 (ppu_loader.cpp).
+The put word's store reaches cellGcm_on_put_store from vm_write32 (ppu_loader.cpp). Lifted PPU code stores inline
+(#573/#574, vm_write32_mm in the lifted header) and would never get there, so the inline store leaves that one word
+to vm_write32, as the inline load does with the ref-poll word next to it (tools/test_ppu_put_store_hook.py: fails
+without it). The lifted header changes, so the module is rebuilt.
 The two loader fixtures that link ppu_loader.cpp (test_ppu_entry_arguments, test_loaded_image_memory) stub it, as they
 stub the other subsystems the loader reaches.
 
-Upstream: not proposed yet. Kept on top of upstream/pr437 (both add code above the walker).
-
+Upstream: not proposed yet.
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index afe37e3..7b2fe6f 100644
+index 5fc01f22..edc8545c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -403,2 +403,4 @@ if(PS3RECOMP_BUILD_TESTS)
+@@ -405,2 +405,4 @@ if(PS3RECOMP_BUILD_TESTS)
          add_subdirectory(tests/gcm_reports)
 +        # ...and the JUMP at an idle get, taken on the put store.
 +        add_subdirectory(tests/gcm_put_jump)
      endif()
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index f06c888..5f9dd5c 100644
+index 60e7e7b2..b0a5d106 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1776,2 +1776,6 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
- 
+@@ -2016,2 +2016,5 @@ static void wprof_note_walker(void) {}
+ volatile unsigned long g_gcm_drain_tid;
 +/* Set on the thread running the walker: a put store it makes itself (the ring
 + * recycle) must not take the lock it already holds. */
 +static _Thread_local int t_in_fifo_walker;
-+
- void cellGcm_rsx_process_fifo(void)
-@@ -1780,3 +1784,5 @@ void cellGcm_rsx_process_fifo(void)
+ 
+@@ -2023,3 +2026,5 @@ void cellGcm_rsx_process_fifo(void)
      AcquireSRWLockExclusive(&s_gcm_fifo_lock);
 +    t_in_fifo_walker = 1;
      gcm_rsx_process_fifo_unlocked();
 +    t_in_fifo_walker = 0;
      ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
-@@ -1815,2 +1821,42 @@ static int gcm_get_eq_put(void)
+@@ -2123,2 +2128,42 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live, u3
   * RSX-thread profiles, so each is read once and cached, like the other knobs. */
 +/* JUMPs taken at once when put moves; a chain longer than this is left to the walker. */
 +#define GCM_PUT_STORE_JUMPS 8u
@@ -93,10 +94,10 @@ index f06c888..5f9dd5c 100644
 +
  static void gcm_rsx_process_fifo_unlocked(void)
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index f54150d..16213a4 100644
+index 9309f2d3..39987397 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
-@@ -1943,3 +1943,5 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
+@@ -2066,3 +2066,5 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         * are guest memory and the PPU reads most of them straight back. */
 -      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
 +      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4);
@@ -104,16 +105,16 @@ index f54150d..16213a4 100644
 +      if ((uint32_t)a == VM_HLE_INJECT_BASE + 0x2000u) { extern void cellGcm_on_put_store(uint32_t); cellGcm_on_put_store(_v); } } }
  void vm_write64(uint64_t a, uint64_t v) {
 diff --git a/runtime/ppu/tests/test_ppu_entry_arguments.cpp b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
-index 2cd75e0..30ed9be 100644
+index 627376d5..7132d3b4 100644
 --- a/runtime/ppu/tests/test_ppu_entry_arguments.cpp
 +++ b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
-@@ -19,2 +19,3 @@ void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
- void cellGcm_ref_on_poll(void) { std::abort(); }
+@@ -22,2 +22,3 @@ void cellGcm_ref_on_poll(void) { std::abort(); }
+ void ps3_stdio_init(void) {}
 +void cellGcm_on_put_store(uint32_t) { std::abort(); }
  HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
 diff --git a/tests/gcm_put_jump/CMakeLists.txt b/tests/gcm_put_jump/CMakeLists.txt
 new file mode 100644
-index 0000000..6ecf412
+index 00000000..6ecf4120
 --- /dev/null
 +++ b/tests/gcm_put_jump/CMakeLists.txt
 @@ -0,0 +1,26 @@
@@ -145,7 +146,7 @@ index 0000000..6ecf412
 +add_test(NAME gcm_put_jump COMMAND test_gcm_put_jump)
 diff --git a/tests/gcm_put_jump/main.c b/tests/gcm_put_jump/main.c
 new file mode 100644
-index 0000000..453f88e
+index 00000000..453f88ef
 --- /dev/null
 +++ b/tests/gcm_put_jump/main.c
 @@ -0,0 +1,149 @@
@@ -299,10 +300,102 @@ index 0000000..453f88e
 +    return g_fail ? 1 : 0;
 +}
 diff --git a/tests/test_loaded_image_memory.cpp b/tests/test_loaded_image_memory.cpp
-index a678053..bd21b92 100644
+index a678053b..bd21b92d 100644
 --- a/tests/test_loaded_image_memory.cpp
 +++ b/tests/test_loaded_image_memory.cpp
 @@ -18,2 +18,3 @@ void spu_lockline_unlock(void) { std::abort(); }
  void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
 +void cellGcm_on_put_store(uint32_t) { std::abort(); }
  HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index a657ba61..421df1c7 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -192,3 +192,4 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until
+  * they also turned away, the gcm ref-poll word, is only special to vm_read32,
+- * so only the 32-bit load still tests it. */
++ * so only the 32-bit load still tests it; the put word 8 bytes below it is
++ * only special to vm_write32, which tests that. */
+ typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
+@@ -280,3 +281,6 @@ static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
+     const uint32_t ea = (uint32_t)a;
+-    if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1)) {
++    /* The gcm control register's put word (8 bytes below the ref-poll word)
++     * goes through vm_write32: storing it hands the new commands to the
++     * walker's JUMP-at-get check (cellGcm_on_put_store). */
++    if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1) && __builtin_expect(ea != m->poll - 8u, 1)) {
+         const uint32_t be = __builtin_bswap32(v);
+diff --git a/tools/test_ppu_put_store_hook.py b/tools/test_ppu_put_store_hook.py
+new file mode 100644
+index 00000000..f595d7d3
+--- /dev/null
++++ b/tools/test_ppu_put_store_hook.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""Self-check: a lifted 32-bit store to the gcm put word leaves the inline path.
++
++Lifted guest stores are inline (vm_write32_mm in the lifted header) and skip
++vm_write32, whose hook hands a new put to cellGcm_on_put_store (the JUMP at the
++idle get is taken on the storing thread). The put word must still go through
++vm_write32; every other store in range stays inline.
++
++Run: python tools/test_ppu_put_store_hook.py
++"""
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from ppu_lifter import HEADER_PREAMBLE  # noqa: E402
++
++ROOT = Path(__file__).resolve().parent.parent
++TEST = r'''
++#include "lifted.h"
++#include <stdio.h>
++#include <stdlib.h>
++uint8_t* vm_base; int vm_inline_ok, vm_inline_st_ok; uint32_t ppu_vm_size, ppu_hle_inject_base;
++uint32_t g_barrier_sync_watch, g_null_sweep_hi; const unsigned char* g_spu_coh_bits;
++static uint8_t s_mem[0x200000];
++static unsigned s_slow_n; static uint32_t s_slow_ea, s_slow_v;
++void (vm_write32)(uint64_t a, uint32_t v) { s_slow_n++; s_slow_ea = (uint32_t)a; s_slow_v = v; }
++int main(void)
++{
++    vm_base = s_mem; ppu_vm_size = sizeof s_mem; vm_inline_ok = 1; vm_inline_st_ok = 1;
++    ppu_hle_inject_base = 0x100000u;
++    const uint32_t put = ppu_hle_inject_base + 0x2000u;
++    vm_write32(put + 4u, 0x1234u);
++    int ok = s_slow_n == 0 && s_mem[put + 7] == 0x34;
++    vm_write32(put, 0x5678u);
++    ok &= s_slow_n == 1 && s_slow_ea == put && s_slow_v == 0x5678u;
++    printf("%s\n", ok ? "ok" : "FAIL");
++    return ok ? 0 : 1;
++}
++'''
++
++
++def main() -> int:
++    cc = os.environ.get("CC") or shutil.which("clang") or shutil.which("cc")
++    with tempfile.TemporaryDirectory(prefix="ppu-put-store-") as tmp:
++        t = Path(tmp)
++        (t / "lifted.h").write_text(HEADER_PREAMBLE)
++        (t / "test.c").write_text(TEST)
++        inc = ["-I", str(ROOT / "include"), "-I", str(ROOT / "runtime/ppu"), "-I", str(ROOT / "runtime")]
++        r = subprocess.run([cc, "-std=gnu17", "-O1", "-w", *inc, str(t / "test.c"), "-o", str(t / "test"),
++                            "-Wl,-undefined,dynamic_lookup" if sys.platform == "darwin" else "-Wl,--unresolved-symbols=ignore-all"],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stderr)
++            return 1
++        r = subprocess.run([str(t / "test")], capture_output=True, text=True)
++        print(r.stdout.strip() or r.stderr.strip())
++        if r.returncode:
++            return 1
++    print("PASS: a lifted store to the gcm put word goes through vm_write32")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

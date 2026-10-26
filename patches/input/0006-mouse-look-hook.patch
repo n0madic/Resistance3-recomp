@@ -12,14 +12,13 @@ Test: libs/input/tests/test_pad_keyboard_fps.c test_mouse_look_hook (degrees and
 motion, declined -> stick, no hook). Scripted run: the host's hook turns the hero (host/r3_input.cpp).
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 2572ba5..7617caa 100644
+index 8c2973ca..1f9fa8f7 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -400,2 +400,18 @@ static void pad_mouse_curve_env(const char* name, PadStickCurve* c)
+@@ -458,2 +458,18 @@ static void pad_mouse_curve_env(const char* name, PadStickCurve* c)
  
 +/* A positive number from the environment, else `def`. */
 +static double pad_env_positive(const char* name, double def)
@@ -38,20 +37,20 @@ index 2572ba5..7617caa 100644
 +}
 +
  /* Mouse motion `dx`, `dy` (points) over `dt` seconds -> right stick. */
-@@ -405,3 +421,2 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+@@ -463,3 +479,2 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
      static PadStickCurve cx, cy;
 -    static double sens = 1.0;
      if (!init) {
-@@ -410,4 +425,2 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+@@ -468,4 +483,2 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
          pad_mouse_curve_env("PAD_MOUSE_CURVE_Y", &cy);
 -        const char* e = getenv("PAD_MOUSE_SENS");
 -        if (e && strtod(e, NULL) > 0) sens = strtod(e, NULL);
      }
-@@ -415,2 +428,3 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+@@ -473,2 +486,3 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
      if (dt > PAD_MOUSE_MAX_DT_S) dt = PAD_MOUSE_MAX_DT_S;
 +    const double sens = pad_mouse_sens();
      const double vx = dx * sens / dt, vy = dy * sens / dt;
-@@ -425,5 +439,23 @@ void cellPad_set_menu_query(int (*in_menu)(void)) { s_menu_query = in_menu; }
+@@ -483,5 +497,23 @@ void cellPad_set_menu_query(int (*in_menu)(void)) { s_menu_query = in_menu; }
  
 +static int (*s_mouse_look)(double yaw_deg, double pitch_deg);
 +void cellPad_set_mouse_look(int (*look)(double yaw_deg, double pitch_deg)) { s_mouse_look = look; }
@@ -77,16 +76,16 @@ index 2572ba5..7617caa 100644
 + * pad-shaped layout above. WASD = left stick, mouse = the view (see
 + * pad_mouse_view), left/right/middle button = R1/L1/R3, wheel = TRIANGLE,
   * Space = CROSS, C/Ctrl/Backspace = CIRCLE, E/R = SQUARE, Q = TRIANGLE,
-@@ -475,3 +507,3 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+@@ -533,3 +565,3 @@ static u16 pad_keyboard_fps(PadHostState* hs)
      const double now = pad_now_s();
 -    pad_mouse_stick(m.dx, m.dy, last_s ? now - last_s : PAD_MOUSE_MAX_DT_S, &hs->analog_rx, &hs->analog_ry);
 +    pad_mouse_view(&m, last_s ? now - last_s : PAD_MOUSE_MAX_DT_S, hs);
      last_s = now;
 diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
-index 42761fc..2cec2c7 100644
+index fd592eba..3abe24b9 100644
 --- a/libs/input/cellPad.h
 +++ b/libs/input/cellPad.h
-@@ -207,2 +207,9 @@ void cellPad_set_menu_query(int (*in_menu)(void));
+@@ -209,2 +209,9 @@ void cellPad_set_menu_query(int (*in_menu)(void));
  
 +/* Host hook for the shooter layout: turns the title's view straight by the mouse's motion, so the turn is not capped
 + * at the stick's top rate. `yaw_deg` > 0 turns right, `pitch_deg` > 0 looks up: the motion times PAD_MOUSE_SENS,
@@ -97,7 +96,7 @@ index 42761fc..2cec2c7 100644
 +
  #ifdef __cplusplus
 diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
-index 4448758..1f179d8 100644
+index 4448758c..1f179d84 100644
 --- a/libs/input/tests/test_pad_keyboard_fps.c
 +++ b/libs/input/tests/test_pad_keyboard_fps.c
 @@ -2,3 +2,4 @@

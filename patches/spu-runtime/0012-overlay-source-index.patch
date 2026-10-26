@@ -14,25 +14,59 @@ the game's source mix: 72 -> 7.5 ns per GET.
 In the game (`sample`, 25 s of the Haven firefight, 2 runs each): spu_overlay_note_get 627/904 of ~11.7k SPU
 samples (5.3-7.8%) -> 107/87 of ~12.4k (0.7-0.9%); the runtime's share of the SPU threads 23-27% -> 19-20%.
 
+#455 (v0.18.0) skips the scan for a GET under 512 bytes whose EA no source has; the index covers every GET and
+match_sig and takes its place. Like #455 it allows registration while the SPUs run: an entry is linked with a
+release store after its fields are written, and the lookups acquire-load the links (#455's
+test_overlay_source_prefilter, which registers while three threads look up, passes).
+
 Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 2647dc1..6d2b7de 100644
+index 2494eb19..3495c8f0 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1672,3 +1672,3 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+@@ -1862,3 +1862,3 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
                   uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
 -                 int pic; } spu_ovl_src;
 +                 int pic; int next; } spu_ovl_src;   /* next: the next source in its hash bucket (index + 1) */
  /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
-@@ -1684,2 +1684,21 @@ static int s_ovl_src_count = 0;
+@@ -1874,39 +1874,24 @@ static int s_ovl_src_count = 0;
  
+-/* Every MFC GET is checked against the registered sources, and a job that
+- * streams its data in small pieces issues thousands of GETs a frame against
+- * up to SPU_OVL_SRC_MAX sources. A GET under 512 bytes can only match a
+- * source by EA (signature entries need >= 512 bytes), so keep every
+- * registered source EA in an insert-only open-addressed set and skip the
+- * scan for a small GET whose EA was never registered.
+- *
+- * The set is a superset of the EA-keyed entries the scan can see: it has
+- * four times as many slots as there can be sources (so an insert always
+- * finds a slot, and a probe always reaches an empty one), nothing is ever
+- * removed, and an EA is inserted before the source count that publishes its
+- * entry is release-stored. spu_overlay_note_get acquire-loads the count
+- * before probing, so any entry the scan would visit is already in the set. */
+-#define SPU_OVL_EA_SET 512u
+-static uint32_t s_ovl_ea_set[SPU_OVL_EA_SET];
+-static uint8_t s_ovl_ea_used[SPU_OVL_EA_SET];
+-static unsigned spu_ovl_ea_slot(uint32_t ea) { return (ea * 0x9E3779B1u) >> 23; }
+-static void spu_ovl_ea_add(uint32_t ea)
+-{
+-    for (unsigned i = spu_ovl_ea_slot(ea), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+-        if (__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) {
+-            if (s_ovl_ea_set[i] == ea) return;
+-            continue;
+-        }
+-        s_ovl_ea_set[i] = ea;
+-        __atomic_store_n(&s_ovl_ea_used[i], 1, __ATOMIC_RELEASE);
+-        return;
+-    }
 +/* Every DMA GET asks which source it loaded (spu_overlay_note_get), and most GETs are data that
 + * match none: a scan of the table was ~6% of the SPU threads' time in a Resistance 3 firefight
 + * (~220 sources). The sources are hashed by EA, the signature ones by their 16 bytes; each bucket
 + * keeps registration order, and a lookup merges the two candidate chains in that order, so the
-+ * first source that matches is the one the scan found. The table is filled before the SPUs run. */
++ * first source that matches is the one the scan found. This covers every GET size, so it also
++ * replaces the small-GET EA filter that stood here (it skipped only GETs under 512 bytes). */
 +#define SPU_OVL_HASH_BITS 10
 +static int s_ovl_ea_head[1u << SPU_OVL_HASH_BITS], s_ovl_sig_head[1u << SPU_OVL_HASH_BITS];   /* index + 1 */
 +static unsigned spu_ovl_hash_ea(uint32_t ea) { return (ea * 0x9E3779B1u) >> (32 - SPU_OVL_HASH_BITS); }
@@ -40,51 +74,66 @@ index 2647dc1..6d2b7de 100644
 +{
 +    uint64_t a, b; memcpy(&a, sig, 8); memcpy(&b, sig + 8, 8);
 +    return (unsigned)(((a ^ b * 0x9E3779B97F4A7C15ull) * 0x9E3779B97F4A7C15ull) >> (64 - SPU_OVL_HASH_BITS));
-+}
+ }
+-static int spu_ovl_ea_known(uint32_t ea)
++/* A source may register while SPU threads look sources up: its fields are written before
++ * the release-store that links it, and the lookups acquire-load every link. */
 +static void spu_ovl_link(int* head, int index)
-+{
+ {
+-    for (unsigned i = spu_ovl_ea_slot(ea), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+-        if (!__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) return 0;
+-        if (s_ovl_ea_set[i] == ea) return 1;
+-    }
+-    return 1;   /* full (cannot happen): never filter */
 +    while (*head) head = &s_ovl_src[*head - 1].next;
-+    *head = index + 1;
-+}
-+
- void spu_overlay_register_source(uint32_t content_ea, int image_id)
-@@ -1690,2 +1709,3 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
++    __atomic_store_n(head, index + 1, __ATOMIC_RELEASE);
+ }
++static inline int spu_ovl_next(const int* link) { return __atomic_load_n(link, __ATOMIC_ACQUIRE); }
+ 
+@@ -1915,3 +1900,2 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
+     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
+-        spu_ovl_ea_add(content_ea);
+         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
+@@ -1919,2 +1903,3 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
          s_ovl_src[s_ovl_src_count].has_sig = 0;
 +        spu_ovl_link(&s_ovl_ea_head[spu_ovl_hash_ea(content_ea)], s_ovl_src_count);
-         s_ovl_src_count++;
-@@ -1874,2 +1894,3 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
+         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
+@@ -2130,2 +2115,3 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
          s_ovl_src[s_ovl_src_count].has_sig = 1;
 +        spu_ovl_link(&s_ovl_sig_head[spu_ovl_hash_sig(sig)], s_ovl_src_count);
          s_ovl_src_count++;
-@@ -1989,6 +2010,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2245,8 +2231,10 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      }
--    for (int i = 0; i < s_ovl_src_count; i++) {
-+    int e = s_ovl_ea_head[spu_ovl_hash_ea(ea)], g = size >= 512 ? s_ovl_sig_head[spu_ovl_hash_sig(ls)] : 0;
+-    int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+-    if (size < 512 && !spu_ovl_ea_known(ea)) return;
+-    for (int i = 0; i < nsrc; i++) {
++    int e = spu_ovl_next(&s_ovl_ea_head[spu_ovl_hash_ea(ea)]),
++        g = size >= 512 ? spu_ovl_next(&s_ovl_sig_head[spu_ovl_hash_sig(ls)]) : 0;
 +    while (e || g) {
 +        int i;                                             /* the lower index first: table order */
-+        if (e && (!g || e < g)) { i = e - 1; e = s_ovl_src[i].next; }
-+        else                    { i = g - 1; g = s_ovl_src[i].next; }
++        if (e && (!g || e < g)) { i = e - 1; e = spu_ovl_next(&s_ovl_src[i].next); }
++        else                    { i = g - 1; g = spu_ovl_next(&s_ovl_src[i].next); }
          const spu_ovl_src* o = &s_ovl_src[i];
 -        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
 -                             : (o->src_ea == ea);
 +        int hit = o->has_sig ? memcmp(ls, o->sig, 16) == 0 : o->src_ea == ea;
          if (hit) {
-@@ -2035,7 +2059,5 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
+@@ -2293,7 +2281,5 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
  {
 -    for (int i = 0; i < s_ovl_src_count; i++) {
 -        const spu_ovl_src* o = &s_ovl_src[i];
 -        if (o->has_sig && memcmp(hdr, o->sig, 16) == 0)
 -            return o->image_id;
 -    }
-+    for (int g = s_ovl_sig_head[spu_ovl_hash_sig(hdr)]; g; g = s_ovl_src[g - 1].next)
++    for (int g = spu_ovl_next(&s_ovl_sig_head[spu_ovl_hash_sig(hdr)]); g; g = spu_ovl_next(&s_ovl_src[g - 1].next))
 +        if (memcmp(hdr, s_ovl_src[g - 1].sig, 16) == 0)
 +            return s_ovl_src[g - 1].image_id;
      return 0;
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
-index 2944662..9538ebd 100644
+index 93742f79..69932235 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
 +++ b/runtime/spu/tests/test_spu_lifted_start.c
-@@ -660,2 +660,58 @@ static void test_verified_resident_code_regions(void)
+@@ -693,2 +693,58 @@ static void test_registry_lookup_memo(void)
  
 +/* Sources are found by EA or signature through hash buckets, in registration
 + * order: the first source that matches a GET takes it, as the scan of the
@@ -118,7 +167,7 @@ index 2944662..9538ebd 100644
 +    check(resident_image_at(ctx, 0x16000) == 112, "of two sources with one EA the first takes the load");
 +
 +    uint8_t s1[16], s2[16];
-+    for (unsigned i = 0; i < 16; ++i) { s1[i] = (uint8_t)(0xA0 + i); s2[i] = (uint8_t)(0xC0 + i); }
++    for (unsigned i = 0; i < 16; ++i) { s1[i] = (uint8_t)(0x50 + i); s2[i] = (uint8_t)(0xC0 + i); }
 +    spu_overlay_register_sig(s1, 114);
 +    spu_overlay_register_region(0xCA0000, 0x400, 115);
 +    memcpy(ctx->ls + 0x18000, s1, 16);
@@ -143,7 +192,7 @@ index 2944662..9538ebd 100644
 +}
 +
  /* Streamed code owns an LS interval even when its registry has a hole.
-@@ -1145,2 +1201,3 @@ int main(void)
+@@ -1257,2 +1313,3 @@ int main(void)
      test_many_resident_code_regions();
 +    test_overlay_source_order();
      test_resident_code_holes();

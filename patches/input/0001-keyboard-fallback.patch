@@ -7,22 +7,21 @@ through the Objective-C runtime so the file stays plain C), SDL scancodes on Lin
 the keyboard code so the keyboard compiles without XInput.
 
 Upstream: not proposed.
-
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 04ab80c..ba0c65e 100644
+index 250d8d2c..c333473c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -171,2 +171,3 @@ if(APPLE)
+@@ -170,2 +170,3 @@ if(APPLE)
          "-framework AppKit"
 +        "-framework ApplicationServices"
      )
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 85b05f8..10634e8 100644
+index afdd93de..5d186120 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -134,29 +134,2 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
+@@ -193,62 +193,2 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
  
 -/* ---------------------------------------------------------------------------
 - * XInput backend
@@ -33,6 +32,39 @@ index 85b05f8..10634e8 100644
 -/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
 -#define PAD_STICK_DEADZONE  7849
 -#define PAD_TRIGGER_THRESHOLD 30
+-
+-/* XInput is resolved at run time. Only XInputGetState and XInputSetState are
+- * called, and XInput9_1_0.dll exports both, so any of the three DLLs serves.
+- * Loaded once, from System32 only (not the exe folder, the working directory
+- * or PATH), and kept loaded until exit. No DLL, or one without the two entry
+- * points, means every slot reads as unplugged. */
+-typedef DWORD (WINAPI *pad_xi_get_state_fn)(DWORD, XINPUT_STATE*);
+-typedef DWORD (WINAPI *pad_xi_set_state_fn)(DWORD, XINPUT_VIBRATION*);
+-static pad_xi_get_state_fn p_xi_get_state;
+-static pad_xi_set_state_fn p_xi_set_state;
+-static int s_xi_tried;
+-
+-static int pad_xinput_load(void)
+-{
+-    static const wchar_t* const names[] = { L"XInput1_4.dll", L"XInput1_3.dll", L"XInput9_1_0.dll" };
+-    if (s_xi_tried) return p_xi_get_state != NULL;
+-    s_xi_tried = 1;
+-    for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
+-        HMODULE m = LoadLibraryExW(names[k], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+-        pad_xi_get_state_fn g;
+-        pad_xi_set_state_fn st;
+-        if (!m) continue;
+-        g  = (pad_xi_get_state_fn)(void (*)(void))GetProcAddress(m, "XInputGetState");
+-        st = (pad_xi_set_state_fn)(void (*)(void))GetProcAddress(m, "XInputSetState");
+-        if (!g || !st) { FreeLibrary(m); continue; }
+-        p_xi_get_state = g;
+-        p_xi_set_state = st;
+-        printf("[cellPad] XInput from %ls\n", names[k]);
+-        return 1;
+-    }
+-    printf("[cellPad] no XInput DLL (XInput1_4, XInput1_3, XInput9_1_0): no XInput pads\n");
+-    return 0;
+-}
 -
 -static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
 -{
@@ -52,7 +84,7 @@ index 85b05f8..10634e8 100644
 -}
 -
  /* Keyboard fallback for port 0.
-@@ -186,3 +159,82 @@ static int pad_host_window_focused(void)
+@@ -278,3 +218,82 @@ static int pad_host_window_focused(void)
  }
 +static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
 +#define PADKEY_UP VK_UP
@@ -135,11 +167,11 @@ index 85b05f8..10634e8 100644
  
 +#if defined(_WIN32) || defined(__APPLE__) || PAD_BACKEND_SDL2
  static void pad_poll_keyboard(void)
-@@ -194,2 +246,3 @@ static void pad_poll_keyboard(void)
+@@ -286,2 +305,3 @@ static void pad_poll_keyboard(void)
      PadHostState* hs = &s_host_state[0];
 +
      if (!pad_host_window_focused()) {
-@@ -205,9 +258,9 @@ static void pad_poll_keyboard(void)
+@@ -297,9 +317,9 @@ static void pad_poll_keyboard(void)
      static const struct { int vk; u16 btn; } map[] = {
 -        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
 -        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
@@ -156,12 +188,12 @@ index 85b05f8..10634e8 100644
 +        { PADKEY_1,      CELL_PAD_CTRL_L2 },      { PADKEY_2,     CELL_PAD_CTRL_R2 },
 +        { PADKEY_RETURN, CELL_PAD_CTRL_START },   { PADKEY_TAB,   CELL_PAD_CTRL_SELECT },
      };
-@@ -216,3 +269,3 @@ static void pad_poll_keyboard(void)
+@@ -308,3 +328,3 @@ static void pad_poll_keyboard(void)
      for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
 -        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
 +        if (pad_key_down(map[i].vk)) btns |= map[i].btn;
  
-@@ -235,2 +288,30 @@ static void pad_poll_keyboard(void)
+@@ -327,2 +347,63 @@ static void pad_poll_keyboard(void)
  
 +/* ---------------------------------------------------------------------------
 + * XInput backend
@@ -172,6 +204,39 @@ index 85b05f8..10634e8 100644
 +/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
 +#define PAD_STICK_DEADZONE  7849
 +#define PAD_TRIGGER_THRESHOLD 30
++
++/* XInput is resolved at run time. Only XInputGetState and XInputSetState are
++ * called, and XInput9_1_0.dll exports both, so any of the three DLLs serves.
++ * Loaded once, from System32 only (not the exe folder, the working directory
++ * or PATH), and kept loaded until exit. No DLL, or one without the two entry
++ * points, means every slot reads as unplugged. */
++typedef DWORD (WINAPI *pad_xi_get_state_fn)(DWORD, XINPUT_STATE*);
++typedef DWORD (WINAPI *pad_xi_set_state_fn)(DWORD, XINPUT_VIBRATION*);
++static pad_xi_get_state_fn p_xi_get_state;
++static pad_xi_set_state_fn p_xi_set_state;
++static int s_xi_tried;
++
++static int pad_xinput_load(void)
++{
++    static const wchar_t* const names[] = { L"XInput1_4.dll", L"XInput1_3.dll", L"XInput9_1_0.dll" };
++    if (s_xi_tried) return p_xi_get_state != NULL;
++    s_xi_tried = 1;
++    for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
++        HMODULE m = LoadLibraryExW(names[k], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++        pad_xi_get_state_fn g;
++        pad_xi_set_state_fn st;
++        if (!m) continue;
++        g  = (pad_xi_get_state_fn)(void (*)(void))GetProcAddress(m, "XInputGetState");
++        st = (pad_xi_set_state_fn)(void (*)(void))GetProcAddress(m, "XInputSetState");
++        if (!g || !st) { FreeLibrary(m); continue; }
++        p_xi_get_state = g;
++        p_xi_set_state = st;
++        printf("[cellPad] XInput from %ls\n", names[k]);
++        return 1;
++    }
++    printf("[cellPad] no XInput DLL (XInput1_4, XInput1_3, XInput9_1_0): no XInput pads\n");
++    return 0;
++}
 +
 +static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
 +{
@@ -191,8 +256,8 @@ index 85b05f8..10634e8 100644
 +}
 +
 +
- static void pad_poll_xinput(void)
-@@ -504,3 +585,3 @@ static void pad_poll_backend(void)
+ /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
+@@ -712,3 +793,3 @@ static void pad_poll_backend(void)
  #endif
 -#ifdef _WIN32
 +#if defined(_WIN32) || defined(__APPLE__) || PAD_BACKEND_SDL2

@@ -22,18 +22,17 @@ goes to the hook with no readback; a linear read of it does not; a refusing back
 user: walking up to the table and turning, the lamp's light stays.
 
 Upstream: not proposed yet.
-
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index eb5a28c..44e03e7 100644
+index a276b85e..0784e21b 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -121,2 +121,3 @@ typedef struct {
+@@ -128,2 +128,3 @@ typedef struct {
      u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
 +    int swizzled;          /* that write went through a swizzled surface     */
      u32 used_w, used_h;    /* the clip that write went through              */
-@@ -1061,5 +1062,11 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+@@ -1114,5 +1115,11 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
      if (s_depth_via_guest || !g.be->depth_as_color || !g.be->surface_view ||
 -        !z->handle || !(bytes || d16) || !(t->format & RSX_TEX_FMT_LINEAR) ||
 -        t->cubemap || t->dimension == 3 || t->mipmaps > 1)
@@ -47,12 +46,12 @@ index eb5a28c..44e03e7 100644
 +    const int linear = (t->format & RSX_TEX_FMT_LINEAR) != 0;
 +    if (linear == z->swizzled) return 0;
      const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
-@@ -1067,3 +1074,3 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+@@ -1120,3 +1127,3 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
      if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
 -        t->pitch != z->pitch)
 +        (linear && t->pitch != z->pitch))
          return 0;
-@@ -1463,3 +1470,13 @@ static int eng_zdepth_to_guest(u32 slot)
+@@ -1566,3 +1573,13 @@ static int eng_zdepth_to_guest(u32 slot)
      const u32 h = z->used_h < z->h ? z->used_h : z->h;
 -    if (!w || !h || z->pitch < w * bpp) return 0;
 +    /* A swizzled zeta is Morton-ordered over its power-of-two size and has no
@@ -67,7 +66,7 @@ index eb5a28c..44e03e7 100644
 +        return 0;
 +    }
      if (s_depth_cap < w * h) {
-@@ -1474,7 +1491,17 @@ static int eng_zdepth_to_guest(u32 slot)
+@@ -1577,12 +1594,24 @@ static int eng_zdepth_to_guest(u32 slot)
          return 0;
 +    u8* image = NULL;
 +    if (z->swizzled) {
@@ -77,21 +76,17 @@ index eb5a28c..44e03e7 100644
      for (u32 r = 0; r < h; r++) {
 -        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
 -        if (!dst) return 0;
-+        u8* row = image;
+-        eng_depth_row_to_guest(dst, s_depth_rows + (size_t)r * w, w, bpp);
++        const float* src = s_depth_rows + (size_t)r * w;
 +        if (!image) {
-+            row = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
-+            if (!row) return 0;
++            u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
++            if (!dst) return 0;
++            eng_depth_row_to_guest(dst, src, w, bpp);
++            continue;
 +        }
-         const float* src = s_depth_rows + (size_t)r * w;
-         for (u32 c = 0; c < w; c++) {
-+            u8* dst = image ? image + rsx_swizzle_offset(c, r, log2w, log2h) * bpp
-+                            : row + c * bpp;
-             float d = src[c];
-@@ -1494,3 +1521,2 @@ static int eng_zdepth_to_guest(u32 slot)
-             }
--            dst += bpp;
-         }
-@@ -1498,6 +1524,7 @@ static int eng_zdepth_to_guest(u32 slot)
++        for (u32 c = 0; c < w; c++)
++            eng_depth_row_to_guest(image + rsx_swizzle_offset(c, r, log2w, log2h) * bpp, src + c, 1, bpp);
+     }
      z->guest_dirty = 0;
 -    eng_textures_touch(z->location, z->offset, z->pitch * h);
 +    eng_textures_touch(z->location, z->offset, image ? w * h * bpp : z->pitch * h);
@@ -102,25 +97,25 @@ index eb5a28c..44e03e7 100644
 +                z->offset, bpp == 2u ? "Z16" : "Z24S8", z->swizzled ? "swizzled, pitch reg" : "pitch",
 +                z->pitch, w, h);
      return 1;
-@@ -1514,2 +1541,3 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+@@ -1599,2 +1628,3 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
      z->pitch = sf->zeta_pitch;
 +    z->swizzled = sf->raster_type == 2u;
      z->used_w = sf->clip_w ? sf->clip_w : g.width;
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 5940211..64e882b 100644
+index f1bb0a53..e7957b3d 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -302,2 +302,3 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
+@@ -303,2 +303,3 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
  static float g_readback_depth = 0.5f;
 +static int g_readback_ramp;     /* texel (c, r) reads back as (r * w + c) / 0xFFFF */
  static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
-@@ -309,3 +310,4 @@ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
+@@ -310,3 +311,4 @@ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
          for (u32 c = 0; c < w; c++)
 -            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) = g_readback_depth;
 +            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) =
 +                g_readback_ramp ? (float)((double)(r * w + c) / 65535.0) : g_readback_depth;
      return 0;
-@@ -1805,2 +1807,70 @@ static void test_z16_read_as_depth16_on_gpu(void)
+@@ -1970,2 +1972,70 @@ static void test_z16_read_as_depth16_on_gpu(void)
  
 +/* Resistance 3 renders a lamp's shadow map into a swizzled power-of-two Z16
 + * surface (zeta pitch register 64) once the camera is close to the lamp, and
@@ -191,7 +186,7 @@ index 5940211..64e882b 100644
 +}
 +
  /* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
-@@ -2136,2 +2206,3 @@ int main(void)
+@@ -2498,2 +2568,3 @@ int main(void)
      test_z16_read_as_depth16_on_gpu();
 +    test_swizzled_z16_read_as_depth16();
      test_full_tables_evict_the_oldest();
