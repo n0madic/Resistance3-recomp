@@ -1,0 +1,149 @@
+SPU: a DMA GET finds its overlay source through a hash of EA and signature instead of a scan of the table.
+
+spu_overlay_note_get runs on every MFC GET and compared the transfer with every registered overlay source.
+Resistance 3 registers ~220 (215 Insomniac job modules by EA, 3 WWS job modules by signature), and most GETs are
+data that match none: the scan was ~6% of the SPU threads' time in a firefight (`sample`). The sources are now
+hashed by EA and, for the signature ones, by their 16 bytes; each bucket keeps registration order and a lookup
+merges the EA and signature candidates in that order, so the source that takes a GET is the one the scan
+found first. spu_overlay_match_sig uses the signature buckets too. Registration happens before the SPUs run.
+
+Test: runtime/spu/tests/test_spu_lifted_start.c, test_overlay_source_order (two sources on one EA, one lifted
+for another load address; a signature and an EA source in either order; the 512-byte rule for signatures;
+match_sig), 178 checks, the same with the old scan; taking EA candidates first fails two. Micro-benchmark with
+the game's source mix: 72 -> 7.5 ns per GET.
+In the game (`sample`, 25 s of the Haven firefight, 2 runs each): spu_overlay_note_get 627/904 of ~11.7k SPU
+samples (5.3-7.8%) -> 107/87 of ~12.4k (0.7-0.9%); the runtime's share of the SPU threads 23-27% -> 19-20%.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 2647dc1..6d2b7de 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1672,3 +1672,3 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+                  uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
+-                 int pic; } spu_ovl_src;
++                 int pic; int next; } spu_ovl_src;   /* next: the next source in its hash bucket (index + 1) */
+ /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
+@@ -1684,2 +1684,21 @@ static int s_ovl_src_count = 0;
+ 
++/* Every DMA GET asks which source it loaded (spu_overlay_note_get), and most GETs are data that
++ * match none: a scan of the table was ~6% of the SPU threads' time in a Resistance 3 firefight
++ * (~220 sources). The sources are hashed by EA, the signature ones by their 16 bytes; each bucket
++ * keeps registration order, and a lookup merges the two candidate chains in that order, so the
++ * first source that matches is the one the scan found. The table is filled before the SPUs run. */
++#define SPU_OVL_HASH_BITS 10
++static int s_ovl_ea_head[1u << SPU_OVL_HASH_BITS], s_ovl_sig_head[1u << SPU_OVL_HASH_BITS];   /* index + 1 */
++static unsigned spu_ovl_hash_ea(uint32_t ea) { return (ea * 0x9E3779B1u) >> (32 - SPU_OVL_HASH_BITS); }
++static unsigned spu_ovl_hash_sig(const uint8_t sig[16])
++{
++    uint64_t a, b; memcpy(&a, sig, 8); memcpy(&b, sig + 8, 8);
++    return (unsigned)(((a ^ b * 0x9E3779B97F4A7C15ull) * 0x9E3779B97F4A7C15ull) >> (64 - SPU_OVL_HASH_BITS));
++}
++static void spu_ovl_link(int* head, int index)
++{
++    while (*head) head = &s_ovl_src[*head - 1].next;
++    *head = index + 1;
++}
++
+ void spu_overlay_register_source(uint32_t content_ea, int image_id)
+@@ -1690,2 +1709,3 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
+         s_ovl_src[s_ovl_src_count].has_sig = 0;
++        spu_ovl_link(&s_ovl_ea_head[spu_ovl_hash_ea(content_ea)], s_ovl_src_count);
+         s_ovl_src_count++;
+@@ -1874,2 +1894,3 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
+         s_ovl_src[s_ovl_src_count].has_sig = 1;
++        spu_ovl_link(&s_ovl_sig_head[spu_ovl_hash_sig(sig)], s_ovl_src_count);
+         s_ovl_src_count++;
+@@ -1989,6 +2010,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+     }
+-    for (int i = 0; i < s_ovl_src_count; i++) {
++    int e = s_ovl_ea_head[spu_ovl_hash_ea(ea)], g = size >= 512 ? s_ovl_sig_head[spu_ovl_hash_sig(ls)] : 0;
++    while (e || g) {
++        int i;                                             /* the lower index first: table order */
++        if (e && (!g || e < g)) { i = e - 1; e = s_ovl_src[i].next; }
++        else                    { i = g - 1; g = s_ovl_src[i].next; }
+         const spu_ovl_src* o = &s_ovl_src[i];
+-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+-                             : (o->src_ea == ea);
++        int hit = o->has_sig ? memcmp(ls, o->sig, 16) == 0 : o->src_ea == ea;
+         if (hit) {
+@@ -2035,7 +2059,5 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
+ {
+-    for (int i = 0; i < s_ovl_src_count; i++) {
+-        const spu_ovl_src* o = &s_ovl_src[i];
+-        if (o->has_sig && memcmp(hdr, o->sig, 16) == 0)
+-            return o->image_id;
+-    }
++    for (int g = s_ovl_sig_head[spu_ovl_hash_sig(hdr)]; g; g = s_ovl_src[g - 1].next)
++        if (memcmp(hdr, s_ovl_src[g - 1].sig, 16) == 0)
++            return s_ovl_src[g - 1].image_id;
+     return 0;
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index 2944662..9538ebd 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -660,2 +660,58 @@ static void test_verified_resident_code_regions(void)
+ 
++/* Sources are found by EA or signature through hash buckets, in registration
++ * order: the first source that matches a GET takes it, as the scan of the
++ * whole table did. */
++static int resident_image_at(const spu_context* ctx, uint32_t lsa)
++{
++    for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
++        if (ctx->resident_code[s].image_id && ctx->resident_code[s].lsa == lsa) return ctx->resident_code[s].image_id;
++    return 0;
++}
++static void test_overlay_source_order(void)
++{
++    extern void spu_overlay_register_sig(const uint8_t sig[16], int image_id);
++    extern int spu_overlay_match_sig(const uint8_t hdr[16]);
++    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
++    if (!ctx) { check(0, "allocate source order context"); return; }
++    spu_context_init(ctx, 0);
++    const uint32_t base = 0x14000, ea = 0xC80000;
++    uint8_t code[0x40];
++    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x60 + i);
++    const spu_overlay_code_segment far = {base + 0x1000, sizeof code, code}, near = {base, sizeof code, code};
++    check(spu_overlay_register_verified_region(ea, base + 0x1000, 0x400, 110, &far, 1)
++          && spu_overlay_register_verified_region(ea, base, 0x400, 111, &near, 1),
++          "two verified regions share an EA");
++    spu_overlay_note_get(ctx, ea, ctx->ls + base, 0x200);
++    check(resident_image_at(ctx, base) == 111, "a load passes over a same-EA source lifted for another address");
++
++    spu_overlay_register_region(0xC90000, 0x400, 112);
++    spu_overlay_register_region(0xC90000, 0x400, 113);
++    spu_overlay_note_get(ctx, 0xC90000, ctx->ls + 0x16000, 0x100);
++    check(resident_image_at(ctx, 0x16000) == 112, "of two sources with one EA the first takes the load");
++
++    uint8_t s1[16], s2[16];
++    for (unsigned i = 0; i < 16; ++i) { s1[i] = (uint8_t)(0xA0 + i); s2[i] = (uint8_t)(0xC0 + i); }
++    spu_overlay_register_sig(s1, 114);
++    spu_overlay_register_region(0xCA0000, 0x400, 115);
++    memcpy(ctx->ls + 0x18000, s1, 16);
++    ctx->resident_ovl = 0;
++    spu_overlay_note_get(ctx, 0xCA0000, ctx->ls + 0x18000, 0x200);
++    check(ctx->resident_ovl == 114 && !resident_image_at(ctx, 0x18000), "an earlier signature beats a later EA");
++    spu_overlay_register_region(0xCB0000, 0x400, 116);
++    spu_overlay_register_sig(s2, 117);
++    memcpy(ctx->ls + 0x19000, s2, 16);
++    spu_overlay_note_get(ctx, 0xCB0000, ctx->ls + 0x19000, 0x200);
++    check(resident_image_at(ctx, 0x19000) == 116 && ctx->resident_ovl == 114, "an earlier EA beats a later signature");
++    ctx->resident_ovl = 0;
++    spu_overlay_note_get(ctx, 0xCC0000, ctx->ls + 0x18000, 0x100);
++    check(ctx->resident_ovl == 0, "a signature needs a GET of 512 bytes");
++    spu_overlay_note_get(ctx, 0xCC0000, ctx->ls + 0x18000, 0x200);
++    check(ctx->resident_ovl == 114, "a signature matches at any EA");
++    static const uint8_t none[16];
++    check(spu_overlay_match_sig(s1) == 114 && spu_overlay_match_sig(s2) == 117 && !spu_overlay_match_sig(none),
++          "a module header is matched by its signature");
++    g_spu_trampoline_fn = 0;
++    free(ctx);
++}
++
+ /* Streamed code owns an LS interval even when its registry has a hole.
+@@ -1145,2 +1201,3 @@ int main(void)
+     test_many_resident_code_regions();
++    test_overlay_source_order();
+     test_resident_code_holes();
