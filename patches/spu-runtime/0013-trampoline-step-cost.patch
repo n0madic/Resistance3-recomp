@@ -1,0 +1,181 @@
+SPU: a trampoline step costs half as much (6.5 -> 3.4 ns): the per-step hooks check their switches before calling.
+
+Lifted SPU code moves between its functions through the trampoline: each step returns to the drain loop
+(spu_drain_call, or SPU_DRAIN at the top level), which ran spu_task_launch_check, yz_lockstep_tick and, through
+the first, spu_check_stack_reset. In a Resistance 3 firefight these took ~15% of the SPU threads' time (`sample`:
+spu_task_launch_check 755-833 samples of ~12.4k, spu_check_stack_reset ~200, yz_lockstep_tick ~130, plus their
+_tlv_get_addr calls), though with no debug variable set they do little:
+- spu_task_launch_check keeps the LS-0 job end and the PM flow trace inline; the variables' paths (SPU_NO_LS0_END,
+  SPU_EXITTRACE, SPU_STEPTRACE, SPU_JOBDRAIN) and the job end itself go to a cold function, the old body. Its
+  register spills for those paths were paid at every step.
+- its ring of recent PCs is one thread-local object instead of two (on Darwin each access is a call);
+- spu_check_stack_reset looks at its (global) entry count before the thread-local halt flag;
+- yz_lockstep_tick is called only while lockstep is on; SPU_DRAIN asks spu_tailret_enabled() only with a host
+  frame open (host_depth > 0, the condition it already required);
+- spu_depth_guard (every lifted call) wrote a ring shared by all SPU threads at each call; it records only within
+  the ring's length of the limit, which still holds the last sites before a trip (the depth grows by at most one
+  per drain).
+
+Test: runtime/spu/tests/test_spu_lifted_start.c, test_job_end_at_ls0 (a job branching to LS 0 halts there, at
+the top level and in a nested drain; a first step at 0 runs; a policy module's 0 is not an end; the PM flow trace
+sees each step): 183 checks pass, the same with the old runtime; skipping the job end or the trace fails them.
+Micro-benchmark (a function re-queued 4M times through spu_drain_call): 6.2-6.8 -> 3.4 ns per step, 1.6 ns
+without spu_task_launch_check at all.
+In the game (`sample`, 25 s of the Haven firefight, 2 runs each): the step hooks (spu_task_launch_check,
+spu_check_stack_reset, yz_lockstep_tick, spu_depth_guard, spu_drain_call, spu_indirect_branch, _tlv_get_addr)
+14-17% -> ~10% of the SPU threads' samples; spu_task_launch_check 553/639 -> 193/184, yz_lockstep_tick gone.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 6d2b7de..458b250 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1822,3 +1822,5 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+ {
+-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
++    /* The count first: it is a plain global, s_spu_halt_armed a thread-local (a call on Darwin), and this
++     * runs at every trampoline step. */
++    if (!s_stack_reset_count || !ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+     for (unsigned i = 0; i < s_stack_reset_count; ++i)
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 8605dae..8586bb9 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -834,2 +834,3 @@ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+ void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
++extern volatile int g_yz_lockstep_on;                /* 0: off (the gate is skipped), <0: not decided yet */
+ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
+@@ -916,3 +917,3 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+              * this changes core dispatch for every title. */              \
+-            if (spu_tailret_enabled() && (ctx)->host_depth > 0 &&          \
++            if ((ctx)->host_depth > 0 && spu_tailret_enabled() &&          \
+                 (((uint32_t)(ctx)->pc & SPU_LS_MASK) ==                    \
+@@ -924,3 +925,3 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+             g_spu_trampoline_fn = 0;                            \
+-            yz_lockstep_tick(ctx);                             \
++            if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       \
+             spu_task_launch_check((ctx), (void*)_tf);          \
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 1b2f2bc..7fd05fb 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -50,9 +50,9 @@ extern void spu_halt(spu_context*);
+ /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
+- * ended where it should not have (spurs_policy.c, [pm-end]). */
+-static _Thread_local uint32_t t_recent[32];
+-static _Thread_local uint32_t t_recent_n;
++ * ended where it should not have (spurs_policy.c, [pm-end]). One thread-local
++ * object: on Darwin each one costs a call to _tlv_get_addr at every step. */
++static _Thread_local struct { uint32_t pc[32]; uint32_t n; } t_recent;
+ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+ {
+-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
+-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
++    unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
++    for (unsigned i = 0; i < k; i++) out[i] = t_recent.pc[(t_recent.n - k + i) & 31];
+     return k;
+@@ -60,7 +60,24 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+ 
++static void spu_task_launch_check_env(spu_context* ctx);
+ void spu_task_launch_check(spu_context* ctx, void* fn)
+ {
+-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
++    t_recent.pc[t_recent.n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
++    /* Every trampoline step comes here. With none of the variables read below
++     * set, what is live is the LS-0 job end and the PM flow trace: checked
++     * here, and the rest stays out of line (its frame cost every step). */
++    static int s_env = -1;
++    if (s_env < 0) s_env = getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
++                           getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
++    if (!s_env && ((ctx->pc & SPU_LS_MASK) || !ctx->steps || ctx->policy_mode || ctx->image_id <= 0)) {
++        ctx->steps++;
++        if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
++            g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
++        return;
++    }
++    spu_task_launch_check_env(ctx);
++}
++__attribute__((noinline, cold)) static void spu_task_launch_check_env(spu_context* ctx)
++{
+     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
+@@ -346,3 +363,6 @@ void spu_depth_guard(spu_context* ctx)
+      * not "where are we" but "what cycle got us here" -- one pc names a point,
+-     * a ring names the loop. */
++     * a ring names the loop. The depth rises by at most one per drain, so the
++     * last RING sites before a trip are all within RING of the limit: only
++     * those are recorded. (Recording every drain wrote one cache line from
++     * every SPU thread at each lifted call.) */
+     enum { RING = 24 };
+@@ -350,2 +370,3 @@ void spu_depth_guard(spu_context* ctx)
+     static uint32_t s_n;
++    if (ctx->host_depth + RING < s_max) return;
+     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+@@ -421,3 +442,3 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+-            yz_lockstep_tick(ctx);
++            if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       /* off: one load, no call */
+             spu_task_launch_check(ctx, (void*)fn);
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index 9538ebd..94e3bc1 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -936,2 +936,51 @@ static void test_guest_stack_reset(void)
+ 
++/* Each trampoline step passes spu_task_launch_check: a job that branches to
++ * LS 0 after its first step has finished (its crt tail-jumps to the job
++ * manager) and halts there, at the top level and in a nested drain; a first
++ * step at 0 is the entry; a policy module's 0 is not an end; an armed PM flow
++ * trace records every step it lets run. */
++extern uint32_t g_pm_flow_buf[8192];
++extern volatile unsigned g_pm_flow_n;
++extern void* volatile g_pm_flow_ctx;
++static int s_le_ran;
++static void le_at_zero(spu_context* c) { (void)c; s_le_ran |= 2; }
++static void le_first(spu_context* c) { s_le_ran |= 1; c->pc = 0; g_spu_trampoline_fn = le_at_zero; }
++static void le_entry(spu_context* c) { c->pc = 0x4000; g_spu_trampoline_fn = le_first; }
++static void le_nested(spu_context* c)
++{
++    c->host_depth++; c->pc = 0x4000; g_spu_trampoline_fn = le_first;
++    spu_drain_call(c, 0x5000);
++    s_le_ran |= 8;
++}
++static void le_entry_at_zero(spu_context* c) { c->pc = 0; g_spu_trampoline_fn = le_at_zero; }
++static int le_run(void (*entry)(spu_context*), int policy, int* ran)
++{
++    spu_context* c = (spu_context*)calloc(1, sizeof *c);
++    if (!c) return -1;
++    spu_context_init(c, 0);
++    c->image_id = 130; c->policy_mode = policy;
++    s_le_ran = 0;
++    const int halted = spu_run_with_halt(entry, c);
++    *ran = s_le_ran;
++    free(c);
++    return halted;
++}
++static void test_job_end_at_ls0(void)
++{
++    int ran;
++    check(le_run(le_entry, 0, &ran) == 1 && ran == 1, "a job that branches to LS 0 ends there");
++    check(le_run(le_nested, 0, &ran) == 1 && ran == 1, "a job that branches to LS 0 in a nested drain ends there");
++    check(le_run(le_entry_at_zero, 0, &ran) == 0 && ran == 2, "a first step at LS 0 is the entry");
++    check(le_run(le_entry, 1, &ran) == 0 && ran == 3, "a policy module's LS 0 is not a job end");
++    spu_context* c = (spu_context*)calloc(1, sizeof *c);
++    if (!c) { check(0, "allocate PM flow context"); return; }
++    spu_context_init(c, 0);
++    c->image_id = 130; c->policy_mode = 1;
++    g_pm_flow_n = 0; g_pm_flow_ctx = c;
++    spu_run_with_halt(le_entry, c);
++    g_pm_flow_ctx = 0;
++    check(g_pm_flow_n == 2 && g_pm_flow_buf[0] == 0x4000 && g_pm_flow_buf[1] == 0, "the PM flow trace records each step");
++    free(c);
++}
++
+ static void nested_task_resume(spu_context* ctx)
+@@ -1210,2 +1259,3 @@ int main(void)
+     test_guest_stack_reset();
++    test_job_end_at_ls0();
+     test_taskset_resume_stack();
