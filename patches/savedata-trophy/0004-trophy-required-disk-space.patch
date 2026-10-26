@@ -5,7 +5,7 @@ Resistance 3 reads a non-zero answer as "not installed" and shows its install pr
 RegisterContext now writes the trophy file (the HLE's record of an installed set) and GetRequiredDiskSpace checks it.
 The registration test also builds again: cellSysutil.c defines g_ps3_guest_caller and calls two more hooks.
 
-Upstream: not proposed yet.
+Upstream: not proposed yet. The fixture's three pump stubs and the dropped g_ps3_guest_caller are PR #607 (rebase when it merges).
 ---
 
 diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c

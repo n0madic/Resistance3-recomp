@@ -10,7 +10,7 @@ are configure dependencies); without it the build time stays.
 Test: two builds configured apart from the same sources (scripts/build_host.sh and the toolkit test build) define
 the same PS3RECOMP_MSL_TRANSLATOR_ID; with the build time they never did.
 
-Upstream: not proposed yet.
+Upstream: PR #609 (drop this patch when the pin has it).
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
