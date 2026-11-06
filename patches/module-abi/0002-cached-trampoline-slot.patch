@@ -24,7 +24,7 @@ Upstream: not proposed. Same as 0001.
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 5fc50208..f95d70b3 100644
+index 84b7ac96..b1273243 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -327,2 +327,3 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
@@ -32,10 +32,10 @@ index 5fc50208..f95d70b3 100644
 +    ctx->tramp_slot = &g_spu_trampoline_fn;         /* where a module's lifted code queues its transfers */
      /* Lockstep gate (env SPU_LOCKSTEP, default off): join the round-robin
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index a052008a..bbd930a0 100644
+index 19de9422..f7ca350e 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -427,2 +427,8 @@ typedef struct spu_context {
+@@ -435,2 +435,8 @@ typedef struct spu_context {
      int coh_listed;
 +
 +    /* The trampoline slot (g_spu_trampoline_fn) of the host thread running
@@ -44,7 +44,7 @@ index a052008a..bbd930a0 100644
 +     * spu_run_with_halt (and checked by spu_drain_call); NULL until then. */
 +    void (**tramp_slot)(struct spu_context*);
  } spu_context;
-@@ -874,3 +880,8 @@ uint32_t (*spu_pch_arr(void))[8];
+@@ -900,3 +906,8 @@ uint32_t (*spu_pch_arr(void))[8];
  unsigned *spu_pch_n_slot(void);
 -#  define g_spu_trampoline_fn (*spu_tramp_slot())
 +/* Lifted code always has its context in `ctx`: the slot it cached, else the accessor. */

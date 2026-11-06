@@ -1,48 +1,56 @@
-SPU: cflts/cfltu/csflt/cuflt four lanes at a time with NEON.
+SPU: cfltu/csflt/cuflt four lanes at a time with NEON (cflts is upstream's, #677).
 
 In a Resistance 3 firefight the SPU float conversions took ~10% of the SPU threads' time (`sample`: spu_cflts,
 spu_cuflt, spu_cfltu next to the lifted code). The per-lane forms were too big to inline into the lifted
 functions, so every conversion was a call with the vector passed through general registers (131 out-of-line
-copies in the module). On NEON they are now inline vector code: cflts/cfltu scale in single precision and
-convert truncating and saturating; csflt/cuflt convert in double and truncate with the fast path's
-spu__nv_trunc0, and only a lane outside the single range (a scale the ISA leaves undefined) is redone one by
-one. The per-lane forms stay as the reference (spu__cflts_s, ...) and on other hosts.
+copies in the module). v0.19.0's ARM64 branch (#677) does fi and cflts in NEON and keeps the per-lane references
+for the other three; this adds those: cfltu scales in single precision and converts truncating and saturating
+(every scale stays in the vector); csflt/cuflt convert in double and truncate exactly (spu__ifl_trunc), and only a
+lane outside the single range (a scale the ISA leaves undefined) is redone one by one.
 
 Test: tools/test_spu_convert_vector.py (runtime/spu/tests/test_spu_convert_vector.c: every i8 on boundary and
-pseudo-random words; `full` runs all 2^32 words at i8 173/155: 25.8G lanes agree). Micro-benchmark, a
-float->int->float pair: throughput 4.5 -> 2.3 ns, latency 9.3 -> 9.4 ns against the called per-lane forms.
-In the game (`sample`, 25 s of the Haven firefight, 2 runs each) the conversions' share of the SPU threads went
-from 7-9% to none and the lifted code's rose by the same amount: no gain shows at that resolution.
-
-v0.18.0 has its own four-lane conversions for AVX2 (#500) and keeps the per-lane forms as spu_*_ref on every other
-host; these are the NEON branch of that choice. #445 dropped the NEON fast path's double-to-single truncation the
-csflt/cuflt here used, so they carry their own (spu__ifl_trunc).
+pseudo-random words, on ARM64 also under round-toward-zero plus flush-to-zero as #677's test does; `full` runs all
+2^32 words at i8 173/155). On v0.18.0 (with this patch's own cflts) `full` agreed on 25.8G lanes, and a
+float->int->float micro-benchmark went from 4.5 to 2.3 ns per pair (throughput; latency 9.3 -> 9.4 ns). In the game
+(`sample`, 25 s of the Haven firefight, 2 runs each) the conversions' share of the SPU threads went from 7-9% to
+none and the lifted code's rose by the same amount: no gain shows at that resolution.
+tests/bench/spu (run_spu_bench.sh --only cfltu,csflt,cuflt) measures each op lifted.
 
 Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
-index f04fda63..79f94e25 100644
+index 9691a152..8d302953 100644
 --- a/runtime/spu/spu_helpers.h
 +++ b/runtime/spu/spu_helpers.h
-@@ -1679,2 +1679,70 @@ static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
- static inline u128 spu_frsqest(u128 a)         { return spu_frsqest_ref(a); }
-+#if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+@@ -1793,4 +1793,5 @@ SPU__XE_INLINE u128 spu_cuflt(u128 a, int i8) {
+ #include <arm_neon.h>
+-/* fi and cflts four lanes at a time on ARM64 (the others keep their references).
+- * test_spu_float_est.c checks both against the scalar references.
++/* fi and the conversions four lanes at a time on ARM64 (frest/frsqest keep their references).
++ * test_spu_fi_cflts_neon.c checks fi and cflts against the scalar references,
++ * test_spu_convert_vector.c the four conversions.
+  *
+@@ -1835,5 +1836,66 @@ static inline u128 spu_cflts(u128 a, int i8) {
+ }
+-static inline u128 spu_cfltu(u128 a, int i8)   { return spu_cfltu_ref(a, i8); }
+-static inline u128 spu_csflt(u128 a, int i8)   { return spu_csflt_ref(a, i8); }
+-static inline u128 spu_cuflt(u128 a, int i8)   { return spu_cuflt_ref(a, i8); }
++/* cfltu, csflt, cuflt: the per-lane references were not inlined either (a call per
++ * instruction; with cflts ~10% of the SPU threads' time in a Resistance 3 firefight). */
 +static inline uint32_t spu__ifl_lane(uint32_t v, int i8, int is_unsigned) {
 +    const int neg = !is_unsigned && (v >> 31);
 +    return v ? spu__sf_pack(neg ? 0x80000000u : 0, neg ? 0u - v : v, -(155 - (i8 & 0xFF))) : 0;
 +}
-+/* The conversions four lanes at a time, as two f64x2 halves. The scalar forms were not inlined
-+ * (a call per instruction, ~10% of the SPU threads' time in a Resistance 3 firefight). */
 +SPU__NV_INLINE float64x2_t spu__nv_pow2(int e) {                 /* 2^e, -1022 <= e <= 1023 */
 +    return vreinterpretq_f64_u64(vdupq_n_u64((uint64_t)(1023 + e) << 52));
 +}
-+/* cflts/cfltu: scale by 2^(173-i8) in single precision (exact: a power of two; an overflow is an
-+ * infinity, which saturates like the true value; an underflow is below 1 and truncates to 0
-+ * either way), then convert truncating toward zero and saturating. A scale above 127 is applied
-+ * in two factors. The SPU reads exponent 0 as zero and exponent 255 as an ordinary binade (at
-+ * least 2^128, which saturates): the input clears the first and turns the second into an
-+ * infinity, so no lane leaves the vector path. */
++/* cfltu: scale by 2^(173-i8) in single precision (exact: a power of two; an overflow is an
++ * infinity, or FLT_MAX under round-toward-zero, which saturates like the true value; an
++ * underflow is below 1 and truncates to 0 either way), then convert truncating toward zero and
++ * saturating (FCVTZU). A scale above 127 is applied in two factors. The SPU reads exponent 0 as
++ * zero and exponent 255 as an ordinary binade (at least 2^128, which saturates): the input
++ * clears the first and turns the second into an infinity, so every scale stays in the vector. */
 +SPU__NV_INLINE float32x4_t spu__nv_cfl_in(uint32x4_t x, int scale) {
 +    const uint32x4_t ext = vcgtq_u32(vshlq_n_u32(x, 1), vdupq_n_u32(0xFEFFFFFFu));      /* exponent 255 */
 +    x = vbicq_u32(vandq_u32(x, vtstq_u32(x, vdupq_n_u32(0x7F800000u))), vandq_u32(ext, vdupq_n_u32(0x7FFFFFu)));
@@ -50,16 +58,14 @@ index f04fda63..79f94e25 100644
 +    if (scale > 127) { f = vmulq_n_f32(f, 0x1p127f); scale -= 127; }
 +    return vmulq_f32(f, vreinterpretq_f32_u32(vdupq_n_u32((uint32_t)(127 + scale) << 23)));   /* 2^scale */
 +}
-+SPU__NV_INLINE u128 spu_cflts(u128 a, int i8) {
-+    return spu__nv_u128(vreinterpretq_u32_s32(vcvtq_s32_f32(spu__nv_cfl_in(vld1q_u32(a._u32), 173 - (i8 & 0xFF)))));
-+}
 +SPU__NV_INLINE u128 spu_cfltu(u128 a, int i8) {
 +    return spu__nv_u128(vcvtq_u32_f32(spu__nv_cfl_in(vld1q_u32(a._u32), 173 - (i8 & 0xFF))));
 +}
 +/* csflt/cuflt: the integer in double (exact), scaled by 2^(i8-155) (exact), then truncated to
 + * single (the SPU rounds toward zero): the low 29 bits of the double's significand dropped, so
-+ * the conversion is exact. Only a scale outside 0..127 (undefined by the ISA) can leave the
-+ * single range (zero aside); *ok clears those lanes and they are redone one by one. */
++ * the conversion is exact in any rounding mode. Only a scale outside 0..127 (undefined by the
++ * ISA) can leave the single range (zero aside); *ok clears those lanes and they are redone one
++ * by one. */
 +SPU__NV_INLINE float32x2_t spu__ifl_trunc(float64x2_t d, uint32x2_t* ok) {
 +    const uint64x2_t u = vreinterpretq_u64_f64(d);
 +    const uint64x2_t az = vceqzq_u64(vshlq_n_u64(u, 1));                  /* +-0 */
@@ -94,22 +100,19 @@ index f04fda63..79f94e25 100644
 +}
 +SPU__NV_INLINE u128 spu_csflt(u128 a, int i8) { return spu__nv_ifl(a, i8, 0); }
 +SPU__NV_INLINE u128 spu_cuflt(u128 a, int i8) { return spu__nv_ifl(a, i8, 1); }
-+#else
- static inline u128 spu_cflts(u128 a, int i8)   { return spu_cflts_ref(a, i8); }
-@@ -1684,2 +1752,3 @@ static inline u128 spu_cuflt(u128 a, int i8)   { return spu_cuflt_ref(a, i8); }
- #endif
-+#endif
- 
+ #else
 diff --git a/runtime/spu/tests/test_spu_convert_vector.c b/runtime/spu/tests/test_spu_convert_vector.c
 new file mode 100644
-index 00000000..c4ca65bc
+index 00000000..dec7527f
 --- /dev/null
 +++ b/runtime/spu/tests/test_spu_convert_vector.c
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,76 @@
 +/* The vector cflts/cfltu/csflt/cuflt against the per-lane reference, for every i8 (0..255) on
-+ * boundary words and pseudo-random words. `full` instead runs every 32-bit word through the
-+ * float-to-integer pair at i8 = 173 (scale 0) and 155 (scale 2^18), and the integer-to-float
-+ * pair at i8 = 155. Prints "OK: <n> lanes" or the first mismatches. */
++ * boundary words and pseudo-random words, on ARM64 once in the default FPCR and once with
++ * round-toward-zero plus flush-to-zero (the mode SPU_FLOAT_RZ runs lifted code in). `full`
++ * instead runs every 32-bit word through the float-to-integer pair at i8 = 173 (scale 0) and
++ * 155 (scale 2^18), and the integer-to-float pair at i8 = 155. Prints "OK: <n> lanes" or the
++ * first mismatches. */
 +#include "spu_helpers.h"
 +#include <stdio.h>
 +#include <string.h>
@@ -132,6 +135,29 @@ index 00000000..c4ca65bc
 +static uint32_t rng = 0x9E3779B9u;
 +static uint32_t next(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 +
++static void run_edges(void) {
++    /* sign x {zero, denormal, smallest normal, 1.0, 1.5, around 2^23/2^31/2^32, largest IEEE,
++     * extended range (exponent 255)}, and integers around 0, 2^24, 2^31, 2^32 */
++    static const uint32_t edge[] = {
++        0x00000000, 0x00000001, 0x007FFFFF, 0x00800000, 0x3F000000, 0x3F7FFFFF, 0x3F800000, 0x3FC00000,
++        0x4B000000, 0x4B7FFFFF, 0x4EFFFFFF, 0x4F000000, 0x4F7FFFFF, 0x4F800000, 0x7F7FFFFF, 0x7F800000,
++        0x7F800001, 0x7FC00000, 0x7FFFFFFF, 0x00000002, 0x00FFFFFF, 0x01000000, 0x01000001, 0x0000FFFF};
++    const int n = (int)(sizeof edge / sizeof edge[0]);
++    for (int i8 = 0; i8 < 256; i8++) {
++        for (int s = 0; s < 2; s++)
++            for (int k = 0; k < n; k++) {
++                u128 a;
++                for (int i = 0; i < 4; i++) a._u32[i] = edge[(k + i * 7) % n] ^ (s ? 0x80000000u : 0);
++                check_all(a, i8);
++            }
++        for (int k = 0; k < 20000; k++) {
++            u128 a;
++            for (int i = 0; i < 4; i++) a._u32[i] = next();
++            check_all(a, i8);
++        }
++    }
++}
++
 +int main(int argc, char** argv) {
 +    if (argc > 1 && !strcmp(argv[1], "full")) {
 +        for (uint64_t w = 0; w < (1ull << 32); w += 4) {
@@ -145,26 +171,13 @@ index 00000000..c4ca65bc
 +            check("cuflt", spu_cuflt(a, 155), spu_cuflt_ref(a, 155), a, 155);
 +        }
 +    } else {
-+        /* sign x {zero, denormal, smallest normal, 1.0, 1.5, around 2^23/2^31/2^32, largest IEEE,
-+         * extended range (exponent 255)}, and integers around 0, 2^24, 2^31, 2^32 */
-+        static const uint32_t edge[] = {
-+            0x00000000, 0x00000001, 0x007FFFFF, 0x00800000, 0x3F000000, 0x3F7FFFFF, 0x3F800000, 0x3FC00000,
-+            0x4B000000, 0x4B7FFFFF, 0x4EFFFFFF, 0x4F000000, 0x4F7FFFFF, 0x4F800000, 0x7F7FFFFF, 0x7F800000,
-+            0x7F800001, 0x7FC00000, 0x7FFFFFFF, 0x00000002, 0x00FFFFFF, 0x01000000, 0x01000001, 0x0000FFFF};
-+        const int n = (int)(sizeof edge / sizeof edge[0]);
-+        for (int i8 = 0; i8 < 256; i8++) {
-+            for (int s = 0; s < 2; s++)
-+                for (int k = 0; k < n; k++) {
-+                    u128 a;
-+                    for (int i = 0; i < 4; i++) a._u32[i] = edge[(k + i * 7) % n] ^ (s ? 0x80000000u : 0);
-+                    check_all(a, i8);
-+                }
-+            for (int k = 0; k < 20000; k++) {
-+                u128 a;
-+                for (int i = 0; i < 4; i++) a._u32[i] = next();
-+                check_all(a, i8);
-+            }
-+        }
++        run_edges();
++#if defined(__aarch64__)
++        uint64_t fpcr; __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++        __asm__ volatile("msr fpcr, %0" :: "r"(fpcr | (3ull << 22) | (1ull << 24)));   /* RZ + FZ */
++        run_edges();
++        __asm__ volatile("msr fpcr, %0" :: "r"(fpcr));
++#endif
 +    }
 +    if (failed) { printf("%d mismatching lanes of %llu\n", failed, lanes); return 1; }
 +    printf("OK: %llu lanes\n", lanes);

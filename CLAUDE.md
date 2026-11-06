@@ -19,7 +19,7 @@ data, the lifted module, build products and logs must never be committed. `build
   copy. `PACKED/GAME/*.PSARC` is uppercase locally; the host FS is case-insensitive.
 - Runtime state written by the game: `gamedata/dev_hdd0/` (HDD install, saves, trophies), `cache/BCES01118` (FIOS
   disk cache; delete it if a data-path bug may have poisoned it). The host keeps translated shaders in `cache/msl`
-  (`PS3RECOMP_MSL_CACHE`, upstream #511; `gcm-rsx/0015` names the translator by a hash of its sources): a first run
+  (`PS3RECOMP_MSL_CACHE`, upstream #511; since #609 the translator is named by a hash of its sources): a first run
   stalls on every new shader, later runs do not. The files stay valid across host rebuilds; an edit to
   `rsx_shader_msl.cpp`/`.h` (their hash is the key) retires them.
 
@@ -51,21 +51,22 @@ cmake -S build/ps3recomp -B <scratch>/build-tests -G Ninja -DPS3RECOMP_BUILD_TES
       -DCMAKE_PREFIX_PATH="$PWD/build/deps/prefix" -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
       -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON
 cmake --build <scratch>/build-tests -- -k 0     # keep going past a target that does not link
-ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 24
+ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 39
 ```
 
-Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (126 of them with
+Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (144 of them with
 the patches; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
 Some runtime unit tests (e.g. `runtime/spu/tests/test_spu_thread_ls_dma.c`) are built directly with clang from the
 toolkit dir against the runtime sources they need: the "run:" steps of `.github/workflows/macos.yml` give the line
-(28 of them; `test_spu_lifted_start` also needs a `void cellSpurs_post_snr(void) {}` stub with the spurs patches).
+(33 of them).
 The Metal ones that translate guest programs
 (`libs/video/tests/test_shadow_compare_metal.m`) need the translator: compile `rsx_shader_msl.cpp` with
 `-DPS3RECOMP_HAVE_MSL_TRANSLATION=1 -DPS3RECOMP_MSL_TRANSLATOR_ID='"<any 23 chars>"'` and `-I build/deps/prefix/include`
 (+ `/spirv_cross`), and link glslang, SPIRV, SPIRV-Tools(-opt) and the spirv-cross static libraries from
 `build/deps/prefix/lib`; without it the stub reports "translation was not built" and 32 of 37 checks fail (with it,
-133/133 pass). On the pinned v0.18.0 all 24 ctest tests, all 126 scripts and the 28 workflow tests pass
-with the patches on (`test_metal_frame_rate` needs a usable display), so a new failure is ours. A patch that moves a symbol or
+133/133 pass). On the pinned v0.19.0 with the patches on, 37 of the 39 ctest tests, all 144 scripts and the 33 workflow
+tests pass (`test_metal_frame_rate` needs a usable display); `sys_fs` and `ppu_thread_join` do not link on macOS, on
+plain v0.19.0 either (`_cellGame_get_hdd_title_id`; Windows thread calls), so any other new failure is ours. A patch that moves a symbol or
 changes a code path can break a fixture's link line or stub (the loader fixtures stub `cellGcm_on_put_store`): fix the
 fixture in the same patch.
 
@@ -75,7 +76,7 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
 `scripts/build_host.sh`; upstream is `github.com/sp00nznet/ps3recomp` and has priority over everything here).
 
 - **Layout.** `patches/<domain>/NNNN-*.patch`, one directory per subject area (module-abi, spurs, spu-runtime,
-  savedata-trophy, input, lv2, fs, gcm-rsx, metal), listed in `patches/domains.txt` (second column: platforms the domain
+  savedata-trophy, input, lv2, fs, gcm-rsx), listed in `patches/domains.txt` (second column: platforms the domain
   is for). Patches inside a domain go in name order and may depend on each other; **domains never depend on each other**:
   each applies to the base on its own, and any order of them gives the same tree.
   `patches/upstream/*.patch` holds open upstream PRs imported as they are (header + the PR's diff), applied first, in
@@ -152,29 +153,30 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   instead gave a black frame at the onset of a heavy hit, binding it whole a yellow band at the bottom).
   Tile 4 is bound over main memory (IO 0x30000, pitch 8192, bank 2). While aiming, NV3089 downsamples the scene into
   it for an SPU depth-of-field job that reads and writes the tiled layout. Every RSX access to a main-memory tile
-  goes through the tiling (`gcm-rsx/0021`). The address math is `rsx_tiling.h`, from envytools'
+  goes through the tiling (upstream #569, ours, in v0.19.0; the NV0039 copy is `gcm-rsx/0021`). The address math is `rsx_tiling.h`, from envytools'
   `tile_translate_addr` (MIT; upstream will not take GPL ports such as RPCS3's).
   `rsx_tiling.c` holds the one tile table and the range copies used by the 2D engines, NV0039, and the draw engine's
   surfaces, textures and fetches. Before that, the job's output showed as bands and the blur never appeared. Only
   the NV3089 and texture paths are reached in the scenes checked.
   Explosion smoke (rockets, hybrids blowing up) samples 256x256x16 DXT5 volumes in main memory, stored in NVIDIA's
   VTC order; the pin's 3D path took uncompressed formats only, and the first 64 KB read as a 2D image drew dark
-  squares (`gcm-rsx/0022`).
+  squares (upstream #585, ours, in v0.19.0).
   A frame of the Haven fight binds ~1700 distinct textures; the engine's texture cache held 1024 and re-created
   ~700 a frame (22 ms of the RSX thread's CPU). `host/CMakeLists.txt` sets it to 2048 (`gcm-rsx/0023`).
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
-  `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000).
+  `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000); the runtime looks most switches up once per name (`ps3_env_once`, #515), so a variable set after start-up is not seen.
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
   Voice packs present: English and Russian. Switching language makes the game ask once to install data again.
 
 ## Running/debugging knobs
 
-- **Keyboard and mouse** (cellPad's fps layout, `patches/input/0004`; the game never reads cellMouse. In play the
+- **Keyboard and mouse** (the keyboard fallback is upstream, #612; cellPad's fps layout is `patches/input/0004`; the game never reads cellMouse. In play the
   mouse turns the hero's orientation matrix directly, `host/r3_input.cpp` via `patches/input/0006`; in menus and
   cutscenes it moves the right stick, capped at the game's top stick rate):
   - WASD walk, mouse look (cursor captured while the window is in front and no menu is up, `patches/input/0007`;
-    Cmd+Tab frees it too). The window's close button quits at once (`host/main.cpp`); Cmd+Q asks the game to quit
-    (upstream `ps3_host_quit`, #544: REQUEST_EXITGAME, then exit after `PS3_QUIT_GRACE_MS`, 3 s);
+    Cmd+Tab frees it too). The window's close button quits at once (`host/main.cpp`); Cmd+Q and the app menu's Quit item (#613) ask the game to quit
+    (upstream `ps3_host_quit`, #544: REQUEST_EXITGAME, then exit after `PS3_QUIT_GRACE_MS`, 3 s); the window resizes
+    keeping the aspect ratio and `PS3RECOMP_FULLSCREEN=1` starts it full screen (#614);
   - left button = R1 (fire), right = L1 (aim), middle or V = R3 (melee), wheel or Q = triangle (weapons);
   - Space = cross (jump), C/Ctrl/Backspace = circle (crouch, back), E/R = square (reload, use);
   - G/F = L2/R2 (grenade, secondary fire), Shift = L3 (sprint);

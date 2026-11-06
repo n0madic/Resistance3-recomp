@@ -1,52 +1,63 @@
-SPU: position-independent code modules: lifted once, dispatched wherever they are loaded.
+SPU: position-independent code modules: lifted once, dispatched wherever they are loaded, several copies at once.
 
 Resistance 3's job igjob_00DC0200 loads two small modules (guest 0xDB2D80 and 0xDB0400) into its local store at a
 new address every time (0x11B60, 0x133C0, 0x146C0, ...) and calls them. A lift is made for one address, so they ran in
 the interpreter: in the opening cutscene (the blurred hand) about 25M interpreted steps/s on two SPU threads, and the
 game stood at 0-2 fps for 20-35 s; afterwards about 12M steps/s kept the cutscene at 25-28 fps instead of 30.
 Their only references to their own addresses are pc-relative (lqr, link values, relative branches), so one lift serves
-every load:
+every load.
 
-- spu_lifter.py --pic (build_spu_workloads.py --pic IMAGE): every LS address of the image that the code observes --
-  lqr/stqr addresses, link values, return pcs, transfer targets -- is emitted moved by _pd, the load offset a function
-  takes on entry from the pc it was entered at (ctx->pc is the entry's address on every way into a lifted function;
-  the PIC lift sets it before its own direct calls). Absolute branches (bra/brasl) stay absolute. Without --pic the
-  output is unchanged (all 62 SPU images of the title lift byte-identical).
-- spu_overlay_register_pic_region: a verified region whose GET may land anywhere. The load at L takes a resident code
-  slot: the one at L, else one whose whole span the GET overwrote, else a free one, else the one of another copy --
-  one that later loads overwrote in part first, the oldest first (resident slots record when they were loaded). Copies
-  neither use up the slots nor keep fixed-address code out, and one that a later load overwrote in part keeps the rest
-  while a slot is free. (Evicting simply the oldest copy threw out the one the job had been running all along.) The copy is verified once against the code bytes moved to
-  L, and dispatch to A there runs the function lifted at A - L + link address.
+v0.19.0 has a mechanism for the same kind of code (#636: spu_lifter.py --reloc, spu_overlay_register_region_reloc):
+the lifted code adds ctx->reloc_delta, which the dispatcher sets, to every address it derives from its own pc. This
+patch builds its lift on that one (every such address goes through SPULifter._pc) and keeps the form and the
+residency Resistance 3 needs, which #636 does not give:
+
+- spu_lifter.py --pic (build_spu_workloads.py --pic IMAGE): the load offset is _pd, a local that each function takes
+  on entry from the pc it was entered at (ctx->pc is the entry's address on every way into a lifted function; the
+  PIC lift sets it before its own direct calls), so it needs no state that a call out of the copy could change.
+  Absolute branches (bra/brasl) stay absolute (#636's --reloc moves them too). Link address 0 is allowed (#636
+  refuses canonical base 0; the port links these modules at 0). --pic and --reloc are exclusive. Without --pic the
+  output is unchanged (--reloc's included).
+- spu_overlay_register_pic_region: a verified region (#636's are unverified) whose GET may land anywhere. The load
+  at L takes a resident code slot: the one at L, else one whose whole span the GET overwrote, else a free one, else
+  the one of another copy -- one that later loads overwrote in part first, the oldest first (resident slots record
+  when they were loaded). Copies neither use up the slots nor keep fixed-address code out, and one that a later load
+  overwrote in part keeps the rest while a slot is free. (Evicting simply the oldest copy threw out the one the job
+  had been running all along; #636 gives each image one placement, the newest, which would do the same.) The copy
+  is verified once against the code bytes moved to L, and dispatch to A there runs the function lifted at
+  A - L + link address. #636's regions keep their rule in the same slot choice: a new placement takes over the
+  image's previous one.
 
 Test: tools/test_spu_lifter_pic.py lifts a module with --pic and runs it with the runtime at three load addresses (14
 checks fail at the two non-zero ones without --pic); runtime/spu/tests/test_spu_lifted_start.c
-test_pic_resident_code (8 checks fail without the address mapping).
+test_pic_resident_code (8 checks fail without the address mapping); #636's test_reloc_regions passes with the shared
+slot choice.
 
-Upstream: not proposed yet.
+Upstream: not proposed yet (the multi-copy residency and verification would extend #636's regions).
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 167ecc17..16cbe985 100644
+index 12fc9ae6..a8203229 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1727,2 +1727,3 @@ static int spu_resident_hole(const spu_context* ctx, unsigned slot, uint32_t lsa
+@@ -1761,2 +1761,3 @@ static int spu_resident_hole(const spu_context* ctx, unsigned slot, uint32_t lsa
  }
 +static uint32_t spu_resident_link_lsa(const spu_context* ctx, unsigned slot, uint32_t lsa);
- static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
-@@ -1747,3 +1748,4 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
-                 !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
--            return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
-+            return (spu_lifted_fn)spu_lookup_memoized(spu_resident_link_lsa(ctx, slot, lsa),
-+                                                      ctx->resident_code[slot].image_id);
-         }
-@@ -1859,3 +1861,4 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
- typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
--                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code; } spu_ovl_src;
-+                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
-+                 int pic; } spu_ovl_src;
+ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa, int* reloc)
+@@ -1782,4 +1783,5 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+             const uint32_t canon = ctx->resident_code[slot].canon;
+-            if (!canon)
+-                return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
++            if (!canon)   /* a placed lift, or a position-independent one (--pic) at its link address */
++                return (spu_lifted_fn)spu_lookup_memoized(spu_resident_link_lsa(ctx, slot, lsa),
++                                                          ctx->resident_code[slot].image_id);
+             /* Relocatable code (spu_overlay_register_region_reloc): its lift sits at
+@@ -1912,3 +1914,3 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+                  uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
+-                 uint32_t canon; } spu_ovl_src;
++                 uint32_t canon; int pic; } spu_ovl_src;
  /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
-@@ -1959,2 +1962,23 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+@@ -2033,2 +2035,23 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
  
 +/* A position-independent module is a verified region the title may load at any
 + * local-store address: link_lsa is where it was lifted (spu_lifter.py --pic),
@@ -70,23 +81,23 @@ index 167ecc17..16cbe985 100644
 +}
 +
  static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
-@@ -1964,2 +1988,5 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+@@ -2038,2 +2061,5 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
          const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
 +        /* Where the load put the lifted bytes: 0 but for a position-independent
 +         * module loaded away from its link address. */
 +        const uint32_t moved = ctx->resident_code[slot].lsa - o->load_lsa;
          int match = 1;
-@@ -1968,3 +1995,3 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+@@ -2042,3 +2068,3 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
          for (unsigned i = 0; match && i < o->code_count; ++i)
 -            for (uint32_t a = o->code[i].lsa, end = o->code[i].lsa + o->code[i].size; match && a < end;) {
 +            for (uint32_t a = o->code[i].lsa + moved, end = a + o->code[i].size; match && a < end;) {
                  uint32_t run = end;
-@@ -1975,3 +2002,3 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+@@ -2049,3 +2075,3 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
                  }
 -                if (run > a) { match = !memcmp(ctx->ls + a, o->code[i].bytes + (a - o->code[i].lsa), run - a); a = run; }
 +                if (run > a) { match = !memcmp(ctx->ls + a, o->code[i].bytes + (a - moved - o->code[i].lsa), run - a); a = run; }
              }
-@@ -2156,2 +2183,30 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
+@@ -2231,2 +2257,33 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
  
 +/* The slot for a code load that wrote [lsa, lsa + size): the one of a load at
 + * the same address, else one whose whole span it overwrote, else a free slot,
@@ -96,7 +107,7 @@ index 167ecc17..16cbe985 100644
 + * neither use up the slots nor keep fixed-address code out; a copy a load
 + * overwrote only in part keeps the rest (its holes) while a slot is free.
 + * N when none is left. */
-+static unsigned spu_resident_slot(const spu_context* ctx, uint32_t lsa, uint32_t size)
++static unsigned spu_resident_slot(const spu_context* ctx, uint32_t lsa, uint32_t size, int reloc_image)
 +{
 +    unsigned free_slot = SPU_RESIDENT_CODE_SLOTS, pic_slot = SPU_RESIDENT_CODE_SLOTS;
 +    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
@@ -106,6 +117,9 @@ index 167ecc17..16cbe985 100644
 +            continue;
 +        }
 +        if (base == lsa || (base >= lsa && base - lsa <= size && span <= size - (base - lsa))) return slot;
++        /* A relocatable image (spu_overlay_register_region_reloc) takes over its own
++         * previous placement's slot. */
++        if (reloc_image && ctx->resident_code[slot].image_id == reloc_image) return slot;
 +        if (!s_ovl_src[ctx->resident_code[slot].source_index].pic) continue;
 +        if (pic_slot == SPU_RESIDENT_CODE_SLOTS) { pic_slot = slot; continue; }
 +        const int holed = ctx->resident_code[slot].n_holes != 0, best_holed = ctx->resident_code[pic_slot].n_holes != 0;
@@ -117,12 +131,15 @@ index 167ecc17..16cbe985 100644
 +}
 +
  void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
-@@ -2194,18 +2249,19 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2274,22 +2331,20 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                  if (lsa + o->span > SPU_LS_SIZE) return;
 -                /* Verified code was lifted for one load address. */
 -                if (o->code && lsa != o->load_lsa) continue;
 -                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
--                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+-                    /* A relocatable image takes over its own previous placement's slot: each load
+-                     * lands somewhere new, and stale copies would fill the slots. */
+-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa &&
+-                        !(o->canon && ctx->resident_code[slot].image_id == o->image_id))
 -                        continue;
 -                    ctx->resident_code[slot].lsa = lsa;
 -                    ctx->resident_code[slot].size = o->span;
@@ -130,12 +147,13 @@ index 167ecc17..16cbe985 100644
 -                    ctx->resident_code[slot].image_id = o->image_id;
 -                    ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
 -                    ctx->resident_code[slot].source_index = i;
+-                    ctx->resident_code[slot].canon = o->canon;
 -                    ctx->resident_code[slot].n_holes = 0;
 -                    spu_dcache_residency_changed(ctx);
 +                /* Verified code was lifted for one load address, unless it is
 +                 * position-independent. */
 +                if (o->code && !o->pic && lsa != o->load_lsa) continue;
-+                const unsigned slot = spu_resident_slot(ctx, lsa, size);
++                const unsigned slot = spu_resident_slot(ctx, lsa, size, o->canon ? o->image_id : 0);
 +                if (slot == SPU_RESIDENT_CODE_SLOTS) {
 +                    fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
                      return;
@@ -147,16 +165,17 @@ index 167ecc17..16cbe985 100644
 +                ctx->resident_code[slot].image_id = o->image_id;
 +                ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
 +                ctx->resident_code[slot].source_index = i;
++                ctx->resident_code[slot].canon = o->canon;
 +                ctx->resident_code[slot].n_holes = 0;
 +                spu_dcache_residency_changed(ctx);
 +                ctx->resident_code[slot].loaded = ctx->dcache_residency;
                  return;
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index ea2c22b3..3c07d8f8 100644
+index bb01db66..3430dbd6 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -312,2 +312,5 @@ typedef struct spu_context {
-         int verify_state, source_index;
+@@ -316,2 +316,5 @@ typedef struct spu_context {
+         uint32_t canon;
 +        /* When it was loaded, in dcache_residency ticks: the oldest copy of a
 +         * position-independent module gives its slot up first. */
 +        uint32_t loaded;
@@ -181,10 +200,10 @@ index 08af5b11..8464aa87 100644
 +
  #ifdef __cplusplus
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
-index 594992f9..93742f79 100644
+index f4e40cd0..5cecf8ea 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
 +++ b/runtime/spu/tests/test_spu_lifted_start.c
-@@ -522,2 +522,95 @@ static void test_verified_with_holes(void)
+@@ -560,2 +560,95 @@ static void test_verified_with_holes(void)
  
 +/* A position-independent module is lifted once, at its link address, and the
 + * title loads it anywhere: every load dispatches to the same lift, verified
@@ -280,7 +299,7 @@ index 594992f9..93742f79 100644
 +}
 +
  /* A streamed region registered with its code bytes dispatches by residency
-@@ -1166,2 +1259,3 @@ int main(void)
+@@ -1205,2 +1298,3 @@ int main(void)
      test_verified_with_holes();
 +    test_pic_resident_code();
      test_resident_interpreter_rejoin();
@@ -444,17 +463,10 @@ index 2eef378b..c1eb6ee6 100644
 +                cmd.append("--pic")
              if img in extra_funcs:
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index 4b334a01..568efc85 100644
+index d10f3fae..e5c7da40 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
-@@ -219,4 +219,4 @@ _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
- # nested another host frame until the depth guard halted the SPU.
--def _drain_ret_open(ret: int) -> str:
--    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = 0x{ret & 0x3FFFC:X}; "
-+def _drain_ret_open(ret: str) -> str:
-+    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = {ret}; "
- 
-@@ -515,4 +515,14 @@ LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
+@@ -516,4 +516,14 @@ LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
  class SPULifter:
 -    def __init__(self, trace: bool = False, prefix: str = ""):
 +    def __init__(self, trace: bool = False, prefix: str = "", pic: bool = False):
@@ -470,46 +482,43 @@ index 4b334a01..568efc85 100644
 +        # the link addresses (spu_overlay_register_pic_region).
 +        self.pic = pic
          self.call_targets: set[int] = set()
-@@ -567,2 +577,5 @@ class SPULifter:
+@@ -574,2 +584,5 @@ class SPULifter:
          last_insn = None
 +        if self.pic:
 +            func.body_lines.append(
 +                f"const uint32_t _pd = (uint32_t)(ctx->pc - 0x{start:X}u) & SPU_LS_MASK;")
          for insn in insns:
-@@ -575,3 +588,3 @@ class SPULifter:
-                     f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
--                    f"{{ ctx->pc = 0x{insn.addr:X}; g_spu_trampoline_fn = "
-+                    f"{{ ctx->pc = {self._ls(insn.addr)}; g_spu_trampoline_fn = "
-                     f"{self.prefix}spu_func_{insn.addr:08X}; return; }}")
-@@ -599,3 +612,3 @@ class SPULifter:
-             func.body_lines.append(
--                f"    {{ SPU_DIRECT(ctx, 0x{end:X}, {self.prefix}spu_func_{end:08X}); }}")
-+                f"    {{ SPU_DIRECT(ctx, {self._ls(end)}, {self.prefix}spu_func_{end:08X}); }}")
- 
-@@ -622,2 +635,12 @@ class SPULifter:
- 
-+    def _ls(self, addr: int, mask: int = 0) -> str:
-+        """C expression of the LS address `addr` of this image (masked by
-+        `mask` when given): the constant, or in a position-independent lift
-+        the same address in the loaded copy."""
-+        if mask:
-+            addr &= mask
+@@ -630,8 +643,16 @@ class SPULifter:
+     def _pc(self, a: int) -> str:
+-        """A local-store address derived from the code's own placement: a constant, or
+-        under --reloc the canonical address plus ctx->reloc_delta (wrapped to LS)."""
++        """A local-store address derived from the code's own placement: a constant, under
++        --reloc the canonical address plus ctx->reloc_delta (wrapped to LS), under --pic
++        the link address moved by _pd, the load offset of the copy that runs."""
+         if self.reloc:
+             return f"((0x{a:X}u + (uint32_t)ctx->reloc_delta) & 0x3FFFFu)"
 +        if self.pic:
-+            return f"((0x{addr & 0x3FFFF:X}u + _pd) & SPU_LS_MASK)"
-+        return f"0x{addr:X}"
++            return f"((0x{a & 0x3FFFF:X}u + _pd) & SPU_LS_MASK)"
+         return f"0x{a:X}"
+ 
++    def _pic_pc(self, a: int) -> str:
++        """The pc reported for an instruction: the copy's under --pic, else the lifted
++        address (also under --reloc, as before)."""
++        return self._pc(a) if self.pic else f"0x{a:X}"
 +
      @staticmethod
-@@ -882,5 +905,7 @@ class SPULifter:
+@@ -896,7 +917,7 @@ class SPULifter:
          if mn in ("lqa", "lqr"):
--            return f"{g(rt())} = spu_ls_read128(ctx, {_imm(ops[1])});"
-+            ea = self._ls(int(ops[1], 16)) if self.pic and mn == "lqr" else _imm(ops[1])
-+            return f"{g(rt())} = spu_ls_read128(ctx, {ea});"
+-            # lqr's address is pc-relative (the disassembler gives it absolute): under --reloc it moves with the code
+-            a = self._pc(int(_imm(ops[1]), 0)) if mn == "lqr" and self.reloc else _imm(ops[1])
++            # lqr's address is pc-relative (the disassembler gives it absolute): under --reloc/--pic it moves with the code
++            a = self._pc(int(_imm(ops[1]), 0)) if mn == "lqr" and (self.reloc or self.pic) else _imm(ops[1])
+             return f"{g(rt())} = spu_ls_read128(ctx, {a});"
          if mn in ("stqa", "stqr"):
--            return f"spu_ls_write128(ctx, {_imm(ops[1])}, {g(rt())});"
-+            ea = self._ls(int(ops[1], 16)) if self.pic and mn == "stqr" else _imm(ops[1])
-+            return f"spu_ls_write128(ctx, {ea}, {g(rt())});"
-         if mn == "lqx":
-@@ -910,2 +935,7 @@ class SPULifter:
+-            a = self._pc(int(_imm(ops[1]), 0)) if mn == "stqr" and self.reloc else _imm(ops[1])
++            a = self._pc(int(_imm(ops[1]), 0)) if mn == "stqr" and (self.reloc or self.pic) else _imm(ops[1])
+             return f"spu_ls_write128(ctx, {a}, {g(rt())});"
+@@ -927,2 +948,7 @@ class SPULifter:
                  return "ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
 +            # An absolute target is not part of a position-independent image:
 +            # a transfer to that LS address, wherever this copy runs.
@@ -517,88 +526,69 @@ index 4b334a01..568efc85 100644
 +                return (f"ctx->pc = 0x{tgt:X}u; "
 +                        f"g_spu_trampoline_fn = spu_indirect_branch; return;")
              return self._uncond_branch(tgt, func)
-@@ -918,3 +948,3 @@ class SPULifter:
-             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
--            link = f"{g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X});"   # wraps at the end of LS
-+            link = f"{g(link_rt)} = spu_link({self._ls(addr + 4, 0x3FFFC)});"   # wraps at the end of LS
-             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
-@@ -937,4 +967,8 @@ class SPULifter:
+@@ -954,4 +980,8 @@ class SPULifter:
                  return f"{link} {self._uncond_branch(addr + 4, func)}"
 +            if self.pic and mn == "brasl" and tgt is not None:
 +                return f"{link} {{ uint32_t _tg = 0x{tgt:X}u; {self._dispatch_call(addr, '')} }}"
              if tgt is not None:
                  self.call_targets.add(tgt)
 +                # The callee takes its load offset from the pc (see self.pic).
-+                enter = f"ctx->pc = {self._ls(tgt)}; " if self.pic else ""
++                enter = f"ctx->pc = {self._pc(tgt)}; " if self.pic else ""
                  # Nested host call bracketed by host_depth (so the callee's
-@@ -946,5 +980,5 @@ class SPULifter:
-                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
--                        f"{_drain_ret_open(addr + 4)}"
+@@ -967,3 +997,3 @@ class SPULifter:
+                         f"{_drain_ret_open(self._pc((addr + 4) & 0x3FFFC))}"
 -                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
--                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; "
-+                        f"{_drain_ret_open(self._ls(addr + 4, 0x3FFFC))}"
 +                        f"ctx->host_depth++; {enter}{self.prefix}spu_func_{tgt:08X}(ctx); "
-+                        f"spu_drain_call(ctx, {self._ls(addr + 4)}); ctx->host_depth--; "
-                         f"{_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
-@@ -956,3 +990,3 @@ class SPULifter:
+                         f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; "
+@@ -976,3 +1006,3 @@ class SPULifter:
                  return (f'/* TODO spu: {mn} {insn.operands} */ '
 -                        f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
-+                        f'spu_unsupported({self._ls(insn.addr)}, "{mn}");')
++                        f'spu_unsupported({self._pic_pc(insn.addr)}, "{mn}");')
              if func.start_addr <= tgt < func.end_addr:
-@@ -963,3 +997,3 @@ class SPULifter:
-             # the trampoline and unwind (SPU_DIRECT, spu_context.h).
--            return (f"if ({cond}) {{ SPU_DIRECT(ctx, 0x{tgt:X}, "
-+            return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._ls(tgt)}, "
-                     f"{self.prefix}spu_func_{tgt:08X}); }}")
-@@ -1011,8 +1045,4 @@ class SPULifter:
+@@ -1031,9 +1061,4 @@ class SPULifter:
              # read the target BEFORE writing the link: rt may be the same register as ra
--            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
--                    f"int32_t _si = (int32_t)ctx->image_id; "
--                    f"{_drain_ret_open(addr + 4)}"
+-            rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
+             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
+-                    f"int32_t _si = (int32_t)ctx->image_id; {rs}"
+-                    f"{_drain_ret_open(self._pc((addr + 4) & 0x3FFFC))}"
 -                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
--                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
--                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
-+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._ls(addr + 4, 0x3FFFC)}); "
+-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
+-                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);{rr} }}")
 +                    f"{self._dispatch_call(addr, _ied)} }}")
          # bisled: set link, branch to RA only if an external event is pending.
-@@ -1022,3 +1052,3 @@ class SPULifter:
-             # read the target before writing the link: rt may alias ra
--            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
-+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._ls(addr + 4, 0x3FFFC)}); "
-                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
-@@ -1053,3 +1083,3 @@ class SPULifter:
+@@ -1074,3 +1099,3 @@ class SPULifter:
          return (f'/* TODO spu: {mn} {insn.operands} */ '
 -                f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
-+                f'spu_unsupported({self._ls(insn.addr)}, "{mn}");')
++                f'spu_unsupported({self._pic_pc(insn.addr)}, "{mn}");')
  
-@@ -1068,2 +1098,13 @@ class SPULifter:
+@@ -1089,2 +1114,16 @@ class SPULifter:
  
 +    def _dispatch_call(self, addr: int, ied: str) -> str:
 +        """Body of an indirect call from `addr` to the LS address in _tg, once
 +        the link is set: nested dispatch bracketed like brsl (host_depth +
 +        SPU_DRAIN + image save/restore) so the callee's tail-chains drain here
 +        and its `bi $r0` returns via host return."""
-+        return (f"int32_t _si = (int32_t)ctx->image_id; "
-+                f"{_drain_ret_open(self._ls(addr + 4, 0x3FFFC))}"
++        # --reloc: the callee's drain may dispatch into other placed code, which sets
++        # ctx->reloc_delta for itself; put this placement's back on return.
++        rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
++        return (f"int32_t _si = (int32_t)ctx->image_id; {rs}"
++                f"{_drain_ret_open(self._pc((addr + 4) & 0x3FFFC))}"
 +                f"{ied}ctx->pc = _tg; ctx->host_depth++; "
-+                f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._ls(addr + 4)}); "
-+                f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);")
++                f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
++                f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);{rr}")
 +
      def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
-@@ -1078,3 +1119,3 @@ class SPULifter:
-         # host-stack growth either way; SPU_DIRECT, spu_context.h).
--        return (f"{{ SPU_DIRECT(ctx, 0x{tgt:X}, {self.prefix}spu_func_{tgt:08X}); }}")
-+        return (f"{{ SPU_DIRECT(ctx, {self._ls(tgt)}, {self.prefix}spu_func_{tgt:08X}); }}")
- 
-@@ -1122,4 +1163,5 @@ class SPULifter:
+@@ -1143,5 +1182,6 @@ class SPULifter:
                  lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
--                lines.append(f"    ctx->pc = 0x{t:X}u; "
+-                pc = self._pc(t) if self.reloc else f"0x{t:X}u"
+-                lines.append(f"    ctx->pc = {pc}; "
 -                             f"g_spu_trampoline_fn = spu_indirect_branch; return;")
-+                # A position-independent caller has already set the pc of the copy.
-+                pc = "" if self.pic else f"ctx->pc = 0x{t:X}u; "
++                # --reloc: the copy's pc from ctx->reloc_delta; --pic: a position-independent
++                # caller has already set the pc of the copy (the stub has no _pd).
++                pc = f"ctx->pc = {self._pc(t)}; " if self.reloc else "" if self.pic else f"ctx->pc = 0x{t:X}u; "
 +                lines.append(f"    {pc}g_spu_trampoline_fn = spu_indirect_branch; return;")
                  lines.append("}")
-@@ -1167,2 +1209,11 @@ def main() -> None:
+@@ -1189,2 +1229,12 @@ def main() -> None:
      p.add_argument("--report", help="Write machine-readable generation diagnostics JSON")
 +    p.add_argument("--pic", action="store_true",
 +                   help="Position-independent image: code the title loads at a "
@@ -608,13 +598,19 @@ index 4b334a01..568efc85 100644
 +                        "at; register the image with "
 +                        "spu_overlay_register_pic_region so dispatch maps a "
 +                        "loaded copy to them. Absolute branches (bra/brasl) "
-+                        "stay absolute.")
++                        "stay absolute. The other form of --reloc (which takes "
++                        "the offset from ctx->reloc_delta); not with it.")
      p.add_argument("--trace", action="store_true",
-@@ -1331,3 +1382,3 @@ def main() -> None:
+@@ -1246,2 +1296,4 @@ def main() -> None:
+     args = p.parse_args()
++    if args.pic and args.reloc:
++        p.error("--pic and --reloc are two forms of one thing: give one")
+ 
+@@ -1358,3 +1410,3 @@ def main() -> None:
  
 -    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
 +    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, pic=args.pic)
-     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
+     lifter.reloc = args.reloc
 diff --git a/tools/test_spu_lifter_pic.py b/tools/test_spu_lifter_pic.py
 new file mode 100644
 index 00000000..f79db8b6

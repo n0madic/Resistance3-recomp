@@ -9,48 +9,50 @@ run, each ending in an unmapped JUMP/CALL and a resync. One of those garbage wor
 a depth near the near plane: every later depth clear then culled the whole scene and the screen stayed flat yellow.
 
 cellGcm_on_put_store now follows JUMPs at get on the storing thread (at most 8, never a park or an unmapped target),
+in either form the walker decodes (0x20000000 | offset, and offset | 1 since upstream #675: gcm_fifo_jump_target),
 under the walker's lock, and publishes get as the walker does. Methods are left to the walker, since they need the
 backend on the present thread. A put store made by the walker itself (the ring recycle) skips it.
 
 tests/gcm_put_jump drives that injection through the walker with no backend: get is back at G as soon as put is
-stored, and the block's memory overwritten afterwards is never executed.
+stored, and the block's memory overwritten afterwards is never executed; a second injection does the same with
+new-form JUMPs (its put-store check fails when the hook decodes only the old form).
 
 The put word's store reaches cellGcm_on_put_store from vm_write32 (ppu_loader.cpp). Lifted PPU code stores inline
 (#573/#574, vm_write32_mm in the lifted header) and would never get there, so the inline store leaves that one word
 to vm_write32, as the inline load does with the ref-poll word next to it (tools/test_ppu_put_store_hook.py: fails
 without it). The lifted header changes, so the module is rebuilt.
-The two loader fixtures that link ppu_loader.cpp (test_ppu_entry_arguments, test_loaded_image_memory) stub it, as they
-stub the other subsystems the loader reaches.
+The loader fixtures that link ppu_loader.cpp (test_ppu_entry_arguments, test_loaded_image_memory, and
+test_ppu_primary_priority, new in v0.19.0) stub it, as they stub the other subsystems the loader reaches.
 
 Upstream: not proposed yet.
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 5fc01f22..edc8545c 100644
+index f2ff530b..427026ce 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -405,2 +405,4 @@ if(PS3RECOMP_BUILD_TESTS)
-         add_subdirectory(tests/gcm_reports)
+@@ -434,2 +434,4 @@ if(PS3RECOMP_BUILD_TESTS)
+         add_subdirectory(tests/gcm_fifo_jump)
 +        # ...and the JUMP at an idle get, taken on the put store.
 +        add_subdirectory(tests/gcm_put_jump)
      endif()
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 60e7e7b2..b0a5d106 100644
+index bf119774..9c9d40cb 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -2016,2 +2016,5 @@ static void wprof_note_walker(void) {}
+@@ -2243,2 +2243,5 @@ static void wprof_note_walker(void) {}
  volatile unsigned long g_gcm_drain_tid;
 +/* Set on the thread running the walker: a put store it makes itself (the ring
 + * recycle) must not take the lock it already holds. */
 +static _Thread_local int t_in_fifo_walker;
  
-@@ -2023,3 +2026,5 @@ void cellGcm_rsx_process_fifo(void)
+@@ -2250,3 +2253,5 @@ void cellGcm_rsx_process_fifo(void)
      AcquireSRWLockExclusive(&s_gcm_fifo_lock);
 +    t_in_fifo_walker = 1;
      gcm_rsx_process_fifo_unlocked();
 +    t_in_fifo_walker = 0;
      ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
-@@ -2123,2 +2128,42 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live, u3
+@@ -2390,2 +2395,42 @@ static int gcm_report_hold(void)
   * RSX-thread profiles, so each is read once and cached, like the other knobs. */
 +/* JUMPs taken at once when put moves; a chain longer than this is left to the walker. */
 +#define GCM_PUT_STORE_JUMPS 8u
@@ -73,15 +75,15 @@ index 60e7e7b2..b0a5d106 100644
 +    {
 +        const u32 get = s_fifo_getoff;
 +        const u32 ea = get != put ? gcm_io2ea(get) : 0;
-+        if (!ea || (vm_read32(ea) >> 29) != 1u) return;
++        u32 tgt;
++        if (!ea || !gcm_fifo_jump_target(vm_read32(ea), &tgt)) return;
 +    }
 +    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
 +    for (u32 n = 0; n < GCM_PUT_STORE_JUMPS && s_fifo_getoff != put; n++) {
 +        const u32 ea = gcm_io2ea(s_fifo_getoff);
 +        if (!ea) break;
-+        const u32 w = vm_read32(ea);
-+        if ((w >> 29) != 1u) break;                         /* not a JUMP: the walker's work */
-+        const u32 tgt = w & 0x1FFFFFFCu;
++        u32 tgt;
++        if (!gcm_fifo_jump_target(vm_read32(ea), &tgt)) break;   /* not a JUMP: the walker's work */
 +        if (tgt == s_fifo_getoff || !gcm_io2ea(tgt)) break; /* a park, or a bad branch the walker reports */
 +        s_fifo_getoff = tgt;
 +        if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt);
@@ -94,10 +96,10 @@ index 60e7e7b2..b0a5d106 100644
 +
  static void gcm_rsx_process_fifo_unlocked(void)
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index 9309f2d3..39987397 100644
+index ea7de18a..a4efb90f 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
-@@ -2066,3 +2066,5 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
+@@ -2071,3 +2071,5 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         * are guest memory and the PPU reads most of them straight back. */
 -      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
 +      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4);
@@ -105,13 +107,21 @@ index 9309f2d3..39987397 100644
 +      if ((uint32_t)a == VM_HLE_INJECT_BASE + 0x2000u) { extern void cellGcm_on_put_store(uint32_t); cellGcm_on_put_store(_v); } } }
  void vm_write64(uint64_t a, uint64_t v) {
 diff --git a/runtime/ppu/tests/test_ppu_entry_arguments.cpp b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
-index 627376d5..7132d3b4 100644
+index c9c09012..76cfef72 100644
 --- a/runtime/ppu/tests/test_ppu_entry_arguments.cpp
 +++ b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
 @@ -22,2 +22,3 @@ void cellGcm_ref_on_poll(void) { std::abort(); }
  void ps3_stdio_init(void) {}
 +void cellGcm_on_put_store(uint32_t) { std::abort(); }
  HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
+diff --git a/runtime/ppu/tests/test_ppu_primary_priority.cpp b/runtime/ppu/tests/test_ppu_primary_priority.cpp
+index 17850ce5..8e5d68ba 100644
+--- a/runtime/ppu/tests/test_ppu_primary_priority.cpp
++++ b/runtime/ppu/tests/test_ppu_primary_priority.cpp
+@@ -21,2 +21,3 @@ uint32_t g_gcm_consumer_put_wake_ea = 0;
+ void cellGcm_fifo_kick_notify(void) { std::abort(); }
++void cellGcm_on_put_store(uint32_t) { std::abort(); }
+ void sys_memory_set_image_query(uint64_t (*)(uint64_t, uint64_t)) {}
 diff --git a/tests/gcm_put_jump/CMakeLists.txt b/tests/gcm_put_jump/CMakeLists.txt
 new file mode 100644
 index 00000000..6ecf4120
@@ -146,10 +156,10 @@ index 00000000..6ecf4120
 +add_test(NAME gcm_put_jump COMMAND test_gcm_put_jump)
 diff --git a/tests/gcm_put_jump/main.c b/tests/gcm_put_jump/main.c
 new file mode 100644
-index 00000000..453f88ef
+index 00000000..11a613ba
 --- /dev/null
 +++ b/tests/gcm_put_jump/main.c
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,168 @@
 +/*
 + * ps3recomp - tests/gcm_put_jump
 + *
@@ -164,7 +174,9 @@ index 00000000..453f88ef
 + *   - the block's memory overwritten afterwards (with a GET_REPORT into main
 + *     memory) is never executed;
 + *   - a put store with a method, not a JUMP, at get leaves get to the walker,
-+ *     and the walker still executes it.
++ *     and the walker still executes it;
++ *   - the same injection in the new JUMP form (offset | 1), which the walker
++ *     decodes too.
 + *
 + * Exit code 0 when every check passes.
 + */
@@ -189,6 +201,7 @@ index 00000000..453f88ef
 +#define HEAP_BASE  0x00400000u
 +
 +#define BLOCK_OFF  0x8000u          /* the injected block, in the IO window */
++#define BLOCK2_OFF 0xC000u          /* the second one, injected with new-form JUMPs */
 +#define REPORT_OFF 0x50390u         /* main-memory report slot the stale block would write */
 +#define REPORT2    0x503A0u         /* report slot the ring writes itself */
 +#define SENTINEL   0xA5A5A5A5u
@@ -197,6 +210,7 @@ index 00000000..453f88ef
 +#define M_GET_REPORT 0x1800u        /* NV4097_GET_REPORT */
 +#define M_ZCLEAR     0x1D8Cu        /* NV4097_SET_ZSTENCIL_CLEAR_VALUE */
 +#define JUMP(io)     (0x20000000u | (io))
++#define NEWJUMP(io)  ((io) | 1u)     /* the new JUMP form */
 +
 +static void gw32(uint32_t ea, uint32_t v)
 +{
@@ -295,6 +309,21 @@ index 00000000..453f88ef
 +    CHECK(gr32(IO_ADDR + REPORT_OFF) == SENTINEL && gr32(IO_ADDR + REPORT_OFF + 8) == SENTINEL,
 +          "the reused block was not executed (report slot 0x%08X)", gr32(IO_ADDR + REPORT_OFF + 8));
 +
++    /* Again at the new idle get G2, with new-form JUMPs. */
++    const uint32_t g2 = end;
++    const uint32_t block2_end = put_method(BLOCK2_OFF, M_ZCLEAR, 0xFFFFFF00u);
++    gw32(IO_ADDR + block2_end, NEWJUMP(g2));
++    const uint32_t saved2 = gr32(IO_ADDR + g2);
++    gw32(IO_ADDR + g2, NEWJUMP(BLOCK2_OFF));
++    store_put(block2_end);
++    cellGcm_rsx_process_fifo();
++    CHECK(vm_read32(ctrl + 4) == block2_end, "new form: walker ran the block to 0x%X (get 0x%X)",
++          block2_end, vm_read32(ctrl + 4));
++    store_put(g2);
++    gw32(IO_ADDR + g2, saved2);
++    CHECK(vm_read32(ctrl + 4) == g2, "new form: the put store took the JUMP back: get 0x%X == G2 0x%X",
++          vm_read32(ctrl + 4), g2);
++
 +    printf("[gcm_put_jump] %s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
 +    free(vm_base);
 +    return g_fail ? 1 : 0;
@@ -308,7 +337,7 @@ index a678053b..bd21b92d 100644
 +void cellGcm_on_put_store(uint32_t) { std::abort(); }
  HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
 diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
-index a657ba61..421df1c7 100644
+index 464ff41b..e467a352 100644
 --- a/tools/ppu_lifter.py
 +++ b/tools/ppu_lifter.py
 @@ -192,3 +192,4 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until

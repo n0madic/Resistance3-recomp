@@ -11,7 +11,9 @@ of the span did before; elsewhere the span's lift runs, and its bytes there are 
 verified region compares the bytes outside the ranges. A load of the span's own module clears them.
 
 Test: runtime/spu/tests/test_spu_lifted_start.c test_resident_code_holes, test_verified_with_holes and the adapted
-case in test_verified_resident_code_regions (6 checks fail without the change). Scripted run, together with 0006 and
+case in test_verified_resident_code_regions (6 checks fail without the change). #654's
+runtime/spu/tests/test_spu_overlay_allsize.c expected a partial foreign overwrite to drop the span; it now checks the
+hole instead. Scripted run, together with 0006 and
 the buffer modules of scripts/extract_spu_raw.py: interpreter steps in gameplay about 23M/s -> 13M/s (what is left is
 mostly the position-independent modules); Home level, stick turning, two runs: 24.2 -> 26.6-26.9 fps.
 
@@ -19,10 +21,10 @@ Upstream: not proposed yet (same problem as the code-only spans of PR #444, for 
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 47431698..167ecc17 100644
+index 665b58e8..12fc9ae6 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1720,2 +1720,9 @@ int spu_have_function(uint32_t addr)
+@@ -1754,2 +1754,9 @@ int spu_have_function(uint32_t addr)
  static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
 +/* Was `lsa` of this resident span overwritten by another DMA since the load? */
 +static int spu_resident_hole(const spu_context* ctx, unsigned slot, uint32_t lsa)
@@ -31,19 +33,19 @@ index 47431698..167ecc17 100644
 +        if (lsa >= ctx->resident_code[slot].holes[h][0] && lsa < ctx->resident_code[slot].holes[h][1]) return 1;
 +    return 0;
 +}
- static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
-@@ -1727,2 +1734,6 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa, int* reloc)
+@@ -1761,2 +1768,6 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
      if (!ctx) return (spu_lifted_fn)spu_lookup_memoized(lsa, 0);
 +    /* A span owns its LS addresses except where another DMA wrote since its
 +     * load: there the bytes are not its, and the address resolves as if the
 +     * span were not resident (a span loaded into it, then task, overlay and
 +     * image), as all of it did when such a DMA dropped the whole span. */
      for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
-@@ -1731,2 +1742,3 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+@@ -1765,2 +1776,3 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
              lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
 +            if (spu_resident_hole(ctx, slot, lsa)) continue;
              /* A region registered with its code bytes owns its span even when
-@@ -1953,4 +1965,14 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+@@ -2027,4 +2039,14 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
          int match = 1;
 +        /* Byte runs between the holes: what another DMA overwrote is not code
 +         * of this load (spu_lifted_lookup_full does not dispatch there). */
@@ -59,7 +61,7 @@ index 47431698..167ecc17 100644
 +                if (run > a) { match = !memcmp(ctx->ls + a, o->code[i].bytes + (a - o->code[i].lsa), run - a); a = run; }
 +            }
          *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
-@@ -2144,3 +2166,14 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2219,3 +2241,14 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
              if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
 -                ctx->resident_code[slot].image_id = 0;
 +                /* Only the bytes this DMA wrote stop being the load's. */
@@ -75,12 +77,12 @@ index 47431698..167ecc17 100644
 +                    if (hi > holes[h][1]) holes[h][1] = hi;
 +                }
                  spu_dcache_residency_changed(ctx);
-@@ -2172,2 +2205,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
-                     ctx->resident_code[slot].source_index = i;
+@@ -2256,2 +2289,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                     ctx->resident_code[slot].canon = o->canon;
 +                    ctx->resident_code[slot].n_holes = 0;
                      spu_dcache_residency_changed(ctx);
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index 62b3dbc7..ea2c22b3 100644
+index 196972e3..bb01db66 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
 @@ -184,2 +184,4 @@ typedef struct spu_channel {
@@ -88,18 +90,18 @@ index 62b3dbc7..ea2c22b3 100644
 +/* Ranges of a resident span that another DMA overwrote since the load (spu_context.resident_code). */
 +#define SPU_RESIDENT_CODE_HOLES 8u
  
-@@ -310,2 +312,6 @@ typedef struct spu_context {
-         int verify_state, source_index;
+@@ -314,2 +316,6 @@ typedef struct spu_context {
+         uint32_t canon;
 +        /* LS ranges [lo, hi) inside the span that a DMA from elsewhere wrote
 +         * since the load (job data, another module): the lift is stale there
 +         * only. More than SPU_RESIDENT_CODE_HOLES merge into the last one. */
 +        uint32_t n_holes, holes[SPU_RESIDENT_CODE_HOLES][2];
      } resident_code[SPU_RESIDENT_CODE_SLOTS];
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
-index a04da3c4..594992f9 100644
+index 217f733d..f4e40cd0 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
 +++ b/runtime/spu/tests/test_spu_lifted_start.c
-@@ -452,2 +452,72 @@ static void test_many_resident_code_regions(void)
+@@ -490,2 +490,72 @@ static void test_many_resident_code_regions(void)
  
 +/* A DMA from elsewhere into a resident span (job data, a smaller module loaded
 + * into the bigger one's data area) takes over only the bytes it wrote: the rest
@@ -172,7 +174,7 @@ index a04da3c4..594992f9 100644
 +}
 +
  /* A streamed region registered with its code bytes dispatches by residency
-@@ -491,4 +561,6 @@ static void test_verified_resident_code_regions(void)
+@@ -529,4 +599,6 @@ static void test_verified_resident_code_regions(void)
  
 -    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base + 0x80, 0x80);
 -    check(spu_lifted_lookup(ctx, base) != code_verified, "foreign DMA into the span clears residency");
@@ -181,11 +183,28 @@ index a04da3c4..594992f9 100644
 +    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base, 0x10);
 +    check(spu_lifted_lookup(ctx, base) != code_verified, "foreign DMA over the code drops it there");
  
-@@ -1092,2 +1164,4 @@ int main(void)
+@@ -1131,2 +1203,4 @@ int main(void)
      test_many_resident_code_regions();
 +    test_resident_code_holes();
 +    test_verified_with_holes();
      test_resident_interpreter_rejoin();
+diff --git a/runtime/spu/tests/test_spu_overlay_allsize.c b/runtime/spu/tests/test_spu_overlay_allsize.c
+index 5b1fda90..ed10a0e3 100644
+--- a/runtime/spu/tests/test_spu_overlay_allsize.c
++++ b/runtime/spu/tests/test_spu_overlay_allsize.c
+@@ -63,6 +63,10 @@ static void residency_and_epochs(spu_context* c)
+     CHECK(spu_lifted_lookup(c,base)==lifted);
+-    /* Partial foreign overwrite starts below the resident range. */
++    /* Partial foreign overwrite starts below the resident range: the bytes it
++     * wrote stop being the load's (a hole), the rest of the span stays. */
+     epoch=c->dcache_residency;
+     spu_overlay_note_get(c,0x79000000,c->ls+base-16,512);
+-    CHECK(!c->resident_code[0].image_id);CHECK(c->dcache_residency!=epoch);
++    CHECK(c->resident_code[0].image_id==701);CHECK(c->dcache_residency!=epoch);
++    CHECK(c->resident_code[0].n_holes==1&&c->resident_code[0].holes[0][0]==base&&
++          c->resident_code[0].holes[0][1]==base-16+512);
++    CHECK(spu_lifted_lookup(c,base)==NULL);
+ 
 diff --git a/tools/test_lift_jobmods_verified.py b/tools/test_lift_jobmods_verified.py
 index c423151a..06c9045a 100644
 --- a/tools/test_lift_jobmods_verified.py

@@ -15,26 +15,26 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index eb2f83e2..8c2973ca 100644
+index e6d26149..aaaabd9a 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -480,2 +480,5 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+@@ -485,2 +485,5 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
  
 +static int (*s_menu_query)(void);
 +void cellPad_set_menu_query(int (*in_menu)(void)) { s_menu_query = in_menu; }
 +
  /* PAD_KEYBOARD_LAYOUT=fps: a PC shooter's keyboard and mouse in place of the
-@@ -485,3 +488,4 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
+@@ -490,3 +493,4 @@ static void pad_mouse_stick(double dx, double dy, double dt, u8* rx, u8* ry)
   * G/F = L2/R2, Shift = L3, V = R3, arrows and 1/2/3/4 = d-pad (up, right,
 - * down, left), Esc/Enter = START, Tab = SELECT. What a button does is the
 + * down, left), Enter/Esc = CROSS/CIRCLE in a menu and START elsewhere,
 + * Tab = SELECT. What a button does is the
   * title's; this follows the usual shooter one (R1 fires, L1 aims, L3 sprints,
-@@ -501,3 +505,2 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+@@ -506,3 +510,2 @@ static u16 pad_keyboard_fps(PadHostState* hs)
          { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_4,      CELL_PAD_CTRL_LEFT },
 -        { PADKEY_ESCAPE, CELL_PAD_CTRL_START },   { PADKEY_RETURN, CELL_PAD_CTRL_START },
          { PADKEY_TAB,    CELL_PAD_CTRL_SELECT },
-@@ -509,2 +512,15 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+@@ -514,2 +517,15 @@ static u16 pad_keyboard_fps(PadHostState* hs)
  
 +    /* Enter and Esc confirm and go back in a menu (cellPad_set_menu_query) and press START (start, pause, skip)
 +     * elsewhere. A key keeps the button it got when it went down until it is released: Esc pauses, the pause menu

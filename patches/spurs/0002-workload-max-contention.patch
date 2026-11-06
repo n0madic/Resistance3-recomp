@@ -2,16 +2,17 @@ SPURS: read maxContention, the 9th argument of _cellSpursWorkloadAttributeInitia
 
 The HLE adapter hands over r3..r10 only, so the attribute was always written with maxContention = 1. Resistance 3 creates
 its job policy (igPm) with maxContention 5 and gives each SPU a bucket of its job queue through SPU_RdSigNotify1; with one
-SPU only bucket 0 was ever served and the main thread waited forever for a job of bucket 2.
+SPU only bucket 0 was ever served and the main thread waited forever for a job of bucket 2. Upstream #649 (v0.19.0)
+clamps maxContention to CELL_SPURS_MAX_SPU in cellSpursAddWorkload, which the attribute path goes through; 5 is below it.
 
 Upstream: not proposed yet.
 ---
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 453bea4d..2606b914 100644
+index be0d1bf1..8ed13886 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -1604,3 +1604,7 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
+@@ -1858,3 +1858,7 @@ s32 _cellSpursWorkloadFlagReceiver(u64 spurs_ea, u32 wid, u32 is_set)
   * NID differs from the non-underscore inline wrapper). Args arrive raw in
 - * r3..r10; writes the REAL BE layout so AddWorkloadWithAttribute round-trips. */
 + * r3..r10; writes the REAL BE layout so AddWorkloadWithAttribute round-trips.
@@ -20,18 +21,18 @@ index 453bea4d..2606b914 100644
 + * r1 alone. Resistance 3 runs its job policy on 5 SPUs at once that way. */
 +#define WKATTR_ARG9_SP_OFF 0x70u
  s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVersion,
-@@ -1610,2 +1614,5 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
+@@ -1864,2 +1868,5 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
      if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
 +    extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 +    u32 maxContention = g_active_ctx
 +        ? (u32)vm_read64((u32)g_active_ctx->gpr[1] + WKATTR_ARG9_SP_OFF) : 1;
      vm_write32((u32)attr_ea + WKATTR_REVISION,   revision);
-@@ -1619,3 +1626,3 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
+@@ -1873,3 +1880,3 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
      vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
 -    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
 +    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, maxContention);
      vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
-@@ -1624,4 +1631,4 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
+@@ -1878,4 +1885,4 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
      vm_write32((u32)attr_ea + WKATTR_HOOK_ARG, 0);
 -    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u)\n",
 -           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention);

@@ -8,10 +8,10 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 2606b914..f6aec2ff 100644
+index 8ed13886..9eef9a0d 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -1874,2 +1874,10 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -2151,2 +2151,10 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
      memset(si->idle, 0, sizeof(si->idle));
 +    /* The workers run lifted SPU job code, whose brsl chains are deep host call chains: Resistance 3's level load
 +     * overflowed a 1 MB stack in an Insomniac job (igjob_00DC0200) and the host died with SIGBUS on the guard page.
@@ -22,7 +22,7 @@ index 2606b914..f6aec2ff 100644
 +    const DWORD pm_stack_flags = 0;
 +#endif
      for (u32 sn = 0; sn < si->nspus; sn++) {
-@@ -1878,3 +1886,3 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -2155,3 +2163,3 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
          slot->instance = si; slot->spu_num = sn;
 -        slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
 +        slot->thread = CreateThread(NULL, 256u << 20, spurs_pm_worker, slot, pm_stack_flags, NULL);

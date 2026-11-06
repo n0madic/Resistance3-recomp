@@ -4,7 +4,8 @@ spu_context.resident_code records which lifted image owns each streamed code spa
 dispatcher keeps modules in up to nine LS buffers at once (0x100, 0x6600, 0xDF00, 0x20680, 0x21600, 0x21F00, 0x23B80,
 0x24D00 and its own code at 0x3F580; scripts/extract_spu_raw.py registers them). With four slots the fifth load found
 none free ("[spu-ovl] no free resident code span") and that module ran in the interpreter. The count is a named
-constant now; spu_context grows (the module must be rebuilt).
+constant now; spu_context grows (the module must be rebuilt). The #654 fixture's drop-residency mutant
+(tools/test_spu_overlay_allsize.py --mutants) names the loop by the constant too.
 
 Test: runtime/spu/tests/test_spu_lifted_start.c test_many_resident_code_regions (nine buffers resident together;
 fails with four slots).
@@ -13,26 +14,26 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 6eec987b..47431698 100644
+index 27430834..665b58e8 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1727,3 +1727,3 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+@@ -1761,3 +1761,3 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
      if (!ctx) return (spu_lifted_fn)spu_lookup_memoized(lsa, 0);
 -    for (unsigned slot = 0; slot < 4; ++slot)
 +    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
          if (ctx->resident_code[slot].image_id &&
-@@ -2138,3 +2138,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2213,3 +2213,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      spu_ovl_dump(ctx, ea, lsa, ls, size);
 -    for (unsigned slot = 0; slot < 4; ++slot) {
 +    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
          if (!ctx->resident_code[slot].image_id) continue;
-@@ -2163,3 +2163,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2243,3 +2243,3 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                  if (o->code && lsa != o->load_lsa) continue;
 -                for (unsigned slot = 0; slot < 4; ++slot) {
 +                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
-                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                     /* A relocatable image takes over its own previous placement's slot: each load
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index f18df065..62b3dbc7 100644
+index 32837614..196972e3 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
 @@ -181,2 +181,6 @@ typedef struct spu_channel {
@@ -49,25 +50,30 @@ index f18df065..62b3dbc7 100644
 +     * up to SPU_RESIDENT_CODE_SLOTS of them at once (a job dispatcher may keep
 +     * several modules in different LS buffers). */
      struct {
-@@ -304,3 +310,3 @@ typedef struct spu_context {
-         int verify_state, source_index;
+@@ -308,3 +314,3 @@ typedef struct spu_context {
+         uint32_t canon;
 -    } resident_code[4];
 +    } resident_code[SPU_RESIDENT_CODE_SLOTS];
- 
+     /* Placement minus canonical base of the relocatable code running now (spu_lifter.py
 diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
-index e9b8f613..62c2fc99 100644
+index 6d63141f..ddb28698 100644
 --- a/runtime/spu/spu_interp.c
 +++ b/runtime/spu/spu_interp.c
-@@ -457,3 +457,3 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
-         uint32_t pc = start_lsa & 0x3FFFC; int owner = ctx->image_id;
+@@ -435,3 +435,3 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+         uint32_t pc = start_lsa & 0x3FFFC, key = pc; int owner = ctx->image_id;
 -        for (unsigned s = 0; s < 4; ++s)
 +        for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
              if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
-index ce11d991..a04da3c4 100644
+index e252a415..217f733d 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
 +++ b/runtime/spu/tests/test_spu_lifted_start.c
-@@ -423,2 +423,31 @@ static void test_resident_code_regions(void)
+@@ -417,3 +417,3 @@ static void test_reloc_regions(void)
+     spu_overlay_note_get(c, 0x900000, c->ls + 0x30000, 16);
+-    int n = 0; for (unsigned s = 0; s < 4; ++s) n += c->resident_code[s].image_id == 140;
++    int n = 0; for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s) n += c->resident_code[s].image_id == 140;
+     check(n == 1, "reloc: a new placement takes over the image's slot");
+@@ -461,2 +461,31 @@ static void test_resident_code_regions(void)
  
 +/* Nine code buffers resident together (Resistance 3's job dispatcher keeps
 + * modules in that many LS buffers): each dispatches its own lift. With four
@@ -99,7 +105,16 @@ index ce11d991..a04da3c4 100644
 +}
 +
  /* A streamed region registered with its code bytes dispatches by residency
-@@ -1062,2 +1091,3 @@ int main(void)
+@@ -1101,2 +1130,3 @@ int main(void)
      test_registry_lookup_memo();
 +    test_many_resident_code_regions();
      test_resident_interpreter_rejoin();
+diff --git a/tools/test_spu_overlay_allsize.py b/tools/test_spu_overlay_allsize.py
+index 02bd7419..32e1d07c 100644
+--- a/tools/test_spu_overlay_allsize.py
++++ b/tools/test_spu_overlay_allsize.py
+@@ -67,3 +67,3 @@ def run(work):
+             'reject-matches':('!spu_ovl_ea_known(ea)', '1'),
+-            'drop-residency':('    for (unsigned slot = 0; slot < 4; ++slot) {\n        if (!ctx->resident_code[slot].image_id) continue;', '    for (unsigned slot = 4; slot < 4; ++slot) {\n        if (!ctx->resident_code[slot].image_id) continue;'),
++            'drop-residency':('    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {\n        if (!ctx->resident_code[slot].image_id) continue;', '    for (unsigned slot = SPU_RESIDENT_CODE_SLOTS; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {\n        if (!ctx->resident_code[slot].image_id) continue;'),
+             'ignore-signatures':('!atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)', '1'),

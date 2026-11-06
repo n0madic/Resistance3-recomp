@@ -22,19 +22,19 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 250d8d2c..5fc01f22 100644
+index d68ec3ee..f2ff530b 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -402,2 +402,4 @@ if(PS3RECOMP_BUILD_TESTS)
+@@ -427,2 +427,4 @@ if(PS3RECOMP_BUILD_TESTS)
      if(UNIX)
 +        # ...NV0039 buffer copies, and the spans they must not run past.
 +        add_subdirectory(tests/gcm_nv0039)
          add_subdirectory(tests/gcm_reports)
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index fd525d21..60e7e7b2 100644
+index a178d42b..bf119774 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1322,2 +1322,57 @@ static void nv3089_blit(void)
+@@ -1541,2 +1541,57 @@ static void nv3089_blit(void)
  
 +/* NV0039 (memory-to-memory buffer copy), libgcm's subchannel 1: cellGcmSetTransferData
 + * and friends. BUFFER_NOTIFY runs the copy, LINE_COUNT lines of LINE_LENGTH bytes, each
@@ -92,7 +92,7 @@ index fd525d21..60e7e7b2 100644
 +}
 +
  static void gcm_2d_method(u32 subch, u32 method, u32 data)
-@@ -1352,2 +1407,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+@@ -1571,2 +1626,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
       * headers); other versions use the classic 2 / 4. Accept both. */
 +    if (subch == 1) {                        /* NV0039 buffer copy */
 +        switch (method) {
@@ -109,7 +109,7 @@ index fd525d21..60e7e7b2 100644
 +        }
 +    }
      if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
-@@ -2660,5 +2729,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2932,5 +3001,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   * same reason the live engine does, and masks them itself. */
 +                /* Only what the 3D path takes, plus the driver methods: the engine
 +                 * strips the subchannel, so a 2D engine's state (NV0039's OFFSET_OUT

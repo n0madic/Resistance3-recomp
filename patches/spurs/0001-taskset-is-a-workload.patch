@@ -1,38 +1,44 @@
 cellSpurs: every taskset is a workload of its SPURS instance.
 
-The HLE numbers tasksets in creation order and publishes each as a workload: the taskset EA in wklInfo1[wid].arg and the
+The HLE numbers tasksets in creation order and publishes each as a workload: the taskset EA in wklInfo[wid].arg and the
 workload's bit in wklEnabled (initialised to 0x8000FFFF, as the real initialiser leaves it); the SPU side reads the id
 from the taskset. A lock-free queue push finds the task to signal through that table (host/spurs_lfqueue.cpp reads it),
 and the real library's own entry points validate the instance against wklEnabled. Workload 0 follows the newest taskset,
-which always holds the consumer just created.
+which always holds the consumer just created. A CellSpurs (16 workloads) numbers tasksets 0-15 in wklInfo1; a CellSpurs2
+(upstream #629, v0.19.0) 0-31, with 16-31 in wklInfo2 (wkl_info_off). Upstream still creates every taskset as workload 0
+with no table entry; #643 (argTaskset) does not touch this.
 
 Resistance 3 creates one taskset with an LFQueue consumer; without this its task parks in WAIT_SIGNAL and the boot never
 leaves it (the SPU side logs "sleeping Ns in WAIT_SIGNAL" for task 0).
+
+Test: tools/test_spurs_taskset_workload.py (the real creation path on a CellSpurs and a CellSpurs2: the id in the
+taskset, wklInfo1/wklInfo2 arg, wklEnabled bits, workload 0 following the newest taskset; fails on plain v0.19.0).
 
 Upstream: not proposed.
 ---
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 82ea66c6..453bea4d 100644
+index b09220e2..be0d1bf1 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -459,2 +459,3 @@ static struct SpursInst {
+@@ -481,2 +481,3 @@ static struct SpursInst {
      u32 cursor, pass_no;
 +    u32 next_taskset_wid; /* workload id of the next taskset (SPU side reads it from the taskset) */
  } s_inst[MAX_SPURS_INST];
-@@ -530,2 +531,24 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+@@ -590,2 +591,25 @@ static int spurs_guest_range_valid(u32 ea, u32 bytes);
  
 +/* Every taskset the HLE creates is a workload of the instance, numbered in creation order.
 + * The SPU side reads the id from the taskset (CSTS_WID) and records it when a task parks on
-+ * a queue; the real library finds the taskset of a workload in wklInfo1[wid].arg and checks
++ * a queue; the real library finds the taskset of a workload in wklInfo[wid].arg and checks
 + * the workload's bit in wklEnabled, e.g. when it signals a task waiting on a lock-free queue
 + * (_cellSpursLFQueuePushBody). So publish both, like cellSpursAddWorkload does. */
 +static u32 spurs_register_taskset_workload(u32 spurs_ea, u32 taskset_ea)
 +{
 +    struct SpursInst* si = spurs_inst_find(spurs_ea);
++    const u32 nwid = si && si->is2 ? SPURS_MAX_WID : CELL_SPURS_MAX_WORKLOAD;
 +    u32 wid = si ? si->next_taskset_wid++ : 0;
-+    if (wid >= CELL_SPURS_MAX_WORKLOAD) wid = CELL_SPURS_MAX_WORKLOAD - 1;
-+    vm_write64(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x08, taskset_ea);
++    if (wid >= nwid) wid = nwid - 1;
++    vm_write64(spurs_ea + wkl_info_off(wid) + 0x08, taskset_ea);
 +    vm_write32(spurs_ea + SPURS_WKL_ENABLED,
 +               vm_read32(spurs_ea + SPURS_WKL_ENABLED) | (0x80000000u >> wid));
 +    /* A push on a fresh lock-free queue signals (workload 0, task 0): the queue's waiting-consumer
@@ -40,26 +46,117 @@ index 82ea66c6..453bea4d 100644
 +     * added first; this one is replaced by a taskset that is shut down and recreated at the same
 +     * address, and the signal then reaches a taskset without task 0 and the push fails (SRCH).
 +     * Keep workload 0 pointing at the newest taskset, which always has the consumer just created. */
-+    if (wid) vm_write64(spurs_ea + SPURS_WKL_INFO1 + 0x08, taskset_ea);
++    if (wid) vm_write64(spurs_ea + wkl_info_off(0) + 0x08, taskset_ea);
 +    return wid;
 +}
 +
- static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
-@@ -553,2 +576,3 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
+@@ -614,2 +638,3 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
      si->nspus = (nspus > 0 && nspus <= CELL_SPURS_MAX_SPU) ? nspus : 1;
 +    si->next_taskset_wid = 0;
      memset(si->prefix, 0, sizeof(si->prefix));
-@@ -562,2 +586,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
-     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
+@@ -628,2 +653,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
+     if (si->is2) *(vm_base + spurs_ea + SPURS_FLAGS1) |= SPURS_SF1_32_WORKLOADS;
 +    /* libsre's own entry points (e.g. _cellSpursLFQueueInitialize, taken from the real
 +     * library when a port lifts it) validate the instance before touching it: the
 +     * workload must be enabled in wklEnabled and wklEnabled starts at 0xffff as in the
 +     * real initialiser. Bit 31 (workload 0) is the first workload a title creates. */
 +    vm_write32(spurs_ea + SPURS_WKL_ENABLED, 0x8000FFFFu);
  
-@@ -909,3 +938,4 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+@@ -1012,3 +1042,4 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
       * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
 -    spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
 +    const u32 taskset_wid = spurs_register_taskset_workload(spurs_ea, taskset_ea);
 +    spurs_taskset_init(taskset_ea, spurs_ea, args, taskset_wid,
                         taskset_size, /*evf1*/0, /*evf2*/0);
+diff --git a/tools/test_spurs_taskset_workload.py b/tools/test_spurs_taskset_workload.py
+new file mode 100644
+index 00000000..80e028e0
+--- /dev/null
++++ b/tools/test_spurs_taskset_workload.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""Every taskset the HLE creates is a workload of its SPURS instance: its id in the taskset (CSTS_WID), the taskset
++EA in the workload's info arg (wklInfo1, or wklInfo2 for wid 16-31 of a CellSpurs2) and its bit in wklEnabled;
++workload 0 follows the newest taskset. Runs the real creation path against a synthetic VM."""
++import os
++from pathlib import Path
++import platform
++import subprocess
++import tempfile
++ROOT = Path(__file__).resolve().parents[1]
++if os.name == 'nt':
++    print('SKIP: standalone fixture requires POSIX C toolchain')
++    raise SystemExit(0)
++FIXTURE = r'''
++#include "libs/spurs/cellSpurs.c"
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++/* No SPU runs in this fixture; observer-only services are inert. */
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) {(void)ea;}
++int spu_coh_is_reserved(uint32_t ea) {(void)ea; return 0;}
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t ea) {(void)ea;}
++void ps3_ww_report_inline(uint32_t ea,uint64_t value,int width) {(void)ea;(void)value;(void)width;}
++void spu_taskset2_register(uint32_t ea) {(void)ea;}
++void spu_taskset_register(uint32_t ea) {(void)ea;}
++int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init) {(void)id_out; (void)init; return 0;}
++static _Alignas(128) uint8_t memory[0x20000];
++enum { SPURS1 = 0x1000, SPURS2 = 0x3000, TS0 = 0x8000, TS_STRIDE = 0x2000 };
++static int failed;
++static void expect(int ok, const char* what, unsigned k) {
++    if (!ok) { fprintf(stderr, "FAIL: %s (taskset %u)\n", what, k); failed++; }
++}
++static uint32_t ts_ea(unsigned k) { return TS0 + (k % 4) * TS_STRIDE; }
++static void create(uint32_t spurs, unsigned k) {
++    expect(cellSpursCreateTaskset((CellSpurs*)(uintptr_t)spurs, (CellSpursTaskset*)(uintptr_t)ts_ea(k), 0, NULL, 0) == 0,
++           "creation", k);
++}
++int main(void) {
++    vm_base = memory; ppu_vm_size = sizeof(memory);
++    s_inst[0].ea = SPURS1;
++    s_inst[1].ea = SPURS2; s_inst[1].is2 = 1;
++
++    /* CellSpurs: wid 0..15 in wklInfo1, the 17th and later share wid 15. */
++    for (unsigned k = 0; k < 17; k++) {
++        create(SPURS1, k);
++        const uint32_t wid = k < 16 ? k : 15;
++        expect(vm_read32(ts_ea(k) + CSTS_WID) == wid, "the taskset holds its workload id", k);
++        expect(vm_read64(SPURS1 + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8) == ts_ea(k),
++               "wklInfo1[wid].arg is the taskset", k);
++        expect(vm_read64(SPURS1 + SPURS_WKL_INFO1 + 8) == ts_ea(k), "workload 0 follows the newest taskset", k);
++        expect(vm_read32(SPURS1 + SPURS_WKL_ENABLED) == ~(0xFFFFFFFFu >> (wid + 1)), "wklEnabled has wid 0..wid", k);
++    }
++    expect(vm_read64(SPURS1 + SPURS_WKL_INFO2 + 8) == 0, "a CellSpurs has no wklInfo2", 16);
++
++    /* CellSpurs2: wid 16..31 in wklInfo2, the 33rd and later share wid 31. */
++    for (unsigned k = 0; k < 33; k++) {
++        create(SPURS2, k);
++        const uint32_t wid = k < 32 ? k : 31;
++        const uint32_t info = wid < 16 ? SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ
++                                       : SPURS_WKL_INFO2 + (wid - 16) * SPURS_WKL_INFO_SZ;
++        expect(vm_read32(ts_ea(k) + CSTS_WID) == wid, "the taskset holds its workload id", k);
++        expect(vm_read64(SPURS2 + info + 8) == ts_ea(k), "wklInfo[wid].arg is the taskset", k);
++        expect(vm_read64(SPURS2 + SPURS_WKL_INFO1 + 8) == ts_ea(k), "workload 0 follows the newest taskset", k);
++        expect(vm_read32(SPURS2 + SPURS_WKL_ENABLED) == (wid == 31 ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> (wid + 1))),
++               "wklEnabled has wid 0..wid", k);
++    }
++    for (uint32_t o = SPURS_WKL_INFO1 + 16 * SPURS_WKL_INFO_SZ; o < SPURS_WKL_INFO2; o += 4)
++        expect(vm_read32(SPURS2 + o) == 0, "wid 16-31 leave the bytes past wklInfo1 alone", o);
++    if (failed) return 1;
++    puts("PASS: tasksets are workloads of their instance (CellSpurs and CellSpurs2)");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='spurs-taskset-workload-') as name:
++    tmp = Path(name); fixture = tmp/'fixture.c'; fixture.write_text(FIXTURE)
++    binary = tmp/'fixture'
++    linker = ['-Wl,-dead_strip'] if platform.system() == 'Darwin' else ['-Wl,--gc-sections']
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
++        '-ffunction-sections', '-fdata-sections', '-I'+str(ROOT), '-I'+str(ROOT/'include'),
++        '-I'+str(ROOT/'runtime/spu'), str(fixture), str(ROOT/'libs/spurs/spurs_taskset.c'),
++        *linker, '-pthread', '-lm', '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True, timeout=10, cwd=tmp)

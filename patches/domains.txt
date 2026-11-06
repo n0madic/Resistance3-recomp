@@ -9,10 +9,12 @@ input
 lv2
 fs
 gcm-rsx
-metal               darwin
 
 # TODO: (full patches in patches/deferred/) left out because Resistance 3 on macOS showed no need for them; look again when the Windows/Linux hosts exist:
 #   SDL gamepad thread (hot-plug after start); Windows audio block pacing;
-#   MinGW GCC fixes in ppu_loader.cpp; optional LGPL-free ATRAC build; queue-ready WAIT_SIGNAL wake and taskset
-#   generations (spu_workload.c); GPU-kept resolves and whole-surface readback cache (perf, rsx_draw_engine.c);
-#   (thread-priority-at-start ordering and the offline NetStartDialog answer are upstream since v0.18.0: #416, #503).
+#   queue-ready WAIT_SIGNAL wake and taskset generations (spu_workload.c); GPU-kept resolves and whole-surface readback
+#   cache (perf, rsx_draw_engine.c); the PPU thread-local accessor (ppu_tramp_slot, PPU_MODULE_ACCESSORS: a PE module
+#   cannot import the host's g_trampoline_fn; dropped from module-abi/0001 when the pin moved to v0.19.0, see git history);
+#   (thread-priority-at-start ordering and the offline NetStartDialog answer are upstream since v0.18.0: #416, #503;
+#   the MinGW GCC fixes in ppu_loader.cpp, the optional LGPL-free ATRAC build and the AUDIO_WAV/AUDIO_PEAK diagnostics
+#   since v0.19.0: #610, #611, #606).

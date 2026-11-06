@@ -10,22 +10,22 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff6011..b054b3e3 100644
+index 19548e0a..270099c4 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -20,2 +20,3 @@
+@@ -21,2 +21,3 @@
  
 +#include <math.h>
  #include <stdio.h>
-@@ -72,2 +73,3 @@ extern u32 ppu_vm_size;
+@@ -73,2 +74,3 @@ extern u32 ppu_vm_size;
  #define M_STENCIL_MASK        0x032C
 +#define M_BLEND_COLOR         0x031C
  #define M_STENCIL_FUNC        0x0330
-@@ -83,2 +85,3 @@ extern u32 ppu_vm_size;
+@@ -84,2 +86,3 @@ extern u32 ppu_vm_size;
  #define M_BACK_STENCIL_OP_ZPASS 0x0364
 +#define M_BLEND_COLOR2        0x037C
  #define M_DEPTH_BOUNDS_ENABLE 0x0380
-@@ -361,2 +364,27 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
+@@ -479,2 +482,27 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
  
 +static float eng_half_to_float(u32 h)
 +{
@@ -53,7 +53,7 @@ index 8dff6011..b054b3e3 100644
 +}
 +
  u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
-@@ -3069,2 +3097,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3320,2 +3348,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
      rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 +    /* The blend constant, for the CONSTANT_COLOR/ALPHA factors: A8R8G8B8 in
 +     * SET_BLEND_COLOR, or on an FP16 target half-float R,G there and B,A in
@@ -67,26 +67,26 @@ index 8dff6011..b054b3e3 100644
 +    }
  
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index a25ecc29..17e583a0 100644
+index 097692ce..2b08363c 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
-@@ -220,2 +220,6 @@ typedef struct rsx_draw_backend {
+@@ -224,2 +224,6 @@ typedef struct rsx_draw_backend {
      void (*set_depth_bias)(void* user, float slope, float units, u32 depth_bits);
 +    /* Optional: the blend constant (SET_BLEND_COLOR/SET_BLEND_COLOR2) for the
 +     * next draw, already decoded to floats; dynamic state like the stencil
 +     * reference. A backend that leaves this NULL has no constant blend. */
 +    void (*set_blend_color)(void* user, const float rgba[4]);
      /* One draw. `indices` is NULL for a non-indexed one. Everything the
-@@ -383,2 +387,4 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
+@@ -387,2 +391,4 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
                                           rsx_be_render_state* out);
 +/* SET_BLEND_COLOR (and SET_BLEND_COLOR2 on an FP16 target) as RGBA floats. */
 +void rsx_draw_engine_decode_blend_color(u32 color, u32 color2, u32 rt_fp16, float rgba[4]);
  
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index ad8db0b5..5ad1c293 100644
+index 0ba88a8c..0c514c99 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
-@@ -2086,2 +2086,7 @@ static MTLBlendFactor blend_factor_to_metal(u32 f)
+@@ -2138,2 +2138,7 @@ static MTLBlendFactor blend_factor_to_metal(u32 f)
      case 0x0308: return MTLBlendFactorSourceAlphaSaturated;
 +    /* The constant factors take the encoder's blend colour (setBlendColor). */
 +    case 0x8001: return MTLBlendFactorBlendColor;
@@ -94,42 +94,42 @@ index ad8db0b5..5ad1c293 100644
 +    case 0x8003: return MTLBlendFactorBlendAlpha;
 +    case 0x8004: return MTLBlendFactorOneMinusBlendAlpha;
      default:     return MTLBlendFactorOne;
-@@ -2553,2 +2558,3 @@ static void release_surfaces(void)
+@@ -2606,2 +2611,3 @@ static void release_surfaces(void)
      u32   stencil_ref;
 +    float blend_color[4];       /* SET_BLEND_COLOR; encoder state, not pipeline */
      float clear_rgba[4];
-@@ -3613,2 +3619,4 @@ static void eng_set_stencil_ref(void* user, u32 ref)
+@@ -3720,2 +3726,4 @@ static void eng_set_stencil_ref(void* user, u32 ref)
  { (void)user; s_eng_pending.stencil_ref = ref; }
 +static void eng_set_blend_color(void* user, const float rgba[4])
 +{ (void)user; memcpy(s_eng_pending.blend_color, rgba, sizeof s_eng_pending.blend_color); }
  
-@@ -3727,2 +3735,4 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -3835,2 +3843,4 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
      [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
 +    [enc setBlendColorRed:r->blend_color[0] green:r->blend_color[1]
 +                     blue:r->blend_color[2] alpha:r->blend_color[3]];
      MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
-@@ -4495,2 +4505,3 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -4725,2 +4735,3 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
      .set_depth_bias       = eng_set_depth_bias,
 +    .set_blend_color      = eng_set_blend_color,
      .draw                 = eng_draw,
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 8099901a..f1bb0a53 100644
+index aabad933..6140ca99 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -94,2 +94,3 @@ typedef struct {
+@@ -96,2 +96,3 @@ typedef struct {
      u32 stencil_ref;
 +    float blend_color[4];
      float depth_bounds[2];
-@@ -225,2 +226,4 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
+@@ -231,2 +232,4 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
  static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
 +static void stub_blend_color(void* u, const float c[4])
 +{ (void)u; memcpy(stub.blend_color, c, sizeof stub.blend_color); }
  static void stub_depth_bounds(void* u, float lo, float hi)
-@@ -352,2 +355,3 @@ static const rsx_draw_backend g_stub_backend = {
+@@ -358,2 +361,3 @@ static const rsx_draw_backend g_stub_backend = {
      .set_stencil_ref = stub_stencil_ref,
 +    .set_blend_color = stub_blend_color,
      .set_depth_bounds = stub_depth_bounds,
-@@ -902,2 +906,17 @@ static void test_pipeline_key(void)
+@@ -1036,2 +1040,17 @@ static void test_pipeline_key(void)
  
 +    /* The blend constant is encoder state too, decoded from A8R8G8B8. */
 +    const int pipelines_before_blend_color = stub.n_pipeline_create;

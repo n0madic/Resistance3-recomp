@@ -9,6 +9,8 @@ buckets waited for a bucket signal that never comes, one took a garbage doorbell
 
 Each bracket now saves the outer value, sets its own before the call and restores it after the drain. The handoff
 fixture gains the direct-call case (it covered only the queued one), and a lifter self-check pins the emitted form.
+The published pc goes through SPULifter._pc like the bracket's other return pcs, so a relocatable lift (--reloc,
+#636) publishes the return pc of the copy that runs; the self-check covers that form too.
 
 Upstream: not proposed yet.
 ---
@@ -38,10 +40,10 @@ index 8924a50d..73402ade 100644
 +        entry = nested_entry; queued_call = strcmp(mode, "nested-return-direct") != 0;
          word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index 35d8d428..4b334a01 100644
+index 4610a361..d10f3fae 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
-@@ -212,2 +212,16 @@ _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
+@@ -212,2 +212,17 @@ _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
  
 +# A call bracket publishes its return pc (ctx->drain_ret_pc) for the whole
 +# call, not only once spu_drain_call starts: the interpreter stops there when
@@ -50,34 +52,37 @@ index 35d8d428..4b334a01 100644
 +# igjob_00DC0200 calls an unlifted handler through `bisl`, the interpreter ran
 +# on through the caller's loop back into the same call, and every iteration
 +# nested another host frame until the depth guard halted the SPU.
-+def _drain_ret_open(ret: int) -> str:
-+    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = 0x{ret & 0x3FFFC:X}; "
++# `ret` is the C expression of the return pc (SPULifter._pc: --reloc moves it).
++def _drain_ret_open(ret: str) -> str:
++    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = {ret}; "
 +
 +
 +_DRAIN_RET_CLOSE = "ctx->drain_ret_pc = _dr; "
 +
 +
  # Mnemonics that do NOT write the rt register (so we skip the post-trace).
-@@ -928,6 +942,10 @@ class SPULifter:
+@@ -944,3 +959,5 @@ class SPULifter:
                  # callee's own tail-chains so they don't grow the caller frame)
 -                # + image save/restore (adopt-on-serve cannot leak upward).
 +                # + image save/restore (adopt-on-serve cannot leak upward)
 +                # + the bracket's return pc published for the whole call (see
 +                # _drain_ret_open).
-                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
-+                        f"{_drain_ret_open(addr + 4)}"
+                 # --reloc: the callee's drain may dispatch into other placed code, which sets
+@@ -949,4 +966,6 @@ class SPULifter:
+                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
++                        f"{_drain_ret_open(self._pc((addr + 4) & 0x3FFFC))}"
                          f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
--                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
-+                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; "
-+                        f"{_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
+-                        f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
++                        f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; "
++                        f"{_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);{rr} }}")
              return f"{link} /* TODO spu: brsl unresolved target */;"
-@@ -995,5 +1013,6 @@ class SPULifter:
-                     f"int32_t _si = (int32_t)ctx->image_id; "
-+                    f"{_drain_ret_open(addr + 4)}"
+@@ -1015,5 +1034,6 @@ class SPULifter:
+                     f"int32_t _si = (int32_t)ctx->image_id; {rs}"
++                    f"{_drain_ret_open(self._pc((addr + 4) & 0x3FFFC))}"
                      f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
-                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
--                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
-+                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si); }}")
+                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
+-                    f"ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
++                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);{rr} }}")
          # bisled: set link, branch to RA only if an external event is pending.
 diff --git a/tools/test_spu_interpreter_handoff.py b/tools/test_spu_interpreter_handoff.py
 index 8d36febb..051468c2 100644
@@ -90,10 +95,10 @@ index 8d36febb..051468c2 100644
                   'nested-stop', 'stop-code', 'halt', 'smc', 'smc-ldst', 'smc-ldst-diag', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
 diff --git a/tools/test_spu_lifter_call_bracket.py b/tools/test_spu_lifter_call_bracket.py
 new file mode 100644
-index 00000000..8708382a
+index 00000000..0c8645f1
 --- /dev/null
 +++ b/tools/test_spu_lifter_call_bracket.py
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,56 @@
 +#!/usr/bin/env python3
 +"""Self-check: an SPU call bracket publishes its return pc for the whole call.
 +
@@ -120,11 +125,13 @@ index 00000000..8708382a
 +)
 +
 +
-+def check(body: str, ret: int, call: str) -> None:
++def check(body: str, ret: int, call: str, reloc: bool = False) -> None:
 +    line = next((ln for ln in body.splitlines() if call in ln), None)
 +    assert line, f"no bracket calling {call!r} in:\n{body}"
-+    publish = f"ctx->drain_ret_pc = 0x{ret:X};"
-+    assert publish in line, f"bracket does not publish 0x{ret:X}: {line}"
++    # A relocatable lift (--reloc) publishes the return pc of the copy that runs.
++    pc = f"((0x{ret:X}u + (uint32_t)ctx->reloc_delta) & 0x3FFFFu)" if reloc else f"0x{ret:X}"
++    publish = f"ctx->drain_ret_pc = {pc};"
++    assert publish in line, f"bracket does not publish {pc}: {line}"
 +    assert line.index(publish) < line.index(call), f"published after the call: {line}"
 +    restore = "ctx->drain_ret_pc = _dr;"
 +    assert restore in line and line.index(restore) > line.index("spu_drain_call"), (
@@ -137,7 +144,12 @@ index 00000000..8708382a
 +    body = "\n".join(lifter.lift_function(insns, BASE, BASE + len(CODE)).body_lines)
 +    check(body, 0x1004, "spu_func_00001008(ctx)")
 +    check(body, 0x1008, "spu_indirect_branch(ctx)")
-+    print("ok: brsl and bisl brackets publish their return pc for the whole call")
++    lifter = SPULifter()
++    lifter.reloc = True
++    body = "\n".join(lifter.lift_function(insns, BASE, BASE + len(CODE)).body_lines)
++    check(body, 0x1004, "spu_func_00001008(ctx)", reloc=True)
++    check(body, 0x1008, "spu_indirect_branch(ctx)", reloc=True)
++    print("ok: brsl and bisl brackets publish their return pc for the whole call (--reloc: the copy's)")
 +    return 0
 +
 +

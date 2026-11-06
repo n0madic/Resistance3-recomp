@@ -14,25 +14,35 @@ the game's source mix: 72 -> 7.5 ns per GET.
 In the game (`sample`, 25 s of the Haven firefight, 2 runs each): spu_overlay_note_get 627/904 of ~11.7k SPU
 samples (5.3-7.8%) -> 107/87 of ~12.4k (0.7-0.9%); the runtime's share of the SPU threads 23-27% -> 19-20%.
 
-#455 (v0.18.0) skips the scan for a GET under 512 bytes whose EA no source has; the index covers every GET and
-match_sig and takes its place. Like #455 it allows registration while the SPUs run: an entry is linked with a
-release store after its fields are written, and the lookups acquire-load the links (#455's
-test_overlay_source_prefilter, which registers while three threads look up, passes).
+#455 (v0.18.0) skips the scan for a GET under 512 bytes whose EA no source has, and #654 (v0.19.0) skips it for any
+size while no signature source exists (Resistance 3 registers three, so every GET of 512 bytes or more still
+scanned); the index covers every GET and match_sig and takes the place of both. Like them it allows registration
+while the SPUs run: an entry is linked with a release store after its fields are written and before the count is
+published, and the lookups acquire-load the links (#455's test_overlay_source_prefilter, which registers while
+three threads look up, passes). #654's tools/test_spu_overlay_allsize.py instruments the candidate loop instead of
+the scan, and its mutants break the index (EA chain, signature chain, a link published after the count): each
+is rejected.
 
 Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 2494eb19..3495c8f0 100644
+index e07e90ef..d91d1007 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1862,3 +1862,3 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+@@ -1914,3 +1914,4 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
                   uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
--                 int pic; } spu_ovl_src;
-+                 int pic; int next; } spu_ovl_src;   /* next: the next source in its hash bucket (index + 1) */
+-                 uint32_t canon; int pic; } spu_ovl_src;
++                 uint32_t canon; int pic;
++                 int next; } spu_ovl_src;   /* next: the next source in its hash bucket (index + 1) */
  /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
-@@ -1874,39 +1874,24 @@ static int s_ovl_src_count = 0;
- 
+@@ -1925,44 +1926,25 @@ static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
+ static int s_ovl_src_count = 0;
+-/* Monotonic: published before any signature entry becomes visible through
+- * s_ovl_src_count. A reader that acquired that count cannot miss the flag.
+- * This lets EA-only registries reject unrelated GETs of every size. */
+-static atomic_int s_ovl_has_sig;
+-
 -/* Every MFC GET is checked against the registered sources, and a job that
 - * streams its data in small pieces issues thousands of GETs a frame against
 - * up to SPU_OVL_SRC_MAX sources. A GET under 512 bytes can only match a
@@ -61,6 +71,7 @@ index 2494eb19..3495c8f0 100644
 -        __atomic_store_n(&s_ovl_ea_used[i], 1, __ATOMIC_RELEASE);
 -        return;
 -    }
++
 +/* Every DMA GET asks which source it loaded (spu_overlay_note_get), and most GETs are data that
 + * match none: a scan of the table was ~6% of the SPU threads' time in a Resistance 3 firefight
 + * (~220 sources). The sources are hashed by EA, the signature ones by their 16 bytes; each bucket
@@ -90,22 +101,28 @@ index 2494eb19..3495c8f0 100644
  }
 +static inline int spu_ovl_next(const int* link) { return __atomic_load_n(link, __ATOMIC_ACQUIRE); }
  
-@@ -1915,3 +1900,2 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
+@@ -1971,3 +1953,2 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
      if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
 -        spu_ovl_ea_add(content_ea);
          s_ovl_src[s_ovl_src_count].src_ea = content_ea;
-@@ -1919,2 +1903,3 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
-         s_ovl_src[s_ovl_src_count].has_sig = 0;
+@@ -1976,2 +1957,3 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
+         s_ovl_src[s_ovl_src_count].canon = 0;
 +        spu_ovl_link(&s_ovl_ea_head[spu_ovl_hash_ea(content_ea)], s_ovl_src_count);
          __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
-@@ -2130,2 +2115,3 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
+@@ -2203,3 +2185,3 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
          s_ovl_src[s_ovl_src_count].has_sig = 1;
+-        atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
 +        spu_ovl_link(&s_ovl_sig_head[spu_ovl_hash_sig(sig)], s_ovl_src_count);
-         s_ovl_src_count++;
-@@ -2245,8 +2231,10 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
+@@ -2322,13 +2304,10 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      }
 -    int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
--    if (size < 512 && !spu_ovl_ea_known(ea)) return;
+-    /* Invalidate destination code/residency above even for an unrelated EA.
+-     * Acquire count before the signature flag: if this snapshot contains a
+-     * signature, its earlier flag publication is visible. A racing future
+-     * signature can only force an unnecessary scan of the older snapshot. */
+-    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
+-        !spu_ovl_ea_known(ea)) return;
 -    for (int i = 0; i < nsrc; i++) {
 +    int e = spu_ovl_next(&s_ovl_ea_head[spu_ovl_hash_ea(ea)]),
 +        g = size >= 512 ? spu_ovl_next(&s_ovl_sig_head[spu_ovl_hash_sig(ls)]) : 0;
@@ -118,7 +135,7 @@ index 2494eb19..3495c8f0 100644
 -                             : (o->src_ea == ea);
 +        int hit = o->has_sig ? memcmp(ls, o->sig, 16) == 0 : o->src_ea == ea;
          if (hit) {
-@@ -2293,7 +2281,5 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
+@@ -2376,7 +2355,5 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
  {
 -    for (int i = 0; i < s_ovl_src_count; i++) {
 -        const spu_ovl_src* o = &s_ovl_src[i];
@@ -130,10 +147,10 @@ index 2494eb19..3495c8f0 100644
 +            return s_ovl_src[g - 1].image_id;
      return 0;
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
-index 93742f79..69932235 100644
+index 5cecf8ea..98569962 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
 +++ b/runtime/spu/tests/test_spu_lifted_start.c
-@@ -693,2 +693,58 @@ static void test_registry_lookup_memo(void)
+@@ -731,2 +731,58 @@ static void test_registry_lookup_memo(void)
  
 +/* Sources are found by EA or signature through hash buckets, in registration
 + * order: the first source that matches a GET takes it, as the scan of the
@@ -192,7 +209,28 @@ index 93742f79..69932235 100644
 +}
 +
  /* Streamed code owns an LS interval even when its registry has a hole.
-@@ -1257,2 +1313,3 @@ int main(void)
+@@ -1296,2 +1352,3 @@ int main(void)
      test_many_resident_code_regions();
 +    test_overlay_source_order();
      test_resident_code_holes();
+diff --git a/tools/test_spu_overlay_allsize.py b/tools/test_spu_overlay_allsize.py
+index 32e1d07c..88417e7d 100644
+--- a/tools/test_spu_overlay_allsize.py
++++ b/tools/test_spu_overlay_allsize.py
+@@ -21,3 +21,3 @@ def instrument(text):
+     text=text.replace('#include "../','#include "'+str(SPU.parent)+'/')
+-    needle='for (int i = 0; i < nsrc; i++) {'
++    needle='while (e || g) {'   # the overlay source index's candidate loop (spu-runtime/0012)
+     assert text.count(needle)==1
+@@ -66,7 +66,7 @@ def run(work):
+         changes={
+-            'reject-matches':('!spu_ovl_ea_known(ea)', '1'),
++            'reject-matches':('int e = spu_ovl_next(&s_ovl_ea_head[spu_ovl_hash_ea(ea)]),', 'int e = 0,'),
+             'drop-residency':('    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {\n        if (!ctx->resident_code[slot].image_id) continue;', '    for (unsigned slot = SPU_RESIDENT_CODE_SLOTS; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {\n        if (!ctx->resident_code[slot].image_id) continue;'),
+-            'ignore-signatures':('!atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)', '1'),
+-            'late-signature-flag':('        atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);\n        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);',
+-                                    '        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);\n        atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);'),
++            'ignore-signatures':('g = size >= 512 ? spu_ovl_next(&s_ovl_sig_head[spu_ovl_hash_sig(ls)]) : 0;', 'g = 0;'),
++            'late-signature-link':('        spu_ovl_link(&s_ovl_sig_head[spu_ovl_hash_sig(sig)], s_ovl_src_count);\n        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);',
++                                    '        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);\n        spu_ovl_link(&s_ovl_sig_head[spu_ovl_hash_sig(sig)], s_ovl_src_count - 1);'),
+         }

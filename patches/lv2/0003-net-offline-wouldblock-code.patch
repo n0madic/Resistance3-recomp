@@ -11,10 +11,10 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
-index 9cb50400..23b7ceeb 100644
+index fd2c2078..4f3743c4 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
-@@ -592,4 +592,9 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
+@@ -598,4 +598,9 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
   * every receive/poll would-block. errno lives in a guest scratch cell since
 - * _sys_net_errno_loc returns a POINTER the game dereferences. */
 + * _sys_net_errno_loc returns a POINTER the game dereferences. The return value
@@ -25,7 +25,7 @@ index 9cb50400..23b7ceeb 100644
  #define SYS_NET_EWOULDBLOCK_V 35
 +#define SYS_NET_ERROR_EWOULDBLOCK (0x80010200u | SYS_NET_EWOULDBLOCK_V)
  extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
-@@ -608,3 +613,3 @@ static void hle_net_wouldblock(ppu_context* ctx)
+@@ -614,3 +619,3 @@ static void hle_net_wouldblock(ppu_context* ctx)
      if (g_net_errno_ea) vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
 -    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)-1;
 +    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)SYS_NET_ERROR_EWOULDBLOCK;

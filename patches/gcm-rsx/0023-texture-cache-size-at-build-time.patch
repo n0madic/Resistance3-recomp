@@ -21,10 +21,10 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index 87535b3e..9dbb2299 100644
+index 775019cb..1b74e9aa 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
-@@ -116,4 +116,9 @@ typedef struct rsx_be_render_state {
+@@ -120,4 +120,9 @@ typedef struct rsx_be_render_state {
   * least recently used one. Public so the eviction test can be exact about
 - * where the boundary is rather than assuming a number. */
 + * where the boundary is rather than assuming a number. A title whose frame
@@ -36,10 +36,10 @@ index 87535b3e..9dbb2299 100644
 +#endif
  
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index 163e5f3c..16e8dd9b 100644
+index da72d299..e685204c 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
-@@ -2485,3 +2485,6 @@ static void release_surfaces(void)
+@@ -2537,3 +2537,6 @@ static void release_surfaces(void)
  
 -#define ENG_MAX_OBJECTS  4096
 +/* Textures share the table with targets, views and per-draw copies, and a
@@ -48,10 +48,10 @@ index 163e5f3c..16e8dd9b 100644
 +#define ENG_MAX_OBJECTS  (2048 + 2 * RSX_DRAW_ENGINE_TEXTURE_CACHE)
  #define ENG_MAX_PIPES    4096
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 71d6c1fc..569817c7 100644
+index c176cd2d..1cfbda5e 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -710,2 +710,7 @@ static void test_mrt_set(void)
+@@ -711,2 +711,7 @@ static void test_mrt_set(void)
  
 +#ifdef RSX_TEST_EXPECT_TEXTURE_CACHE
 +_Static_assert(RSX_DRAW_ENGINE_TEXTURE_CACHE == RSX_TEST_EXPECT_TEXTURE_CACHE,

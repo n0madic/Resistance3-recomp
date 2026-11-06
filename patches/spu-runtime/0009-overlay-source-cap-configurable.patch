@@ -7,33 +7,35 @@ in the interpreter. The default stays 128; the port defines a larger one from it
 
 Test: a scripted boot to the Haven street fight, aiming: no "[r3] ... not registered" line in the log (88 without
 the larger cap), and the interpreter census of that fight (see the commit) drops to the modules no lift covers.
+The workflows build test_spu_lifted_start with -DSPU_OVL_SRC_MAX=512: with the regions the domain's earlier
+patches and upstream's test_reloc_regions register, its last tests otherwise find the default table full.
 
 Upstream: not proposed yet.
 ---
 
 diff --git a/.github/workflows/linux.yml b/.github/workflows/linux.yml
-index 0d73b40b..3a1d7eb3 100644
+index 9706e588..4533c0fe 100644
 --- a/.github/workflows/linux.yml
 +++ b/.github/workflows/linux.yml
-@@ -520,3 +520,3 @@ jobs:
+@@ -591,3 +591,3 @@ jobs:
          run: |
 -          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
 +          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -DSPU_OVL_SRC_MAX=512 -I include -I runtime/spu -I runtime/platform \
              -o /tmp/test_spu_lifted_start \
 diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
-index 5eac3857..cf47991b 100644
+index 6a799fca..ba8d89d5 100644
 --- a/.github/workflows/macos.yml
 +++ b/.github/workflows/macos.yml
-@@ -594,3 +594,3 @@ jobs:
+@@ -660,3 +660,3 @@ jobs:
          run: |
 -          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
 +          clang -std=gnu17 -DSPU_OVL_SRC_MAX=512 -I include -I runtime/spu -I runtime/platform \
              -o /tmp/test_spu_lifted_start \
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 16cbe985..2494eb19 100644
+index a8203229..e07e90ef 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1864,4 +1864,9 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+@@ -1916,4 +1916,9 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
  /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
 - * the same job code buffer at LS 0x4000, dispatched by content signature). */
 + * the same job code buffer at LS 0x4000, dispatched by content signature).

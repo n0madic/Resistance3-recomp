@@ -9,11 +9,14 @@ to almost any target. In a Resistance 3 firefight (v0.17.0) the resolver and its
 spu_indirect_branch first checks that none of the special cases can apply (no interrupt return pending, not one of
 their addresses, no task registered above the task region, no diagnostic variable set), takes the dispatch cache's
 hit inline and tail-calls the target; anything else goes to the unchanged resolver (spu_indirect_branch_full) from
-the top. (The step-check half of this patch on v0.17.0 is upstream since v0.18.0: #434.)
+the top. (The step-check half of this patch on v0.17.0 is upstream since v0.18.0: #434.) A hit on relocatable code
+(#636) restores ctx->reloc_delta, as spu_lifted_lookup's own hit does.
 
 Test: runtime/spu/tests/test_spu_lifted_start.c, test_indirect_fast_path_guards: a lifted function registered at
 each special address (interrupt return, exit-to-kernel, selectWorkload, job return, a task entry, below the task
-region) must not run in its place; each guard left out fails its check. No header changes: the module ABI is the same.
+region) must not run in its place; each guard left out fails its check. test_indirect_fast_path_reloc: relocatable
+code reached through the fast path runs with its placement's delta on cache hits too (fails without the restore).
+No header changes: the module ABI is the same.
 Micro-benchmark on v0.18.0 (a function re-queued through spu_drain_call through spu_indirect_branch to one of 256
 registered targets, 3 runs): 12.0-12.7 -> 6.4-6.9 ns per step; direct steps unchanged.
 On v0.17.0 in the game (`sample`, 25 s of the Haven firefight, 3 runs each), with the step check: the trampoline
@@ -23,10 +26,10 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 3495c8f0..86160236 100644
+index d91d1007..2a29f76c 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1808,2 +1808,13 @@ static void spu_dcache_shadow_stats(void)
+@@ -1857,2 +1857,13 @@ static void spu_dcache_shadow_stats(void)
  }
 +static inline spu_dcache_ent* spu_dcache_slot(uint32_t lsa, uint32_t id)
 +{
@@ -40,7 +43,7 @@ index 3495c8f0..86160236 100644
 +           e->ovl == c->resident_ovl && e->task == c->resident_task;
 +}
  spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
-@@ -1821,6 +1832,4 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+@@ -1870,6 +1881,4 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
      const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
 -    spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
 -    if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
@@ -48,8 +51,8 @@ index 3495c8f0..86160236 100644
 -        e->ovl == c->resident_ovl && e->task == c->resident_task) {
 +    spu_dcache_ent* e = spu_dcache_slot(lsa, id);
 +    if (spu_dcache_hit(e, c, id, lsa, rgen)) {
-         if (mode == 2) {
-@@ -2686,3 +2695,50 @@ static int spu_smc_microstep(spu_context* ctx)
+         if (e->reloc) c->reloc_delta = e->reloc_delta;
+@@ -2760,3 +2769,52 @@ static int spu_smc_microstep(spu_context* ctx)
  
 +static void spu_indirect_branch_full(spu_context* ctx);
 +
@@ -77,8 +80,10 @@ index 3495c8f0..86160236 100644
 +        const uint32_t id = ctx->dcache_id;
 +        if (id && spu_dcache_mode() == 1) {
 +            const spu_dcache_ent* e = spu_dcache_slot(pc, id);
-+            if (spu_dcache_hit(e, ctx, id, pc, __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE)))
++            if (spu_dcache_hit(e, ctx, id, pc, __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE))) {
++                if (e->reloc) ctx->reloc_delta = e->reloc_delta;   /* relocatable code: its placement */
 +                fn = (spu_fn)e->fn;
++            }
 +        }
 +        if (!fn) fn = spu_lifted_lookup(ctx, pc);
 +        if (fn) {
@@ -101,10 +106,10 @@ index 3495c8f0..86160236 100644
 +__attribute__((noinline)) static void spu_indirect_branch_full(spu_context* ctx)
  {
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
-index 69932235..5324ef46 100644
+index 98569962..37e51de7 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
 +++ b/runtime/spu/tests/test_spu_lifted_start.c
-@@ -1301,2 +1301,68 @@ static void test_overlay_source_prefilter(void)
+@@ -1339,2 +1339,92 @@ static void test_overlay_source_prefilter(void)
  
 +/* spu_indirect_branch resolves a lifted target before its special cases only where none of
 + * them applies: each case below has a lifted function registered at its address, which the
@@ -172,8 +177,33 @@ index 69932235..5324ef46 100644
 +    free(c);
 +}
 +
++/* Relocatable code (spu_overlay_register_region_reloc) reached through the fast path: a
++ * dispatch cache hit there restores ctx->reloc_delta like spu_lifted_lookup's own hit. The
++ * copy sits below the task region, so the fast path applies whatever tasks are registered. */
++static void fp_reloc(spu_context* c) { c->gpr[9]._u32[0] = (uint32_t)c->reloc_delta; }
++static void test_indirect_fast_path_reloc(void)
++{
++    spu_context* c = (spu_context*)calloc(1, sizeof *c);
++    if (!c) { check(0, "allocate fast path reloc context"); return; }
++    spu_context_init(c, 0); c->image_id = 121;
++    spu_begin_image(151); spu_register_function(0x10000, fp_reloc);
++    spu_begin_image(0);
++    spu_overlay_register_region_reloc(0x940000, 0x100, 0x10000, 151);
++    spu_overlay_note_get(c, 0x940000, c->ls + 0x2400, 16);
++    int all = 1;
++    for (int round = 0; round < 3; ++round) {     /* a miss, then cache hits */
++        c->reloc_delta = 0; c->gpr[9]._u32[0] = 0; c->pc = 0x2400;
++        spu_indirect_branch(c);
++        if (c->gpr[9]._u32[0] != 0x2400u - 0x10000u) all = 0;
++    }
++    check(all, "fast path: relocatable code runs with its placement's delta, cache hits too");
++    g_spu_trampoline_fn = 0;
++    free(c);
++}
++
  int main(void)
-@@ -1319,2 +1385,3 @@ int main(void)
+@@ -1358,2 +1448,4 @@ int main(void)
      test_dispatch_cache();
 +    test_indirect_fast_path_guards();
++    test_indirect_fast_path_reloc();
      test_lle_taskset_syscall();

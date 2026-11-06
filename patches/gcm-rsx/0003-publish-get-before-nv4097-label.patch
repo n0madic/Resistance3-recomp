@@ -14,10 +14,10 @@ Upstream: not proposed yet (a candidate: #401 covers NV406E only).
 ---
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 298ee7de..fd525d21 100644
+index f073f327..a178d42b 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -2001,6 +2001,12 @@ static int gcm_word_diag(void)
+@@ -2228,6 +2228,12 @@ static int gcm_word_diag(void)
  /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
 - * plus the methods whose answer the walker writes itself. */
 -static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
@@ -32,21 +32,21 @@ index 298ee7de..fd525d21 100644
 +    if ((m == 0x1D70u || m == 0x1D74u) && !gcm_get_eq_put())
 +        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, end_off);
      /* #466: rsx_state feeds only the legacy vtable backend. With the draw
-@@ -2531,3 +2537,3 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2803,3 +2809,3 @@ static void gcm_rsx_process_fifo_unlocked(void)
                          gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method,
 -                                      vm_read32(dea + i * 4), legacy_state_live);
 +                                      vm_read32(dea + i * 4), legacy_state_live, s_fifo_getoff + 4 + count * 4);
                      s_fifo_getoff += 4 + count * 4;
-@@ -2684,3 +2690,3 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2956,3 +2962,3 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  } else if (subch == 0 || (subch == 1 && !s1_2d)) {
 -                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
 +                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live, s_fifo_getoff + 4 + count * 4);
                  } else
 diff --git a/libs/video/tests/test_gcm_get_on_release.c b/libs/video/tests/test_gcm_get_on_release.c
-index 67094140..b762f68c 100644
+index 05c5a8c6..71a5690f 100644
 --- a/libs/video/tests/test_gcm_get_on_release.c
 +++ b/libs/video/tests/test_gcm_get_on_release.c
-@@ -45,3 +45,12 @@ void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why;
+@@ -49,3 +49,12 @@ void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why;
  void rsx_state_init(rsx_state* state) { (void)state; }
 -int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
 +/* NV4097 back-end write / texture-read semaphore releases write their label inside rsx_process_method;
@@ -60,7 +60,7 @@ index 67094140..b762f68c 100644
 +    return 0;
 +}
  /* No microcode or constant runs here: the walker hands every word to
-@@ -141,2 +150,8 @@ int main(int argc, char** argv)
+@@ -145,2 +154,8 @@ int main(int argc, char** argv)
      io = put_probe(io, 3);
 +    /* NV4097 back-end write release, then texture-read release. */
 +    const u32 be_val = 0x33u, tex_val = 0x44u;
@@ -69,7 +69,7 @@ index 67094140..b762f68c 100644
 +    io = put_cmd(io, 0, 0x1D74u, 1, &tex_val);
 +    const u32 end_tex = io;
      const u32 put = io;
-@@ -160,2 +175,9 @@ int main(int argc, char** argv)
+@@ -164,2 +179,9 @@ int main(int argc, char** argv)
      }
 +    check(sema4097_n == 2, "the NV4097 semaphore releases reached the method handler");
 +    if (!eq_put) {

@@ -3,9 +3,10 @@ sceNpTrophy: report no required disk space once the trophy set is installed.
 GetRequiredDiskSpace always answered 1 MB. Firmware answers 0 after the first RegisterContext installed the set;
 Resistance 3 reads a non-zero answer as "not installed" and shows its install prompt and install pass on every boot.
 RegisterContext now writes the trophy file (the HLE's record of an installed set) and GetRequiredDiskSpace checks it.
-The registration test also builds again: cellSysutil.c defines g_ps3_guest_caller and calls two more hooks.
+test_trophy_registration (tools/test_trophy_registration.py) gets two assertions: 1 MB before RegisterContext, 0 after.
 
-Upstream: not proposed yet. The fixture's three pump stubs and the dropped g_ps3_guest_caller are PR #607 (rebase when it merges).
+Upstream: not proposed yet. The registration test's own link fixes (the pump stubs, no second g_ps3_guest_caller) were
+this patch's until PR #607 (v0.19.0) made it link and run in CI.
 ---
 
 diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
@@ -55,22 +56,15 @@ index d956e6dd..eb577c36 100644
 +           context, (unsigned long long)required);
      return CELL_OK;
 diff --git a/libs/network/tests/test_trophy_registration.c b/libs/network/tests/test_trophy_registration.c
-index cdbee09e..ea9356b5 100644
+index b08a5b24..1449bd5b 100644
 --- a/libs/network/tests/test_trophy_registration.c
 +++ b/libs/network/tests/test_trophy_registration.c
-@@ -15,3 +15,5 @@ void spu_lockline_lock(void) {}
- void spu_lockline_unlock(void) {}
--ps3_guest_caller_fn g_ps3_guest_caller;
-+void cellMsgDialog_tick(void) {}
-+void np_psnr_pump(void) {}
-+void ps3_np_eula_tick(void) {}   /* cellSysutil.c: the PSN terms check (#542) */
- static unsigned calls;
-@@ -35,2 +37,4 @@ int main(void)
+@@ -40,2 +40,4 @@ int main(void)
      assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
 +    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
 +    assert(vm_read64(0x208) == TROPHY_PACK_SIZE);
      assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == SCE_NP_TROPHY_ERROR_UNKNOWN);
-@@ -39,2 +43,5 @@ int main(void)
+@@ -44,2 +46,5 @@ int main(void)
      assert(calls == 1 && s_contexts[1].registered);
 +    /* Registration installed the set: nothing more to install. */
 +    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);

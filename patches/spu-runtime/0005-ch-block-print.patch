@@ -12,10 +12,10 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 5fc50208..6eec987b 100644
+index 84b7ac96..27430834 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1183,4 +1183,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+@@ -1213,4 +1213,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  
 -    { static unsigned long bn = 0; unsigned long n = ++bn;
 -      if (n <= 50 || (n % 512) == 0)

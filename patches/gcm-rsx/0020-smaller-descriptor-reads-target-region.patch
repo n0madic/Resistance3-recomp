@@ -26,24 +26,24 @@ Upstream: not proposed yet.
 ---
 
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 59c32474..875ea8b5 100644
+index 961922da..3d9ba283 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -111,2 +111,5 @@ typedef struct {
+@@ -113,2 +113,5 @@ typedef struct {
      u32 feedback;          /* last immutable own-target copy, engine-owned */
 +    u32 region;            /* top-left copy for a smaller descriptor (eng_surface_region), engine-owned */
 +    u32 region_w, region_h;
 +    u64 region_serial;     /* color_serial the region was copied at */
      u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
-@@ -732,2 +735,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -851,2 +854,3 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
 +    if (s->region) { g.be->texture_release(g.be->user, s->region); s->region = 0; }
      if (s->handle) g.be->color_target_release(g.be->user, s->handle);
-@@ -1000,2 +1004,3 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -1120,2 +1124,3 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
      g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
 +    g.surfaces[slot].region_serial = UINT64_MAX;   /* the region copy predates these rows */
  }
-@@ -2527,2 +2532,33 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
+@@ -2777,2 +2782,33 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
   * different conversion and must not silently sample stale guest bytes. */
 +/* What a texture unit naming colour target `slot` reads: the target, or, when
 + * the unit's descriptor is smaller than it at the same pitch, a copy of the
@@ -77,7 +77,7 @@ index 59c32474..875ea8b5 100644
 +}
 +
  static int eng_color_feedback_compatible(const eng_surface* s,
-@@ -2675,7 +2711,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2925,7 +2961,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          if (sampled >= 0) {
 +            const u32 src = eng_surface_region((u32)sampled, &t);
              const u32 view = g.be->surface_view
@@ -88,15 +88,15 @@ index 59c32474..875ea8b5 100644
 -            textures[u] = view ? view : g.surfaces[sampled].handle;
 +            textures[u] = view ? view : src;
              continue;
-@@ -3600,2 +3636,3 @@ void rsx_draw_engine_shutdown(void)
+@@ -3862,2 +3898,3 @@ void rsx_draw_engine_shutdown(void)
          if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
 +        if (g.surfaces[i].region) g.be->texture_release(g.be->user, g.surfaces[i].region);
          if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index f41c34a7..87535b3e 100644
+index 8feacfe8..775019cb 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
-@@ -302,2 +302,10 @@ typedef struct rsx_draw_backend {
+@@ -306,2 +306,10 @@ typedef struct rsx_draw_backend {
  
 +    /* Optional. The top-left w x h of a colour target (w and h no larger than
 +     * the target) as a fresh texture of the target's storage format, copied in
@@ -108,10 +108,10 @@ index f41c34a7..87535b3e 100644
 +    u32  (*color_region)(void* user, u32 surface, u32 w, u32 h);
  } rsx_draw_backend;
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index 5ad1c293..ff9caeb9 100644
+index 0c514c99..da72d299 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
-@@ -3203,2 +3203,26 @@ static u32 eng_color_snapshot(void* user, u32 surface)
+@@ -3309,2 +3309,26 @@ static u32 eng_color_snapshot(void* user, u32 surface)
  
 +/* eng_color_snapshot of the top-left w x h only: the executor copies the
 + * destination's extent. */
@@ -138,7 +138,7 @@ index 5ad1c293..ff9caeb9 100644
 +}
 +
  static u32 eng_depth_target_create(void* user, u32 w, u32 h)
-@@ -3939,4 +3963,5 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -4047,4 +4071,5 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              id<MTLTexture> dst = eng_obj(r->resolve_dst);
 -            if (!src || !dst || [src width] != [dst width] ||
 -                [src height] != [dst height] || [src pixelFormat] != [dst pixelFormat]) {
@@ -146,12 +146,12 @@ index 5ad1c293..ff9caeb9 100644
 +            if (!src || !dst || [src width] < [dst width] ||
 +                [src height] < [dst height] || [src pixelFormat] != [dst pixelFormat]) {
                  s_eng_dropped++; continue;
-@@ -3948,3 +3973,3 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -4056,3 +4081,3 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                     sourceOrigin:MTLOriginMake(0, 0, 0)
 -                     sourceSize:MTLSizeMake([src width], [src height], 1)
 +                     sourceSize:MTLSizeMake([dst width], [dst height], 1)
                        toTexture:dst destinationSlice:0 destinationLevel:0
-@@ -4493,2 +4518,3 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -4723,2 +4748,3 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
      .depth_as_color       = eng_depth_as_color,
 +    .color_region         = eng_color_region,
      .pipeline_create      = eng_pipeline_create,
@@ -228,10 +228,10 @@ index 00000000..4bee1b4b
 +    return failures ? 1 : 0;
 +}
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 547d1af9..9f561cda 100644
+index 05c2bf7e..c176cd2d 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
-@@ -561,2 +561,85 @@ static void test_surface_aliasing(void)
+@@ -567,2 +567,85 @@ static void test_surface_aliasing(void)
  
 +/* ---- 2a. a smaller descriptor reads the top-left of a target ------------ */
 +
@@ -317,7 +317,7 @@ index 547d1af9..9f561cda 100644
 +}
 +
  /* ---- 2b. the MRT set ----------------------------------------------------- */
-@@ -2605,2 +2688,3 @@ int main(void)
+@@ -2878,2 +2961,3 @@ int main(void)
      test_surface_aliasing();
 +    test_smaller_descriptor_reads_a_region();
      test_mrt_set();

@@ -5,7 +5,8 @@ miss there is interpreted. #481 (with #419) makes spu_lifted_lookup and spu_indi
 the drain's resume after a call bracket still looked up the overlay and then the context's own image, so it took the
 stale lift of the image underneath. Resistance 3's job dispatcher loads each job module at LS 0x100, over the policy
 module (igPm, 0xA00) that started it; a resume at a pc in 0xA00 found igPm's lift there, which went back to waiting for
-a signal, and the job never completed. The resume now asks spu_lifted_lookup (with its dispatch cache).
+a signal, and the job never completed. The resume now asks spu_lifted_lookup (with its dispatch cache), which since v0.19.0
+also sets ctx->reloc_delta when the pc is in relocatable code (#636).
 
 Scripted run: boot, Continue, gameplay; jobs complete (no joblist hang).
 

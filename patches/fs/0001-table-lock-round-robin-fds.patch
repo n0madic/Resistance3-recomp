@@ -9,15 +9,21 @@ lowest-free, so a late call on a number that was just closed cannot reach a file
 Upstream #430 (v0.18.0) allocates and releases under a lock and reads each slot once, which keeps a close from
 handing a reader NULL; a reader's snapshot can still be fclose'd under it, which is this crash. So the handlers keep
 holding g_fs_lock for as long as they use the slot, and allocation (under #430's g_fd_lock) goes round-robin.
+v0.19.0's #620 (error codes, EBADF/EMFILE), #641 (cellFsAioWrite) and #645 (cellFsFtruncate) leave the fd table
+itself alone, and the two new handlers look their fd up the same unlocked way, so they hold g_fs_lock here too.
+
+Test: tools/test_ppu_fs_fd_table.py (runtime/ppu/tests/test_fs_fd_table.cpp): each handler that uses a slot waits for
+g_fs_lock while another thread holds it, the AIO completion callbacks run with it free, and a closed descriptor is
+the last to be handed out again (also with the table full).
 
 Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index f73907c2..69e57773 100644
+index 37e37454..2d8cdfe2 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -236,2 +236,23 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir
+@@ -243,2 +243,23 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir
  static std::mutex g_fd_lock;
 +/* A snapshot alone does not stop a close from freeing the FILE while another
 + * thread still reads through it (Resistance 3's FIOS scheduler and media
@@ -41,7 +47,7 @@ index f73907c2..69e57773 100644
 +    return -1;
 +}
  static int fd_alloc_file(FILE* f)
-@@ -239,9 +260,8 @@ static int fd_alloc_file(FILE* f)
+@@ -246,9 +267,8 @@ static int fd_alloc_file(FILE* f)
      std::lock_guard<std::mutex> hold(g_fd_lock);
 -    for (int i = 3; i < FS_MAX; i++)
 -        if (!g_files[i] && !g_dirs[i]) {
@@ -57,7 +63,7 @@ index f73907c2..69e57773 100644
 +    }
 +    return i;
  }
-@@ -250,5 +270,5 @@ static int fd_alloc_dir(DIR* d)
+@@ -257,5 +277,5 @@ static int fd_alloc_dir(DIR* d)
      std::lock_guard<std::mutex> hold(g_fd_lock);
 -    for (int i = 3; i < FS_MAX; i++)
 -        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
@@ -66,52 +72,400 @@ index f73907c2..69e57773 100644
 +    if (i >= 0) __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE);
 +    return i;
  }
-@@ -436,2 +456,3 @@ static void cellFsClose(ppu_context* ctx)
+@@ -443,2 +463,3 @@ static void cellFsClose(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -477,2 +498,3 @@ static void cellFsRead(ppu_context* ctx)
+@@ -484,2 +505,3 @@ static void cellFsRead(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd          = (int)(uint32_t)ctx->gpr[3];
-@@ -549,2 +571,3 @@ static void cellFsWrite(ppu_context* ctx)
+@@ -556,2 +578,3 @@ static void cellFsWrite(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd          = (int)(uint32_t)ctx->gpr[3];
-@@ -614,2 +637,3 @@ static void cellFsFGetBlockSize(ppu_context* ctx)
+@@ -621,2 +644,3 @@ static void cellFsFGetBlockSize(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -631,2 +655,3 @@ static void cellFsLseek(ppu_context* ctx)
+@@ -638,2 +662,3 @@ static void cellFsLseek(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd        = (int)(uint32_t)ctx->gpr[3];
-@@ -687,2 +712,3 @@ static void cellFsFstat(ppu_context* ctx)
+@@ -709,2 +734,3 @@ static void cellFsFstat(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd      = (int)(uint32_t)ctx->gpr[3];
-@@ -733,2 +759,3 @@ static void cellFsReaddir(ppu_context* ctx)
+@@ -766,2 +792,3 @@ static void cellFsReaddir(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd          = (int)(uint32_t)ctx->gpr[3];
-@@ -759,2 +786,3 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
+@@ -796,2 +823,3 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
  {
 +    FS_LOCKED();
      const uint32_t fd = (uint32_t)ctx->gpr[3];
-@@ -809,2 +837,3 @@ static void cellFsClosedir(ppu_context* ctx)
+@@ -846,2 +874,3 @@ static void cellFsClosedir(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -859,2 +888,3 @@ static void cellFsFsync(ppu_context* ctx)
+@@ -896,2 +925,3 @@ static void cellFsFsync(ppu_context* ctx)
  {
 +    FS_LOCKED();
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -953,2 +983,4 @@ static void cellFsAioRead(ppu_context* ctx)
+@@ -904,2 +934,3 @@ static void cellFsFtruncate(ppu_context* ctx)
+ {
++    FS_LOCKED();
+     FILE* f = fd_file((int)(uint32_t)ctx->gpr[3]);
+@@ -1006,2 +1037,4 @@ static void cellFsAioRead(ppu_context* ctx)
      int32_t err = CELL_FS_ENOENT;
 +    {
 +    FS_LOCKED();   /* the table, not the completion: the guest callback runs unlocked */
      if (FILE* f = fd_file(fd)) {
-@@ -971,2 +1003,3 @@ static void cellFsAioRead(ppu_context* ctx)
+@@ -1024,2 +1057,3 @@ static void cellFsAioRead(ppu_context* ctx)
      }
 +    }
-     if (getenv("PS3_FSLOG"))
+     if (ps3_env_once("PS3_FSLOG"))
+@@ -1055,2 +1089,4 @@ static void cellFsAioWrite(ppu_context* ctx)
+     int32_t err = CELL_FS_ENOENT;
++    {
++    FS_LOCKED();   /* the table, not the completion: the guest callback runs unlocked */
+     if (FILE* f = fd_file(fd)) {
+@@ -1067,2 +1103,3 @@ static void cellFsAioWrite(ppu_context* ctx)
+     }
++    }
+     if (ps3_env_once("PS3_FSLOG"))
+diff --git a/runtime/ppu/tests/test_fs_fd_table.cpp b/runtime/ppu/tests/test_fs_fd_table.cpp
+new file mode 100644
+index 00000000..85a3dc0d
+--- /dev/null
++++ b/runtime/ppu/tests/test_fs_fd_table.cpp
+@@ -0,0 +1,239 @@
++/*
++ * ps3recomp - the cellFs descriptor tables under concurrent use (ppu_fs.cpp).
++ *
++ * Resistance 3's FIOS threads open and close one descriptor hundreds of times
++ * per level while others seek and read on it; a close landing between a
++ * handler's fd lookup and its use freed the FILE under it. Two properties
++ * keep that from happening, and the fixture checks both:
++ *   - every handler that uses a table slot holds g_fs_lock for as long as it
++ *     uses it (the AIO ones for the table access only: the guest completion
++ *     callback runs unlocked, or a callback that opens a file would deadlock
++ *     against another thread's handler);
++ *   - descriptors are handed out round-robin, so a call on a number that was
++ *     just closed cannot reach a file that took the number at once.
++ * The lock check holds g_fs_lock from the test thread and shows that each
++ * handler waits for it: a handler without FS_LOCKED() returns at once.
++ *
++ *   tools/test_ppu_fs_fd_table.py [--exe-out PATH]
++ *   test_fs_fd_table [DIR]      (DIR: scratch directory; default the system temp dir)
++ */
++/* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash. */
++#include "../../platform/ps3_dev_flash.c"
++#include "ppu_fs.cpp"
++#include <chrono>
++#include <thread>
++#ifdef _WIN32
++#  include <windows.h>
++#endif
++
++/* ---- link stubs: nothing on the paths this test drives calls them ---- */
++extern "C" {
++uint8_t* vm_base = nullptr;
++uint32_t ppu_vm_size = 0;
++void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); memcpy(vm_base + a, &be, 4); }
++void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
++void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
++void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
++void ydkj_host_bt(const char* tag) { (void)tag; }
++void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
++}
++const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
++
++/* The AIO completion callback: asked, from another thread, whether the table lock is free while it runs. */
++static int cb_calls = 0, cb_lock_free = 0;
++static void guest_caller(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)
++{
++    cb_calls++;
++    bool got = false;
++    std::thread([&] { got = g_fs_lock.try_lock(); if (got) g_fs_lock.unlock(); }).join();
++    cb_lock_free += got;
++}
++ps3_guest_caller_fn g_ps3_guest_caller = guest_caller;
++
++static uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, vm_base + a, 4); return __builtin_bswap32(v); }
++
++static int fails = 0;
++#define CHECK(c, ...) do { const bool ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++enum : uint32_t { PATH = 0x100, FDP = 0x500, NP = 0x508, POSP = 0x510, STATB = 0x600, DENT = 0x800,
++                  AIO = 0x900, DIRENTS = 0x2000, CNTP = 0x6000, BUF = 0x7000 };
++
++static uint32_t call_rc(const ppu_context& ctx) { return (uint32_t)ctx.gpr[3]; }
++static ppu_context mk(uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0)
++{
++    ppu_context ctx; memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = a; ctx.gpr[4] = b; ctx.gpr[5] = c; ctx.gpr[6] = d;
++    return ctx;
++}
++static uint32_t open_guest(const char* guest, uint32_t flags, uint32_t* fd_out)
++{
++    strcpy((char*)vm_base + PATH, guest);
++    ppu_context ctx = mk(PATH, flags, FDP);
++    cellFsOpen(&ctx);
++    if (call_rc(ctx) == 0 && fd_out) *fd_out = rd32(FDP);
++    return call_rc(ctx);
++}
++static uint32_t opendir_guest(const char* guest, uint32_t* fd_out)
++{
++    strcpy((char*)vm_base + PATH, guest);
++    ppu_context ctx = mk(PATH, FDP);
++    cellFsOpendir(&ctx);
++    if (call_rc(ctx) == 0 && fd_out) *fd_out = rd32(FDP);
++    return call_rc(ctx);
++}
++static void close_fd(uint32_t fd)    { ppu_context ctx = mk(fd); cellFsClose(&ctx); }
++static void closedir_fd(uint32_t fd) { ppu_context ctx = mk(fd); cellFsClosedir(&ctx); }
++
++/* Runs `fn` on its own thread while this one holds g_fs_lock; true when it
++ * stayed blocked for 150 ms and then, with the lock released, finished OK. */
++static bool waits_for_lock(void (*fn)(ppu_context*), ppu_context ctx)
++{
++    std::atomic<bool> done{false};
++    g_fs_lock.lock();
++    std::thread t([&] { fn(&ctx); done = true; });
++    std::this_thread::sleep_for(std::chrono::milliseconds(150));
++    const bool held_back = !done.load();
++    g_fs_lock.unlock();
++    t.join();
++    return held_back && call_rc(ctx) == 0;
++}
++
++static void aio_args(uint32_t fd, uint64_t off, uint32_t buf, uint64_t len)
++{
++    vm_write32(AIO + 0x00, fd); vm_write64(AIO + 0x08, off); vm_write32(AIO + 0x10, buf); vm_write64(AIO + 0x18, len);
++}
++
++int main(int argc, char** argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    static uint8_t mem[0x20000];
++    vm_base = mem; ppu_vm_size = sizeof mem;
++
++    const char* dir = argc > 1 ? argv[1] : NULL;
++#ifdef _WIN32
++    char tmp[MAX_PATH];
++    if (!dir) { DWORD n = GetTempPathA(sizeof tmp, tmp); if (n && n < sizeof tmp) { tmp[n - 1] = 0; dir = tmp; } }
++#endif
++    if (!dir) dir = getenv("TMPDIR");
++    if (!dir) dir = "/tmp";
++    char host[1100], hostdir[1100], inner[1200];
++    snprintf(host, sizeof host, "%s/ps3recomp_fs_fd_table.bin", dir);
++    snprintf(hostdir, sizeof hostdir, "%s/ps3recomp_fs_fd_table.d", dir);
++    snprintf(inner, sizeof inner, "%s/inner.txt", hostdir);
++    remove(host);
++    ppu_vfs_root = dir;
++#ifdef _WIN32
++    _mkdir(hostdir);
++#else
++    mkdir(hostdir, 0755);
++#endif
++    if (FILE* f = fopen(inner, "wb")) { fputs("x", f); fclose(f); }
++
++    const char* GFILE = "/dev_hdd1/ps3recomp_fs_fd_table.bin";
++    const char* GDIR = "/dev_hdd1/ps3recomp_fs_fd_table.d";
++
++    uint32_t fd = 0;
++    uint32_t rc = open_guest(GFILE, 0x42 /* O_RDWR|O_CREAT */, &fd);
++    CHECK(rc == 0, "cellFsOpen(O_RDWR|O_CREAT) creates the file (rc 0x%08X, fd %u)", rc, fd);
++    if (rc != 0) { printf("FAIL (could not create %s)\n", host); return 1; }
++    memset(mem + BUF, 'a', 64);
++    { ppu_context ctx = mk(fd, BUF, 64, NP); cellFsWrite(&ctx); }
++
++    /* ---- round-robin: a just-closed number is not the next one handed out ---- */
++    {
++        uint32_t a = 0, b = 0, c = 0;
++        CHECK(open_guest(GFILE, 0, &a) == 0 && open_guest(GFILE, 0, &b) == 0 && open_guest(GFILE, 0, &c) == 0,
++              "three opens: fds %u %u %u", a, b, c);
++        CHECK(b == a + 1 && c == b + 1, "they are consecutive");
++        close_fd(a);
++        uint32_t d = 0;
++        CHECK(open_guest(GFILE, 0, &d) == 0 && d != a && d == c + 1,
++              "after closing fd %u the next open gets %u, not the number just closed", a, d);
++        close_fd(b); close_fd(c); close_fd(d);
++
++        uint32_t d1 = 0, d2 = 0;
++        CHECK(opendir_guest(GDIR, &d1) == 0, "cellFsOpendir (fd %u)", d1);
++        closedir_fd(d1);
++        CHECK(opendir_guest(GDIR, &d2) == 0 && d2 != d1, "closedir then opendir: fd %u then %u", d1, d2);
++        closedir_fd(d2);
++        uint32_t f1 = 0;
++        CHECK(open_guest(GFILE, 0, &f1) == 0 && f1 != d2 && f1 != d1,
++              "a file open right after does not take the just-closed dir fd (%u)", f1);
++        close_fd(f1);
++    }
++
++    /* The same with the table full and two slots free: allocation goes on from where it
++     * stopped, wrapping round the table, so the slot just closed is the last to be reused. */
++    {
++        uint32_t fds[FS_MAX]; int n = 0;
++        for (int i = 0; i < FS_MAX; i++) {
++            if (open_guest(GFILE, 0, &fds[n]) != 0) break;
++            n++;
++        }
++        CHECK(n >= 200, "opened %d descriptors before the table filled", n);
++        const uint32_t s1 = fds[2], s2 = fds[n - 3];
++        close_fd(s1); close_fd(s2);
++        uint32_t x = 0, y = 0;
++        CHECK(open_guest(GFILE, 0, &x) == 0 && (x == s1 || x == s2), "first reuse: fd %u", x);
++        close_fd(x);
++        CHECK(open_guest(GFILE, 0, &y) == 0 && (y == s1 || y == s2) && y != x,
++              "after closing it the other free slot is next, not fd %u again (fd %u)", x, y);
++        for (int i = 0; i < n; i++) if (fds[i] != s1 && fds[i] != s2) close_fd(fds[i]);
++        close_fd(y);
++    }
++
++    /* ---- every handler that uses a slot waits for g_fs_lock ---- */
++    uint32_t rfd = 0, dfd = 0;
++    CHECK(open_guest(GFILE, 0x42, &rfd) == 0 && opendir_guest(GDIR, &dfd) == 0, "open a file (fd %u) and a dir (fd %u)", rfd, dfd);
++    CHECK(waits_for_lock(cellFsRead,        mk(rfd, BUF, 8, NP)),      "cellFsRead waits for the table lock");
++    CHECK(waits_for_lock(cellFsWrite,       mk(rfd, BUF, 8, NP)),      "cellFsWrite waits for the table lock");
++    CHECK(waits_for_lock(cellFsLseek,       mk(rfd, 0, CELL_FS_SEEK_SET, POSP)), "cellFsLseek waits for the table lock");
++    CHECK(waits_for_lock(cellFsFstat,       mk(rfd, STATB)),           "cellFsFstat waits for the table lock");
++    CHECK(waits_for_lock(cellFsFGetBlockSize, mk(rfd, NP, POSP)),      "cellFsFGetBlockSize waits for the table lock");
++    CHECK(waits_for_lock(cellFsFsync,       mk(rfd)),                  "cellFsFsync waits for the table lock");
++    CHECK(waits_for_lock(cellFsFtruncate,   mk(rfd, 64)),              "cellFsFtruncate waits for the table lock");
++    CHECK(waits_for_lock(cellFsReaddir,     mk(dfd, DENT, NP)),        "cellFsReaddir waits for the table lock");
++    aio_args(rfd, 0, BUF, 16);
++    CHECK(waits_for_lock(cellFsAioRead,     mk(AIO, 0, 0)),            "cellFsAioRead waits for the table lock");
++    CHECK(waits_for_lock(cellFsAioWrite,    mk(AIO, 0, 0)),            "cellFsAioWrite waits for the table lock");
++    CHECK(waits_for_lock(cellFsClosedir,    mk(dfd)),                  "cellFsClosedir waits for the table lock");
++    CHECK(waits_for_lock(cellFsClose,       mk(rfd)),                  "cellFsClose waits for the table lock");
++    CHECK(fd_file(rfd) == nullptr && fd_dir(dfd) == nullptr, "and both closes took effect once it was free");
++    {
++        uint32_t d3 = 0;
++        CHECK(opendir_guest(GDIR, &d3) == 0, "reopen the dir (fd %u)", d3);
++        CHECK(waits_for_lock(cellFsGetDirectoryEntries, mk(d3, DIRENTS, 312 * 4, CNTP)),
++              "cellFsGetDirectoryEntries waits for the table lock");
++        closedir_fd(d3);
++    }
++
++    /* ---- the AIO completion callback runs with the lock released ---- */
++    {
++        uint32_t afd = 0;
++        CHECK(open_guest(GFILE, 0x42, &afd) == 0, "open the file again (fd %u)", afd);
++        aio_args(afd, 0, BUF, 16);
++        ppu_context ctx = mk(AIO, 0, 0x1234);
++        cb_calls = cb_lock_free = 0;
++        cellFsAioRead(&ctx);
++        CHECK(call_rc(ctx) == 0 && cb_calls == 1 && cb_lock_free == 1,
++              "cellFsAioRead: the callback ran (%d) with the table lock free (%d)", cb_calls, cb_lock_free);
++        ctx = mk(AIO, 0, 0x1234);
++        cb_calls = cb_lock_free = 0;
++        cellFsAioWrite(&ctx);
++        CHECK(call_rc(ctx) == 0 && cb_calls == 1 && cb_lock_free == 1,
++              "cellFsAioWrite: the callback ran (%d) with the table lock free (%d)", cb_calls, cb_lock_free);
++        close_fd(afd);
++    }
++
++    close_fd(fd);
++    remove(inner);
++    remove(host);
++#ifdef _WIN32
++    _rmdir(hostdir);
++#else
++    rmdir(hostdir);
++#endif
++    printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/tools/test_ppu_fs_fd_table.py b/tools/test_ppu_fs_fd_table.py
+new file mode 100644
+index 00000000..189ed25f
+--- /dev/null
++++ b/tools/test_ppu_fs_fd_table.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""cellFs descriptor tables under concurrent use: the table lock and round-robin fds.
++
++runtime/ppu/ppu_fs.cpp: every handler that uses an fd's slot holds one lock for as
++long as it does, so a close on another thread cannot free the FILE under it (the AIO
++handlers hold it for the table access only: the guest completion callback runs
++unlocked), and descriptors are handed out round-robin, so a number that was just
++closed is the last to be reused. This builds
++runtime/ppu/tests/test_fs_fd_table.cpp (which includes ppu_fs.cpp) against a
++ppu_recomp.h made from the lifter's own HEADER_PREAMBLE and runs it.
++
++It needs a host C++ compiler (under CI=1 a missing one fails instead of
++skipping).
++
++Usage:
++    python3 tools/test_ppu_fs_fd_table.py [--exe-out PATH] [--build-only]
++"""
++
++import argparse
++import importlib.util
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++
++TOOLS = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(TOOLS)
++FIXTURE = os.path.join(ROOT, "runtime", "ppu", "tests", "test_fs_fd_table.cpp")
++INCLUDE_DIRS = ["include", "runtime/ppu", "runtime/memory", "runtime", "libs", "."]
++
++
++def _cxx():
++    return (shutil.which(os.environ.get("CXX", "c++")) or shutil.which("g++")
++            or shutil.which("clang++"))
++
++
++def _stub_header():
++    spec = importlib.util.spec_from_file_location(
++        "ppu_lifter", os.path.join(TOOLS, "ppu_lifter.py"))
++    lifter = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(lifter)
++    return lifter.HEADER_PREAMBLE
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--exe-out", help="keep the built test program at this path")
++    ap.add_argument("--build-only", action="store_true",
++                    help="build (for another machine, e.g. a Windows target) and stop")
++    args = ap.parse_args()
++
++    cxx = _cxx()
++    if cxx is None:
++        if os.environ.get("CI"):
++            print("FAIL: no C++ compiler found")
++            return 1
++        print("skip test_ppu_fs_fd_table: no C++ compiler")
++        return 0
++    with tempfile.TemporaryDirectory() as td:
++        with open(os.path.join(td, "ppu_recomp.h"), "w") as fh:
++            fh.write(_stub_header())
++        exe = args.exe_out or os.path.join(td, "test_fs_fd_table")
++        cmd = [cxx, "-std=gnu++17", "-w", "-I" + td]
++        cmd += ["-I" + os.path.join(ROOT, d) for d in INCLUDE_DIRS]
++        cmd += ["-o", exe, FIXTURE, "-pthread"]
++        if "mingw" in os.path.basename(cxx):
++            cmd += ["-static"]
++        r = subprocess.run(cmd, capture_output=True, text=True)
++        if r.returncode != 0:
++            print("FAIL: fixture did not build")
++            print((r.stdout + r.stderr)[-4000:])
++            return 1
++        if args.build_only:
++            print(f"built {exe}")
++            return 0
++        r = subprocess.run([exe, td], capture_output=True, text=True)
++        sys.stdout.write(r.stdout)
++        sys.stderr.write(r.stderr)
++        return r.returncode
++
++
++if __name__ == "__main__":
++    sys.exit(main())

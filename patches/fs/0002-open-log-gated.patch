@@ -2,19 +2,201 @@ ppu_fs: the "[fs] open" line only with PS3_FSLOG, like the other per-call file t
 
 cellFsOpen printed every successful open. Resistance 3 opens sound banks, level chunks and streamed data throughout
 play, so the log fills with "[fs] open '/dev_hdd0/.../resident_sound.dat' -> fd 68" lines. stat, opendir and mkdir
-already print only with PS3_FSLOG; open now does too. Failed opens and FS_CALLER output are unchanged.
+already print only with PS3_FSLOG; open now does too. Failed opens and FS_CALLER output are unchanged. The switch is
+looked up with ps3_env_once, like the file's other PS3_FSLOG checks since #515 (v0.19.0).
 
-Test: scripted run (boot, Continue, gameplay): no "[fs] open" lines without PS3_FSLOG; with it the same lines as before.
+Test: tools/test_ppu_fs_open_log.py (runtime/ppu/tests/test_fs_open_log.cpp) runs a successful and a failed open under
+no switch, PS3_FSLOG and FS_CALLER and reads stderr; a scripted run (boot, Continue, gameplay) shows no "[fs] open"
+lines without PS3_FSLOG and the same lines as before with it.
 
 Upstream: not proposed yet.
 ---
 
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index 69e57773..898d8448 100644
+index 2d8cdfe2..71127381 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -356,3 +356,3 @@ static void cellFsOpen(ppu_context* ctx)
+@@ -363,3 +363,3 @@ static void cellFsOpen(ppu_context* ctx)
            } }
 -      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
-+      else if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
-     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
++      else if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+     if (ps3_env_once("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
+diff --git a/runtime/ppu/tests/test_fs_open_log.cpp b/runtime/ppu/tests/test_fs_open_log.cpp
+new file mode 100644
+index 00000000..b5bceadd
+--- /dev/null
++++ b/runtime/ppu/tests/test_fs_open_log.cpp
+@@ -0,0 +1,59 @@
++/*
++ * ps3recomp - the "[fs] open" trace of cellFsOpen (ppu_fs.cpp).
++ *
++ * A title opens sound banks and level chunks throughout play, so the line for
++ * each successful open is a per-call trace like stat's and opendir's: it is
++ * printed only with PS3_FSLOG (FS_CALLER's longer line is its own switch). A
++ * failed open is printed always. The program opens a file that exists and one
++ * that does not, then closes the first; tools/test_ppu_fs_open_log.py runs it
++ * under three environments and reads what it wrote to stderr.
++ *
++ *   tools/test_ppu_fs_open_log.py [--exe-out PATH]
++ *   test_fs_open_log DIR      (DIR: scratch directory for the file)
++ */
++/* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash. */
++#include "../../platform/ps3_dev_flash.c"
++#include "ppu_fs.cpp"
++
++/* ---- link stubs: nothing on the paths this test drives calls them ---- */
++extern "C" {
++uint8_t* vm_base = nullptr;
++uint32_t ppu_vm_size = 0;
++void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); memcpy(vm_base + a, &be, 4); }
++void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
++void ppu_guest_caller(char* out, size_t n) { if (n) snprintf(out, n, "test_main"); }
++void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
++void ydkj_host_bt(const char* tag) { (void)tag; }
++void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
++}
++ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
++const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
++
++static uint32_t open_guest(const char* guest, uint32_t* fd_out)
++{
++    strcpy((char*)vm_base + 0x100, guest);
++    ppu_context ctx; memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = 0x100; ctx.gpr[4] = 0 /* O_RDONLY */; ctx.gpr[5] = 0x500;
++    cellFsOpen(&ctx);
++    if ((uint32_t)ctx.gpr[3] == 0 && fd_out) { uint32_t be; memcpy(&be, vm_base + 0x500, 4); *fd_out = __builtin_bswap32(be); }
++    return (uint32_t)ctx.gpr[3];
++}
++
++int main(int argc, char** argv)
++{
++    static uint8_t mem[0x1000];
++    vm_base = mem; ppu_vm_size = sizeof mem;
++    if (argc < 2) { printf("usage: test_fs_open_log DIR\n"); return 2; }
++    char host[1100];
++    snprintf(host, sizeof host, "%s/ps3recomp_fs_open_log.bin", argv[1]);
++    if (FILE* f = fopen(host, "wb")) { fputs("x", f); fclose(f); } else { printf("FAIL: could not create %s\n", host); return 1; }
++    ppu_vfs_root = argv[1];
++
++    uint32_t fd = 0;
++    const uint32_t ok = open_guest("/dev_hdd1/ps3recomp_fs_open_log.bin", &fd);
++    const uint32_t missing = open_guest("/dev_hdd1/ps3recomp_fs_open_log.missing", nullptr);
++    { ppu_context ctx; memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; cellFsClose(&ctx); }
++    remove(host);
++    printf("open rc=0x%08X fd=%u; missing rc=0x%08X\n", ok, fd, missing);
++    return ok == 0 && missing == 0x80010006u ? 0 : 1;
++}
+diff --git a/tools/test_ppu_fs_open_log.py b/tools/test_ppu_fs_open_log.py
+new file mode 100644
+index 00000000..b8a8da03
+--- /dev/null
++++ b/tools/test_ppu_fs_open_log.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""The "[fs] open" line of cellFsOpen is a PS3_FSLOG trace.
++
++runtime/ppu/ppu_fs.cpp printed every successful open: a title that opens sound
++banks and level chunks all through play filled the log with them. Like stat,
++opendir and mkdir, the line is now printed only with PS3_FSLOG; FS_CALLER's
++longer line is its own switch, and a failed open is printed always. This builds
++runtime/ppu/tests/test_fs_open_log.cpp (which includes ppu_fs.cpp) against a
++ppu_recomp.h made from the lifter's own HEADER_PREAMBLE and runs it under three
++environments, reading what it writes to stderr.
++
++It needs a host C++ compiler (under CI=1 a missing one fails instead of
++skipping).
++
++Usage:
++    python3 tools/test_ppu_fs_open_log.py [--exe-out PATH] [--build-only]
++"""
++
++import argparse
++import importlib.util
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++
++TOOLS = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(TOOLS)
++FIXTURE = os.path.join(ROOT, "runtime", "ppu", "tests", "test_fs_open_log.cpp")
++INCLUDE_DIRS = ["include", "runtime/ppu", "runtime/memory", "runtime", "libs", "."]
++
++
++def _cxx():
++    return (shutil.which(os.environ.get("CXX", "c++")) or shutil.which("g++")
++            or shutil.which("clang++"))
++
++
++def _stub_header():
++    spec = importlib.util.spec_from_file_location(
++        "ppu_lifter", os.path.join(TOOLS, "ppu_lifter.py"))
++    lifter = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(lifter)
++    return lifter.HEADER_PREAMBLE
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--exe-out", help="keep the built test program at this path")
++    ap.add_argument("--build-only", action="store_true",
++                    help="build (for another machine, e.g. a Windows target) and stop")
++    args = ap.parse_args()
++
++    cxx = _cxx()
++    if cxx is None:
++        if os.environ.get("CI"):
++            print("FAIL: no C++ compiler found")
++            return 1
++        print("skip test_ppu_fs_open_log: no C++ compiler")
++        return 0
++    with tempfile.TemporaryDirectory() as td:
++        with open(os.path.join(td, "ppu_recomp.h"), "w") as fh:
++            fh.write(_stub_header())
++        exe = args.exe_out or os.path.join(td, "test_fs_open_log")
++        cmd = [cxx, "-std=gnu++17", "-w", "-I" + td]
++        cmd += ["-I" + os.path.join(ROOT, d) for d in INCLUDE_DIRS]
++        cmd += ["-o", exe, FIXTURE]
++        if "mingw" in os.path.basename(cxx):
++            cmd += ["-static"]
++        r = subprocess.run(cmd, capture_output=True, text=True)
++        if r.returncode != 0:
++            print("FAIL: fixture did not build")
++            print((r.stdout + r.stderr)[-4000:])
++            return 1
++        if args.build_only:
++            print(f"built {exe}")
++            return 0
++        failed = 0
++
++        def check(cond, what):
++            nonlocal failed
++            print(("[PASS] " if cond else "[FAIL] ") + what)
++            failed += not cond
++
++        def run(**extra):
++            env = {k: v for k, v in os.environ.items() if k not in ("PS3_FSLOG", "FS_CALLER")}
++            env.update(extra)
++            r = subprocess.run([exe, td], capture_output=True, text=True, env=env)
++            check(r.returncode == 0, f"the program ran ({r.stdout.strip()})")
++            return [l for l in r.stderr.splitlines() if l.startswith("[fs] open")]
++
++        plain = run()
++        check(not any(l.startswith("[fs] open '") for l in plain),
++              "no \"[fs] open '...'\" line without PS3_FSLOG")
++        check(any(l.startswith("[fs] open FAIL ") for l in plain),
++              "a failed open is still printed")
++        logged = run(PS3_FSLOG="1")
++        check(sum(l.startswith("[fs] open '") for l in logged) == 1,
++              "with PS3_FSLOG one \"[fs] open '...' -> fd N\" line for the successful open")
++        check(any(l.startswith("[fs] open FAIL ") for l in logged), "and the failed open")
++        caller = run(FS_CALLER="1")
++        check(any(l.startswith("[fs] open '") and "(opened by test_main)" in l for l in caller),
++              "FS_CALLER still prints its own line, without PS3_FSLOG")
++        print("%s (%d failed)" % ("FAIL" if failed else "PASS", failed))
++        return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
