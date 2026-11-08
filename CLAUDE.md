@@ -172,6 +172,12 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   (`gcm-rsx/0025`; it used to drop the rest: at 8192 the fight lost 117-195 records every few frames); the cap is
   16384 from `host/CMakeLists.txt`, so the fight never pays that mid-frame wait. Next on that thread: the 8 KB VS constant block copied for every draw (`eng_bind_vs_constants`
   -> `eng_stage_copy`, ~10%), texture content hashing, FP structural hashing.
+  The game times its GPU frame with marker reports (IO 0x20B60 start, 0x20B40 end; `func_0075A38C` keeps the time at
+  0x12B5238+0xE1C, `func_003DCA40` compares it with its frame budget and sets the quality bits at 0x11DDFB4) and
+  drops decor (cloth under roofs, bushes, saplings) above 0.84-0.90 of the budget. The walker stamped reports with
+  host time, so the game read our draw conversion as GPU load; `PS3RECOMP_GCM_REPORT_BUSY_SCALE=0` (host default,
+  `gcm-rsx/0026`) leaves the walker's drain time out of the stamps. Its ~2360 occlusion queries a frame are read only by
+  conditional rendering (method 0x1E98), which the toolkit ignores: everything is drawn.
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000); the runtime looks most switches up once per name (`ps3_env_once`, #515), so a variable set after start-up is not seen.
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.

@@ -631,6 +631,11 @@ int main(int argc, char** argv)
      * memory. The toolkit's default treats subchannel 1 as 3D (another title binds NV4097 there), which dropped
      * every copy and wrote its offsets over the blend registers. */
     set_default_env("GCM_SUBCH1_2D", "1");
+    /* The game times its GPU frame with three marker reports and above 0.84-0.90 of its frame budget drops decor
+     * (cloth, bushes, saplings) and detail. The walker stamps reports with host time, so the GPU time it showed was
+     * our draw conversion, 31-46 ms a frame in the Haven fight; 0 leaves the walker's drain time out of the stamps
+     * (gcm-rsx/0026), as if the RSX's own work cost nothing. */
+    set_default_env("PS3RECOMP_GCM_REPORT_BUSY_SCALE", "0");
     /* The toolkit logs every guest wait ("[WAIT] event_queue_receive ...", about 10k lines a minute here) whenever
      * stderr is not a terminal, so a run with --log filled the file with them and paid for the writes on every guest
      * thread. PS3_VERBOSE=1 brings them back for debugging. */
