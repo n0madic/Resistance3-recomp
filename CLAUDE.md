@@ -54,7 +54,7 @@ cmake --build <scratch>/build-tests -- -k 0     # keep going past a target that 
 ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 40
 ```
 
-Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (144 of them with
+Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (145 of them with
 the patches; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
 Some runtime unit tests (e.g. `runtime/spu/tests/test_spu_thread_ls_dma.c`) are built directly with clang from the
 toolkit dir against the runtime sources they need: the "run:" steps of `.github/workflows/macos.yml` give the line
@@ -64,7 +64,7 @@ The Metal ones that translate guest programs
 `-DPS3RECOMP_HAVE_MSL_TRANSLATION=1 -DPS3RECOMP_MSL_TRANSLATOR_ID='"<any 23 chars>"'` and `-I build/deps/prefix/include`
 (+ `/spirv_cross`), and link glslang, SPIRV, SPIRV-Tools(-opt) and the spirv-cross static libraries from
 `build/deps/prefix/lib`; without it the stub reports "translation was not built" and 32 of 37 checks fail (with it,
-133/133 pass). On the pinned v0.19.0 with the patches on, 38 of the 40 ctest tests, all 144 scripts and the 37 workflow
+133/133 pass). On the pinned v0.19.0 with the patches on, 38 of the 40 ctest tests, all 145 scripts and the 37 workflow
 tests pass (`test_metal_frame_rate` needs a usable display); `sys_fs` and `ppu_thread_join` do not link on macOS, on
 plain v0.19.0 either (`_cellGame_get_hdd_title_id`; Windows thread calls), so any other new failure is ours. A patch that moves a symbol or
 changes a code path can break a fixture's link line or stub (the loader fixtures stub `cellGcm_on_put_store`): fix the
@@ -128,6 +128,11 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   SPU interpreter. The ~220 images need larger runtime tables than the toolkit's defaults: `host/CMakeLists.txt` defines
   `SPU_WORKLOAD_MAX` (past it the SPURS task ELFs were dropped and the boot hung) and `SPU_OVL_SRC_MAX`
   (`spu-runtime/0009`; past it a module stays in the interpreter, the log says `[r3] ... not registered`).
+  Lifted SPU functions with a loop keep their registers in locals (`spu-runtime/0015`, `tools/spu_regcache.py` on the
+  lifter's output; 1651 of ~16100 functions, +7.5% code; the hottest Haven loop 9-17% faster per call, checked with
+  lldb-dumped entry states run offline, bit-identical results). `PS3RECOMP_SPU_REGCACHE=0` at lift time (and any
+  `--trace` lift) emits the plain `ctx->gpr` form; in cached functions `SPU_LS_WATCH`/`SPU_LS_LOWREAD` print the
+  registers as of the last store-back.
 - **RSX/GCM**: the FIFO walker runs on the present thread. `cellGcm_on_put_store` takes JUMPs at an idle get
   immediately (the game injects command blocks at get and reuses their memory). The draw engine goes to Metal.
   The game reads its Z24S8 depth buffers as A8R8G8B8 several times a frame (one of them while it is still the

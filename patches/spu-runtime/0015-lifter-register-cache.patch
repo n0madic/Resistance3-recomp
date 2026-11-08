@@ -1,0 +1,571 @@
+SPU lifter: functions with a loop keep their registers in locals (a hot job loop 9-17% faster per call).
+
+The lifter writes every register access as ctx->gpr[n]. A local-store store goes through ctx->ls, and with
+-fno-strict-aliasing it may alias the context, so after each one the compiler re-reads every register from ctx and
+every result is stored back at once: a lifted loop runs through memory. In the Resistance 3 Haven fight the hottest
+lifted SPU loop (igjob_00E29200 at 0x2E8) loaded registers from ctx 86 times in its body.
+
+tools/spu_regcache.py runs on the lifter's output (emit_source; PS3RECOMP_SPU_REGCACHE=0 emits the old form, and so
+does a --trace lift, whose spu_trace_rt prints ctx->gpr). For a function with a goto back to a label above it, the
+registers it names live in locals: loaded on entry, stored back before any statement that hands ctx to code that may
+read them (a lifted call, the drain, spu_indirect_branch, stop/halt, channel ops, SPU_DIRECT/SPU_RET, return),
+re-read at the end of a line that may run other SPU code. The lifter emits one balanced statement per body line, and
+such a call sits in plain blocks with no register access or goto after it on its line; a function with another shape
+is left as it is (none in Resistance 3). Functions without a loop are left alone: caching every function grew the
+lifted SPU code by 61% and a straight chunk with five exits ran no faster; loops only: +7.5% (1651 of 16119
+functions). The LS diagnostics read ctx->gpr themselves (SPU_LS_WATCH r0, SPU_LS_LOWREAD r1-r4) and see the values
+of the last store-back.
+Idea from the Resistance 2 port's spu_regcache.py / spu_writeback.py (MIT,
+github.com/miroslavdanutalexandru-alt/Resistance2Port); this is a separate implementation.
+
+Test: tools/test_spu_lifter_regcache.py lifts a loop (LS store and load, a call to a subroutine that changes the
+caller's register, a stop) with and without the cache; both runs must give the expected registers and LS (the
+store-back before a call placed after it fails it), the loop body must not name ctx->gpr, a loopless function and a
+trace lift are left alone. Unit cases: a store-back is dropped right after another and kept after a write or a label,
+none goes between a call and its reload, a comment is not code, and a call the reload may not follow (conditional,
+register access or goto after it) leaves the function alone.
+Micro-benchmark (registers and LS of three entries of each function dumped from the Haven fight with lldb, the
+function run 3000-5000 times from each, both versions from the same lift): igjob_00E29200 0x2E8 458-542 ->
+417-458 ns per call (9-17%), jobmod_8f987d5458b2 0x4300 (no loop) unchanged; the registers and LS after the call
+are bit-identical in all six cases. In-game fps could not be compared: the fight is not SPU-bound since gcm-rsx/0024
+and run-to-run noise is larger than lifted SPU code's share.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index e5c7da40..995143ee 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -553,2 +553,6 @@ class SPULifter:
+         self.reloc = False
++        # Keep each function's registers in locals (spu_regcache.py) instead of
++        # ctx->gpr. PS3RECOMP_SPU_REGCACHE=0 emits the plain form, and so does a
++        # --trace lift: spu_trace_rt prints ctx->gpr after every instruction.
++        self.regcache = os.environ.get("PS3RECOMP_SPU_REGCACHE", "1") != "0"
+         # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
+@@ -1202,3 +1206,7 @@ class SPULifter:
+         lines.append("")
+-        return "\n".join(lines)
++        src = "\n".join(lines)
++        if self.regcache and not self.trace:
++            import spu_regcache
++            src = spu_regcache.transform_source(src)[0]
++        return src
+ 
+diff --git a/tools/spu_regcache.py b/tools/spu_regcache.py
+new file mode 100644
+index 00000000..fa24d375
+--- /dev/null
++++ b/tools/spu_regcache.py
+@@ -0,0 +1,273 @@
++#!/usr/bin/env python3
++"""Register cache for lifted SPU functions.
++
++The lifter writes every SPU register access as ctx->gpr[n]. Local-store stores
++go through ctx->ls (bytes), and with -fno-strict-aliasing every store may alias
++the context, so the compiler re-reads each register from ctx after every LS
++store and writes each result back at once: the code moves through memory.
++
++This pass gives each function with a loop local copies (S_n) of the registers
++it names (see has_loop for why only those):
++  - entry: S_n = ctx->gpr[n] for every register the function uses;
++  - writes and reads use S_n only;
++  - before a statement that hands ctx to code that may read the registers
++    (a lifted function, the drain, spu_indirect_branch, stop/halt, the channel
++    ops, SPU_DIRECT / SPU_RET, any return) the registers the function writes
++    are stored back (SPU_RC_STORE);
++  - at the end of a line with a statement that may run other SPU code (a
++    lifted function call, spu_drain_call, spu_indirect_branch) every register
++    the function uses is re-read (SPU_RC_LOAD).
++LS reads/writes (spu_ls_read128/spu_ls_write128 ...) and spu_img_restore only
++look at ctx->ls / image state and need neither. Code that reads ctx->gpr by
++itself between store-backs sees the values of the last one: the LS
++diagnostics (SPU_LS_WATCH prints r0, SPU_LS_LOWREAD r1-r4). spu_trace_rt does
++too, so the lifter does not cache a --trace lift.
++
++The lifter emits one complete statement per body line (balanced braces, no
++else, no switch), and a call that may run SPU code sits in plain blocks with
++no register access or goto after it on its line, so the reload at the end of
++the line follows the call on every path. A function with anything else is
++left as it is.
++
++Idea: the Resistance 2 port's spu_regcache.py / spu_writeback.py (MIT,
++github.com/miroslavdanutalexandru-alt/Resistance2Port); this is a separate
++implementation over this lifter's output.
++
++  spu_regcache.py in.c [out.c]     (out defaults to in)
++"""
++from __future__ import annotations
++
++import logging
++import re
++import sys
++
++LOG = logging.getLogger(__name__)
++
++STORE = 'SPU_RC_STORE'          # macro: the registers the function writes, back to ctx
++LOAD = 'SPU_RC_LOAD'            # macro: every register the function uses, from ctx
++STORE_STMT = STORE + '; '
++FHEAD = re.compile(r'^void (\w+)\(spu_context\* ctx\) \{$')
++GPR = re.compile(r'ctx->gpr\[(\d+)\]')
++GPR_WRITE = re.compile(r'ctx->gpr\[(\d+)\]\s*=(?!=)')
++# Statements that let other code see the context's registers: store back first.
++FLUSH = re.compile(r'\breturn\b|\bSPU_DIRECT\(|\bSPU_RET(?:_REG)?\(|\bspu_(?:stop|halt|wrch|rdch|rchcnt|'
++                   r'indirect_branch|drain_call)\(|\b(?:\w+_)?spu_func_[0-9A-Fa-f]+\(ctx\)')
++# Statements after which the registers may have changed: re-read.
++CLOBBER = re.compile(r'\bspu_(?:indirect_branch|drain_call)\(|\b(?:\w+_)?spu_func_[0-9A-Fa-f]+\(ctx\)')
++# Shapes the pass does not handle: a register by address or computed index, the
++# pass's own names (an already cached function), compound and lane writes.
++UNHANDLED = re.compile(rf'&\s*ctx->gpr|ctx->gpr(?!\[\d+\])|\bS_\d+\b|\b(?:{STORE}|{LOAD})\b'
++                       r'|ctx->gpr\[\d+\](?:\.\w+\[\d+\])?\s*(?:\+\+|--|[-+*/|&^%]=|<<=|>>=)'
++                       r'|ctx->gpr\[\d+\]\.\w+\[\d+\]\s*=(?!=)')
++NON_CODE = re.compile(r'/\*.*?\*/|"(?:\\.|[^"\\])*"')
++MARK = '/* spu regcache */'
++LABEL = re.compile(r'^(loc_[0-9A-Fa-f]+):')
++GOTO = re.compile(r'\bgoto (loc_[0-9A-Fa-f]+);')
++
++
++def _code(line: str) -> str:
++    """The line with its comments and string literals blanked (same length),
++    so a ; or a brace in them is not taken for code."""
++    return NON_CODE.sub(lambda m: ' ' * len(m.group()), line)
++
++
++def _stmt_start(code: str, pos: int) -> int:
++    """Index where the statement holding `pos` starts (after the last ; { or }
++    outside parentheses before it)."""
++    depth = 0
++    start = 0
++    for i in range(pos):
++        c = code[i]
++        if c == '(':
++            depth += 1
++        elif c == ')':
++            depth -= 1
++        elif depth == 0 and c in ';{}':
++            start = i + 1
++    return start
++
++
++def _in_plain_blocks(code: str, pos: int) -> bool:
++    """Every brace block open at `pos` is a plain one (not the body of an if,
++    a loop or an else), so a statement there runs whenever the line does."""
++    depth = 0
++    plain: list[bool] = []
++    for i in range(pos):
++        c = code[i]
++        if c == '(':
++            depth += 1
++        elif c == ')':
++            depth -= 1
++        elif depth == 0 and c == '{':
++            before = code[:i].rstrip()
++            plain.append(not before or before[-1] in ';{}')
++        elif depth == 0 and c == '}':
++            if not plain:
++                return False
++            plain.pop()
++    return all(plain)
++
++
++def _reload_follows_calls(code: str) -> bool:
++    """The reload at the end of the line runs after every call on it that may
++    run SPU code, and nothing from the first such call on reads or writes a
++    register or jumps (the locals are stale until the reload)."""
++    calls = list(CLOBBER.finditer(code))
++    if not all(_in_plain_blocks(code, m.start()) for m in calls):
++        return False
++    return not re.search(r'ctx->gpr|\bgoto\b', code[calls[0].end():])
++
++
++def _insert_flushes(line: str) -> str:
++    """Put a store-back before each statement on this line that matches FLUSH.
++    A statement in the same brace block as the previous flushed one, with no
++    register write between them, needs none of its own (extra store-backs are
++    only redundant). None goes after a call that may run SPU code: the locals
++    are stale until the reload at the end of the line, and storing them back
++    would undo what the call left in ctx."""
++    code = _code(line)
++    first_call = min((m.start() for m in CLOBBER.finditer(code)), default=len(code))
++    starts = sorted({_stmt_start(code, m.start()) for m in FLUSH.finditer(code)})
++    keep: list[int] = []
++    for s in starts:
++        if s > first_call:
++            break
++        if keep:
++            seg = code[keep[-1]:s]
++            if '{' not in seg and '}' not in seg and not GPR_WRITE.search(seg):
++                continue
++        keep.append(s)
++    for s in reversed(keep):
++        while s < len(line) and line[s] == ' ':
++            s += 1
++        line = line[:s] + STORE_STMT + line[s:]
++    return line
++
++
++def has_loop(body: list[str]) -> bool:
++    """A goto back to a label above it. Only loops gain: a straight chunk
++    loads every register it names on entry and stores back every one it
++    writes on each exit, which costs about what it saves (Resistance 3: a
++    chunk with five exits ran the same, and caching every function grew the
++    lifted SPU code by 61%)."""
++    seen: set[str] = set()
++    for ln in body:
++        m = LABEL.match(ln)
++        if m:
++            seen.add(m.group(1))
++        for g in GOTO.findall(ln):
++            if g in seen:
++                return True
++    return False
++
++
++def transform_function(body: list[str]) -> tuple[list[str], list[str]] | None:
++    """body: the lines between the function's '{' and '}' lines. Returns None
++    for a shape the pass does not handle, else (the store-back and reload macro
++    lines, the new body)."""
++    text = '\n'.join(body)
++    used = sorted({int(n) for n in GPR.findall(text)})
++    written = sorted({int(n) for n in GPR_WRITE.findall(text)})
++    if not used or UNHANDLED.search(text):
++        return None
++    for ln in body:
++        code = _code(ln).strip()
++        if code.count('{') != code.count('}') or code.count('(') != code.count(')'):
++            return None
++        if re.match(r'(else|switch|case|default)\b', code):
++            return None
++        if CLOBBER.search(code) and not _reload_follows_calls(code):
++            return None
++
++    out = ['    u128 ' + ', '.join(f'S_{n} = ctx->gpr[{n}]' for n in used) + ';']
++    # clean: the locals equal the context (entry, after a store-back at the
++    # start of a line or a reload, with no register write since). A label
++    # ends it: other paths may arrive there with written locals.
++    clean = True
++    for ln in body:
++        if not ln.strip():
++            out.append(ln)
++            continue
++        if ln.rstrip().endswith(':'):
++            out.append(ln)
++            clean = False
++            continue
++        code = _code(ln)
++        new = _insert_flushes(ln) if written and FLUSH.search(code) else ln
++        lead = len(new) - len(new.lstrip(' '))
++        flush_first = new.startswith(STORE_STMT, lead)
++        if clean and flush_first:
++            new = new[:lead] + new[lead + len(STORE_STMT):]
++        new = GPR.sub(r'S_\1', new)
++        if CLOBBER.search(code):
++            new = f'{new.rstrip()} {LOAD};'
++            clean = True
++        elif flush_first or clean:
++            clean = not GPR_WRITE.search(ln)
++        out.append(new)
++    store = ' '.join(f'ctx->gpr[{n}] = S_{n};' for n in written)
++    load = ' '.join(f'S_{n} = ctx->gpr[{n}];' for n in used)
++    # falling off the end of the function: store back
++    out.append(f'    {STORE};')
++    return ([f'#define {STORE} do {{ {store} }} while (0)', f'#define {LOAD} do {{ {load} }} while (0)'], out)
++
++
++def transform_source(src: str) -> tuple[str, dict[str, int]]:
++    if MARK in src:
++        return src, {'already': 1}
++    lines = src.split('\n')
++    res: list[str] = []
++    stats = {'cached': 0, 'unchanged': 0, 'skipped': 0}
++    i = 0
++    while i < len(lines):
++        ln = lines[i]
++        if not FHEAD.match(ln):
++            res.append(ln)
++            i += 1
++            continue
++        j = i + 1
++        while j < len(lines) and lines[j] != '}':
++            j += 1
++        body = lines[i + 1:j]
++        if not has_loop(body) or not any(GPR.search(ln) for ln in body):
++            stats['unchanged'] += 1
++            res.extend(lines[i:j + 1])
++        elif (r := transform_function(body)) is None:
++            stats['skipped'] += 1
++            res.extend(lines[i:j + 1])
++        else:
++            defs, nb = r
++            stats['cached'] += 1
++            res.extend(defs)
++            res.append(ln)
++            res.extend(nb)
++            res.append('}')
++            res.append(f'#undef {STORE}')
++            res.append(f'#undef {LOAD}')
++        i = j + 1
++    out = '\n'.join(res)
++    k = out.find('#include')
++    if k >= 0:
++        e = out.find('\n', k) + 1
++        out = out[:e] + MARK + '\n' + out[e:]
++    return out, stats
++
++
++def main(argv: list[str]) -> int:
++    logging.basicConfig(level=logging.INFO, format='%(message)s')
++    if len(argv) < 2:
++        LOG.error('usage: spu_regcache.py in.c [out.c]')
++        return 2
++    inp = argv[1]
++    outp = argv[2] if len(argv) > 2 else inp
++    with open(inp, encoding='utf-8', errors='surrogateescape') as f:
++        src = f.read()
++    out, stats = transform_source(src)
++    with open(outp, 'w', encoding='utf-8', errors='surrogateescape') as f:
++        f.write(out)
++    LOG.info('%s %s', inp, stats)
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv))
+diff --git a/tools/test_spu_lifter_regcache.py b/tools/test_spu_lifter_regcache.py
+new file mode 100644
+index 00000000..2ce049cf
+--- /dev/null
++++ b/tools/test_spu_lifter_regcache.py
+@@ -0,0 +1,231 @@
++#!/usr/bin/env python3
++"""The SPU register cache (spu_regcache.py) must not change what lifted code computes.
++
++The fixture loops ten times: it stores its counter to local store and loads
++it back (an LS store is what made the compiler re-read every register from
++the context), adds it to r4, and calls a subroutine that adds 100 to r4 and
++counts the calls in r9. The caller's r4 must see the callee's write (reload
++after the call), the callee must see the caller's r4 (store-back before it),
++and the stop must see the final registers (store-back before leaving).
++The same program is lifted with and without the cache and both runs must
++match each other and the expected values. Only the looping caller is cached.
++
++Usage:
++    python3 tools/test_spu_lifter_regcache.py
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parent
++RUNTIME = TOOLS.parent / 'runtime' / 'spu'
++sys.path.insert(0, str(TOOLS))
++
++from spu_disasm import disassemble_spu  # noqa: E402
++from spu_lifter import SPULifter  # noqa: E402
++import spu_regcache  # noqa: E402
++
++
++def ri16(op9: int, i16: int, rt: int) -> int:
++    return (op9 << 23) | ((i16 & 0xFFFF) << 7) | rt
++
++
++def ri10(op8: int, i10: int, ra: int, rt: int) -> int:
++    return (op8 << 24) | ((i10 & 0x3FF) << 14) | (ra << 7) | rt
++
++
++def rr(op11: int, rb: int, ra: int, rt: int) -> int:
++    return (op11 << 21) | (rb << 14) | (ra << 7) | rt
++
++
++PROGRAM = [
++    ri16(0x081, 0, 3),                    # 0x00 il   $3, 0
++    ri16(0x081, 0, 4),                    # 0x04 il   $4, 0
++    ri16(0x081, 0x1000, 1),               # 0x08 il   $1, 0x1000
++    ri10(0x24, 0, 1, 3),                  # 0x0C stqd $3, 0($1)       <- loop
++    ri10(0x34, 0, 1, 8),                  # 0x10 lqd  $8, 0($1)
++    rr(0x0C0, 8, 4, 4),                   # 0x14 a    $4, $4, $8
++    ri16(0x066, (0x30 - 0x18) >> 2, 0),   # 0x18 brsl $0, 0x30
++    ri10(0x1C, 1, 3, 3),                  # 0x1C ai   $3, $3, 1
++    ri10(0x7C, 10, 3, 6),                 # 0x20 ceqi $6, $3, 10
++    ri16(0x040, (0x0C - 0x24) >> 2, 6),   # 0x24 brz  $6, 0x0C
++    ri10(0x24, 1, 1, 4),                  # 0x28 stqd $4, 16($1)
++    0x00003FFF,                           # 0x2C stop 0x3FFF
++    ri10(0x1C, 100, 4, 4),                # 0x30 ai   $4, $4, 100   (subroutine)
++    ri10(0x1C, 1, 9, 9),                  # 0x34 ai   $9, $9, 1
++    rr(0x1A8, 0, 0, 0),                   # 0x38 bi   $0
++]
++BOUNDS = [(0x00, 0x30), (0x30, 0x3C)]
++
++DRIVER = r'''
++#include "lifted.h"
++#include <stdio.h>
++#include <stdlib.h>
++SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
++volatile int g_spu_direct = 0;
++uint8_t g_spu_stack_reset_hint[1024];
++int g_spu_ls_watch_n = 0;   /* LS watch off */
++void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
++{ (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
++static uint8_t ls[256 * 1024];
++static int stopped;
++void spu_indirect_branch(spu_context* ctx) { (void)ctx; abort(); }
++void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) { (void)addr; (void)fn; }
++void spu_img_restore(spu_context* ctx, int32_t saved) { (void)ctx; (void)saved; }
++void spu_stop(spu_context* ctx) { (void)ctx; stopped = 1; }
++void spu_drain_call(spu_context* ctx, uint32_t ret) {
++    (void)ret;
++    while (g_spu_trampoline_fn) {
++        void (*fn)(spu_context*) = g_spu_trampoline_fn;
++        g_spu_trampoline_fn = 0;
++        fn(ctx);
++    }
++}
++int main(void) {
++    static spu_context c;
++    c.ls = ls;
++    spu_func_00000000(&c);
++    spu_drain_call(&c, 0);
++    uint32_t w = (uint32_t)ls[0x1010] << 24 | (uint32_t)ls[0x1011] << 16 |
++                 (uint32_t)ls[0x1012] << 8 | ls[0x1013];
++    printf("%d %u %u %u %u\n", stopped, c.gpr[3]._u32[0], c.gpr[4]._u32[0],
++           c.gpr[9]._u32[0], w);
++    return 0;
++}
++'''
++
++# 10 iterations: r4 = (0 + 1 + ... + 9) + 10 * 100
++EXPECTED = ['1', '10', '1045', '10', '1045']
++
++
++def lift(regcache: bool, trace: bool = False) -> SPULifter:
++    insns = disassemble_spu(b''.join(struct.pack('>I', w) for w in PROGRAM), 0)
++    lifter = SPULifter(trace=trace)
++    lifter.regcache = regcache
++    lifter.func_starts = {s for s, _ in BOUNDS}
++    for s, e in BOUNDS:
++        lifter.lift_function(insns, s, e)
++    return lifter
++
++
++class RegisterCache(unittest.TestCase):
++    def test_cached_body_keeps_registers_in_locals(self) -> None:
++        src = lift(True).emit_source('lifted.h')
++        body = src[src.index('void spu_func_00000000('):]
++        body = body[:body.index('\n}\n')]
++        lines = body.split('\n')[2:]        # past the head and the locals' declaration
++        self.assertFalse([ln for ln in lines if 'ctx->gpr' in ln], body)
++        self.assertIn('SPU_RC_STORE; spu_func_00000030(ctx);', body)
++        self.assertIn('} SPU_RC_LOAD;', body)
++        self.assertIn('SPU_RC_STORE; spu_stop(ctx); return;', body.replace('ctx->stop_code = 0x3FFFu; '
++                                                               'ctx->status = SPU_STATUS_STOPPED_BY_STOP; ', ''))
++
++    def test_function_without_loop_is_left_alone(self) -> None:
++        src = lift(True).emit_source('lifted.h')
++        callee = src[src.index('void spu_func_00000030('):]
++        callee = callee[:callee.index('\n}\n')]
++        self.assertIn('ctx->gpr[4] = spu_ai(ctx->gpr[4], 100);', callee)
++        self.assertNotIn('S_4', callee)
++
++    def test_function_with_unexpected_shape_is_left_alone(self) -> None:
++        body = ['loc_00000000:', '    if (ctx->gpr[3]._u32[0]) {', '        ctx->gpr[4] = ctx->gpr[3];',
++                '    }', '    goto loc_00000000;']
++        self.assertIsNone(spu_regcache.transform_function(body))
++
++    def test_call_the_reload_may_not_follow_is_refused(self) -> None:
++        call = ('{ int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_func_00000030(ctx); '
++                'spu_drain_call(ctx, 0x8u); ctx->host_depth--; spu_img_restore(ctx, _si); }')
++        for line in ('if (ctx->gpr[5]._u32[0] != 0) ' + call,                  # not on every path
++                     call + ' ctx->gpr[6] = ctx->gpr[3];',                     # a register after the call
++                     '{ spu_func_00000030(ctx); if (ctx->gpr[3]._u32[0]) goto loc_00000000; }'):
++            body = ['loc_00000000:', '    ctx->gpr[3] = spu_ai(ctx->gpr[3], 1);', '    ' + line,
++                    '    goto loc_00000000;']
++            self.assertIsNone(spu_regcache.transform_function(body), line)
++        body = ['loc_00000000:', '    ctx->gpr[3] = spu_ai(ctx->gpr[3], 1);', '    ' + call,
++                '    goto loc_00000000;']
++        self.assertIsNotNone(spu_regcache.transform_function(body))
++
++    def test_no_store_back_between_a_call_and_its_reload(self) -> None:
++        # the drain in the next block would otherwise store the stale locals over what the call left
++        body = ['loc_00000000:', '    ctx->gpr[3] = spu_ai(ctx->gpr[3], 1);',
++                '    { ctx->host_depth++; spu_func_00000030(ctx); } { spu_drain_call(ctx, 0x8u); ctx->host_depth--; }',
++                '    goto loc_00000000;']
++        _, out = spu_regcache.transform_function(body)
++        self.assertIn('    { ctx->host_depth++; SPU_RC_STORE; spu_func_00000030(ctx); } '
++                      '{ spu_drain_call(ctx, 0x8u); ctx->host_depth--; } SPU_RC_LOAD;', out)
++
++    def test_store_back_after_one_is_dropped_until_a_write_or_label(self) -> None:
++        body = ['loc_00000000:',
++                '    ctx->gpr[3] = spu_ai(ctx->gpr[3], 1);',
++                '    spu_wrch(ctx, MFC_LSA, ctx->gpr[3]);',       # a write since the label: store back
++                '    spu_wrch(ctx, MFC_EAL, ctx->gpr[3]);',       # nothing written since: none
++                '    ctx->gpr[4] = ctx->gpr[3];',
++                '    spu_wrch(ctx, MFC_Size, ctx->gpr[4]);',      # after a write: store back
++                'loc_00000014:',
++                '    spu_wrch(ctx, MFC_TagID, ctx->gpr[4]);',     # after a label: store back
++                '    goto loc_00000000;']
++        _, out = spu_regcache.transform_function(body)
++        flushed = [ln.strip().startswith('SPU_RC_STORE;') for ln in out if 'spu_wrch' in ln]
++        self.assertEqual(flushed, [True, False, True, True], out)
++
++    def test_comment_is_not_code(self) -> None:
++        body = ['loc_00000000:', '    ctx->gpr[3] = spu_ai(ctx->gpr[3], 1);',
++                '    /* x; y */ spu_wrch(ctx, MFC_LSA, ctx->gpr[3]);', '    goto loc_00000000;']
++        _, out = spu_regcache.transform_function(body)
++        self.assertIn('    SPU_RC_STORE; /* x; y */ spu_wrch(ctx, MFC_LSA, S_3);', out)
++
++    def test_trace_lift_is_not_cached(self) -> None:
++        src = lift(True, trace=True).emit_source('lifted.h')
++        self.assertNotIn('SPU_RC_STORE', src)
++        self.assertIn('spu_trace_rt(ctx, 4);', src)
++
++    def test_transform_is_idempotent(self) -> None:
++        src = lift(True).emit_source('lifted.h')
++        self.assertEqual(spu_regcache.transform_source(src)[0], src)
++        # without the marker the cached function itself is refused
++        again, stats = spu_regcache.transform_source(src.replace(spu_regcache.MARK + '\n', ''))
++        self.assertEqual(again, src)
++        self.assertEqual((stats['cached'], stats['skipped']), (0, 1))
++
++    def run_program(self, regcache: bool) -> list[str]:
++        cc = shutil.which('clang') or shutil.which('cc')
++        if not cc:
++            if os.environ.get('CI'):
++                self.fail('C compiler required in CI')
++            self.skipTest('C compiler unavailable')
++        lifter = lift(regcache)
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            context = (RUNTIME / 'spu_context.h').as_posix()
++            helpers = (RUNTIME / 'spu_helpers.h').as_posix()
++            (root / 'lifted.h').write_text(lifter.emit_header().replace(
++                '../../runtime/spu/spu_context.h', context))
++            (root / 'lifted.c').write_text(lifter.emit_source('lifted.h').replace(
++                '../../runtime/spu/spu_helpers.h', helpers))
++            (root / 'driver.c').write_text(DRIVER)
++            exe = root / ('proof.exe' if sys.platform == 'win32' else 'proof')
++            built = subprocess.run([cc, '-O2', '-fno-strict-aliasing', '-I', str(RUNTIME),
++                                    '-o', str(exe), str(root / 'lifted.c'), str(root / 'driver.c')],
++                                   capture_output=True, text=True)
++            self.assertEqual(built.returncode, 0, built.stderr)
++            ran = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++            self.assertEqual(ran.returncode, 0, ran.stderr)
++            return ran.stdout.split()
++
++    def test_uncached_program(self) -> None:
++        self.assertEqual(self.run_program(False), EXPECTED)
++
++    def test_cached_program(self) -> None:
++        self.assertEqual(self.run_program(True), EXPECTED)
++
++
++if __name__ == '__main__':
++    unittest.main()

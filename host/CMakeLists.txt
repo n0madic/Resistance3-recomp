@@ -81,7 +81,8 @@ file(GLOB_RECURSE ABI_INPUTS CONFIGURE_DEPENDS
     "${PS3RECOMP_DIR}/runtime/memory/*.h"
     "${PS3RECOMP_DIR}/runtime/platform/*.h"
     "${PS3RECOMP_DIR}/tools/ppu_lifter.py"
-    "${PS3RECOMP_DIR}/tools/spu_lifter.py")
+    "${PS3RECOMP_DIR}/tools/spu_lifter.py"
+    "${PS3RECOMP_DIR}/tools/spu_regcache.py")   # rewrites the SPU lifter's output (spu-runtime/0015)
 list(FILTER ABI_INPUTS EXCLUDE REGEX "/tests/")
 list(SORT ABI_INPUTS)
 set(ABI_TEXT "")
