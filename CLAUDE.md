@@ -51,20 +51,20 @@ cmake -S build/ps3recomp -B <scratch>/build-tests -G Ninja -DPS3RECOMP_BUILD_TES
       -DCMAKE_PREFIX_PATH="$PWD/build/deps/prefix" -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
       -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON
 cmake --build <scratch>/build-tests -- -k 0     # keep going past a target that does not link
-ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 39
+ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 40
 ```
 
 Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (144 of them with
 the patches; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
 Some runtime unit tests (e.g. `runtime/spu/tests/test_spu_thread_ls_dma.c`) are built directly with clang from the
 toolkit dir against the runtime sources they need: the "run:" steps of `.github/workflows/macos.yml` give the line
-(33 of them).
+(37 of them).
 The Metal ones that translate guest programs
 (`libs/video/tests/test_shadow_compare_metal.m`) need the translator: compile `rsx_shader_msl.cpp` with
 `-DPS3RECOMP_HAVE_MSL_TRANSLATION=1 -DPS3RECOMP_MSL_TRANSLATOR_ID='"<any 23 chars>"'` and `-I build/deps/prefix/include`
 (+ `/spirv_cross`), and link glslang, SPIRV, SPIRV-Tools(-opt) and the spirv-cross static libraries from
 `build/deps/prefix/lib`; without it the stub reports "translation was not built" and 32 of 37 checks fail (with it,
-133/133 pass). On the pinned v0.19.0 with the patches on, 37 of the 39 ctest tests, all 144 scripts and the 33 workflow
+133/133 pass). On the pinned v0.19.0 with the patches on, 38 of the 40 ctest tests, all 144 scripts and the 37 workflow
 tests pass (`test_metal_frame_rate` needs a usable display); `sys_fs` and `ppu_thread_join` do not link on macOS, on
 plain v0.19.0 either (`_cellGame_get_hdd_title_id`; Windows thread calls), so any other new failure is ours. A patch that moves a symbol or
 changes a code path can break a fixture's link line or stub (the loader fixtures stub `cellGcm_on_put_store`): fix the
@@ -163,6 +163,14 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   squares (upstream #585, ours, in v0.19.0).
   A frame of the Haven fight binds ~1700 distinct textures; the engine's texture cache held 1024 and re-created
   ~700 a frame (22 ms of the RSX thread's CPU). `host/CMakeLists.txt` sets it to 2048 (`gcm-rsx/0023`).
+  The fight records ~7800 draws a frame, and the RSX thread is what the game waits on (the main thread polls a GCM
+  label in `usleep(50)`, `func_0073439C`). The engine keeps each draw's converted vertices and rebuilt indices in
+  GPU-read chunks keyed by a hash of the index bytes, layout, attribute state and vertex bytes (`gcm-rsx/0024`;
+  99.5% hits there; `PS3RECOMP_ENG_VCACHE=0` turns it off, `PS3RECOMP_ENG_VCACHE_STATS=1` prints the hit rate). An
+  attribute's current value is keyed only where it reaches a vertex (no array): keying it always cost 15-20% misses.
+  The Metal backend's record cap is 16384 from `host/CMakeLists.txt` (`gcm-rsx/0025`; at 8192 the fight dropped
+  117-195 records every few frames). Next on that thread: the 8 KB VS constant block copied for every draw (`eng_bind_vs_constants`
+  -> `eng_stage_copy`, ~10%), texture content hashing, FP structural hashing.
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000); the runtime looks most switches up once per name (`ps3_env_once`, #515), so a variable set after start-up is not seen.
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.

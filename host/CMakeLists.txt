@@ -42,9 +42,10 @@ add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_
 # were dropped and the boot hung on an event flag that task sets. Each Insomniac module also takes one overlay source
 # (spu_channels.c, default 128, spu-runtime/0009); past that cap a module stays in the interpreter. A frame of the
 # Haven fight binds about 1700 distinct textures; the draw engine's cache holds 1024 by default (gcm-rsx/0023), and
-# past it every frame re-created ~700 of them.
+# past it every frame re-created ~700 of them. The fight also records ~7800 draws a frame besides clears and copies;
+# the Metal backend's default cap of 8192 records dropped the rest of such a frame (gcm-rsx/0025).
 target_compile_definitions(ps3recomp_runtime PRIVATE SPU_WORKLOAD_MAX=1024 SPU_OVL_SRC_MAX=512
-                           RSX_DRAW_ENGINE_TEXTURE_CACHE=2048)
+                           RSX_DRAW_ENGINE_TEXTURE_CACHE=2048 ENG_MAX_RECORDS=16384)
 
 # ---------------------------------------------------------------------------
 # Generated, game-independent files

@@ -1,0 +1,58 @@
+rsx metal backend: the record cap (ENG_MAX_RECORDS) may be defined at build time.
+
+The Metal backend records at most 8192 draws, clears and copies per submission and drops the rest of the frame. A
+Resistance 3 firefight records ~7800 draws a frame besides its clears and copies; the log showed "[rsx engine/metal]
+dropped 117-195 record(s) (cap 8192)" every few frames throughout the Haven fight, i.e. geometry missing from those
+frames. The default stays 8192; the port defines 16384 from its own build, like RSX_DRAW_ENGINE_TEXTURE_CACHE.
+
+With 16384 the "dropped" line is gone from the same scripted Haven run (0 lines in 280 s, against several a minute).
+
+The macOS workflow builds libs/video/tests/test_metal_vertex_cache.m a second time with -DENG_MAX_RECORDS=16384 and
+-DRSX_TEST_EXPECT_MAX_RECORDS=16384: the test asserts the cap it was built with, and its cap check finds the boundary
+at 16384. Without the change that build fails the assertion (8192 == 16384).
+
+Upstream: not proposed yet.
+---
+
+diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
+index ad3d1512..d7f2289c 100644
+--- a/.github/workflows/macos.yml
++++ b/.github/workflows/macos.yml
+@@ -179,2 +179,9 @@ jobs:
+           /tmp/test_metal_vertex_cache
++          # Again with the record cap a title defines at build time: the cap
++          # test then finds the boundary at 16384.
++          clang -fobjc-arc -DENG_MAX_RECORDS=16384 -DRSX_TEST_EXPECT_MAX_RECORDS=16384 \
++            -I include -I libs/video libs/video/tests/test_metal_vertex_cache.m \
++            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
++            -o /tmp/test_metal_vertex_cache_16k
++          /tmp/test_metal_vertex_cache_16k
+ 
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index a2159290..c757541e 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -2542,3 +2542,9 @@ static void release_surfaces(void)
+ #define ENG_MAX_PIPES    4096
++/* Draws, clears and copies recorded per submission; past it the rest of the
++ * frame is dropped ("dropped N record(s)"). A title with more defines a
++ * larger cap at build time: a Resistance 3 firefight records ~7800 draws
++ * besides its clears and copies. */
++#ifndef ENG_MAX_RECORDS
+ #define ENG_MAX_RECORDS  8192
++#endif
+ #define ENG_MAX_VIEWS    256
+diff --git a/libs/video/tests/test_metal_vertex_cache.m b/libs/video/tests/test_metal_vertex_cache.m
+index 9b239f96..023bc6be 100644
+--- a/libs/video/tests/test_metal_vertex_cache.m
++++ b/libs/video/tests/test_metal_vertex_cache.m
+@@ -17,2 +17,9 @@
+ 
++/* A title whose frames record more defines a larger record cap at build
++ * time; the workflow builds this test a second time with one. */
++#ifdef RSX_TEST_EXPECT_MAX_RECORDS
++_Static_assert(ENG_MAX_RECORDS == RSX_TEST_EXPECT_MAX_RECORDS,
++               "the record cap given at build time is the one the backend uses");
++#endif
++
+ static int g_failures;
