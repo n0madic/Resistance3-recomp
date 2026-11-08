@@ -168,8 +168,9 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   GPU-read chunks keyed by a hash of the index bytes, layout, attribute state and vertex bytes (`gcm-rsx/0024`;
   99.5% hits there; `PS3RECOMP_ENG_VCACHE=0` turns it off, `PS3RECOMP_ENG_VCACHE_STATS=1` prints the hit rate). An
   attribute's current value is keyed only where it reaches a vertex (no array): keying it always cost 15-20% misses.
-  The Metal backend's record cap is 16384 from `host/CMakeLists.txt` (`gcm-rsx/0025`; at 8192 the fight dropped
-  117-195 records every few frames). Next on that thread: the 8 KB VS constant block copied for every draw (`eng_bind_vs_constants`
+  Past the Metal backend's record cap the frame so far is submitted and waited for, as for a full staging arena
+  (`gcm-rsx/0025`; it used to drop the rest: at 8192 the fight lost 117-195 records every few frames); the cap is
+  16384 from `host/CMakeLists.txt`, so the fight never pays that mid-frame wait. Next on that thread: the 8 KB VS constant block copied for every draw (`eng_bind_vs_constants`
   -> `eng_stage_copy`, ~10%), texture content hashing, FP structural hashing.
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000); the runtime looks most switches up once per name (`ps3_env_once`, #515), so a variable set after start-up is not seen.

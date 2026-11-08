@@ -1,0 +1,299 @@
+rsx metal backend: a full record array is submitted mid-frame instead of dropping the rest of the frame; the cap
+(ENG_MAX_RECORDS) may be defined at build time.
+
+The Metal backend records at most 8192 draws, clears and copies per submission and dropped every record past that.
+A Resistance 3 firefight records ~7800 draws a frame besides its clears and copies; the log showed "[rsx
+engine/metal] dropped 117-195 record(s) (cap 8192)" every few frames throughout the Haven fight, i.e. geometry
+missing from those frames.
+
+Past the cap the backend now does what it already did for a full staging arena: it submits what has been recorded,
+waits for it, and goes on recording (eng_record_room -> eng_flush_recorded). Two things that path got wrong are
+fixed with it, since the cap now reaches it every heavy frame:
+- the bound vertex/fragment constants were staged in the arena the commit hands off; the next draw read whatever
+  the new arena held at their old offsets. They are staged again in the new one.
+- eng_draw staged vertices and indices in two reservations; a second one that filled the arena submitted it and
+  left the vertices' offset pointing into the next. They now share one reservation.
+The draw engine already reads the commit serial after draw_cached, so a cached draw that opens the next submission
+tags its block with that one.
+
+The submission waits for the GPU, a stall in mid-frame, so the port still defines 16384 from its own build, like
+RSX_DRAW_ENGINE_TEXTURE_CACHE: with it the scripted Haven run reaches the cap in no frame ("records in one
+submission" is logged the first 4 times it happens).
+A host built with a cap of 4096 submits mid-frame throughout the same 240 s run: no record dropped, no command
+buffer failure, frames that match the 16384 run, at 15-16 fps against 23-28 (the wait).
+
+libs/video/tests/test_metal_vertex_cache.m fills the array with clears of one target, binds known constants and
+records a cached draw: the full array is submitted and completes without a failure, the draw is the first record of
+the next submission, and its constants are byte-equal in the new arena; a staged draw's indices follow its vertices
+at the next aligned offset. test_metal_rect_clears and test_metal_independent_clears get the display-gamma stub
+the other backend fixtures have: their clears can now reach the commit path. With the old drop the first three checks fail, without the re-staging the constants
+check fails. The macOS workflow builds the test a second time with -DENG_MAX_RECORDS=16384
+-DRSX_TEST_EXPECT_MAX_RECORDS=16384: the test asserts the cap it was built with and the submission happens at 16384.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
+index ad3d1512..d7f2289c 100644
+--- a/.github/workflows/macos.yml
++++ b/.github/workflows/macos.yml
+@@ -179,2 +179,9 @@ jobs:
+           /tmp/test_metal_vertex_cache
++          # Again with the record cap a title defines at build time: the cap
++          # test then finds the boundary at 16384.
++          clang -fobjc-arc -DENG_MAX_RECORDS=16384 -DRSX_TEST_EXPECT_MAX_RECORDS=16384 \
++            -I include -I libs/video libs/video/tests/test_metal_vertex_cache.m \
++            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
++            -o /tmp/test_metal_vertex_cache_16k
++          /tmp/test_metal_vertex_cache_16k
+ 
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index a2159290..597d79a5 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -2542,3 +2542,9 @@ static void release_surfaces(void)
+ #define ENG_MAX_PIPES    4096
++/* Draws, clears and copies recorded per submission; past it the frame so
++ * far is submitted and waited for (eng_record_room), a stall mid-frame. A
++ * title with more defines a larger cap at build time: a Resistance 3
++ * firefight records ~7800 draws besides its clears and copies. */
++#ifndef ENG_MAX_RECORDS
+ #define ENG_MAX_RECORDS  8192
++#endif
+ #define ENG_MAX_VIEWS    256
+@@ -3008,2 +3014,3 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+ static void eng_encode_and_commit(id<MTLTexture> present_dst);
++static void eng_flush_recorded(void);
+ 
+@@ -3049,2 +3056,3 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
+ {
++    if (bytes > ENG_STAGE_MAX - ENG_ALIGN) return 0;   /* fits no arena */
+     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
+@@ -3053,3 +3061,3 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
+          * already recorded has been encoded, so the arena is free again. */
+-        eng_encode_and_commit(nil);
++        eng_flush_recorded();
+         return eng_stage_reserve(bytes, out_off);
+@@ -3088,2 +3096,43 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
+ 
++/* Submit what has been recorded so far, mid-frame, and go on recording: the
++ * arena or the record array is full. The bound constants were staged in the
++ * arena the commit hands off, so they are staged again in the next one;
++ * without that the next draw read whatever the new arena held at their old
++ * offsets. */
++static void eng_flush_recorded(void)
++{
++    EngRecord* p = &s_eng_pending;
++    const int keep_vs = p->vs_cb_bytes && s_eng_stage &&
++                        (u64)p->vs_cb_off + p->vs_cb_bytes <= s_eng_stage_used;
++    const int keep_ps = p->ps_cb_bytes && s_eng_stage &&
++                        (u64)p->ps_cb_off + p->ps_cb_bytes <= s_eng_stage_used;
++    const u32 vs_bytes = keep_vs ? p->vs_cb_bytes : 0;
++    const u32 ps_bytes = keep_ps ? p->ps_cb_bytes : 0;
++    u8* keep = (vs_bytes || ps_bytes) ? malloc((size_t)vs_bytes + ps_bytes) : NULL;
++    if (keep) {
++        memcpy(keep, s_eng_stage + p->vs_cb_off, vs_bytes);
++        memcpy(keep + vs_bytes, s_eng_stage + p->ps_cb_off, ps_bytes);
++    }
++    eng_encode_and_commit(nil);
++    /* Unrestorable constants are unbound rather than left pointing into
++     * the next arena. */
++    if (!keep || !eng_stage_copy(keep, vs_bytes, &p->vs_cb_off)) p->vs_cb_bytes = 0;
++    if (!keep || !eng_stage_copy(keep + vs_bytes, ps_bytes, &p->ps_cb_off)) p->ps_cb_bytes = 0;
++    free(keep);
++}
++
++/* Room for one more record: a full array is submitted (eng_flush_recorded)
++ * rather than the rest of the frame dropped. */
++static int eng_record_room(void)
++{
++    if (s_eng_rec_count < ENG_MAX_RECORDS) return 1;
++    { static int n = 0; if (PS3_LOG_FIRST(n, 4))
++        fprintf(stderr, "[rsx engine/metal] %d records in one submission: submitting mid-frame\n",
++                ENG_MAX_RECORDS); }
++    eng_flush_recorded();
++    if (s_eng_rec_count < ENG_MAX_RECORDS) return 1;
++    s_eng_dropped++;   /* the commit failed and kept the records */
++    return 0;
++}
++
+ /* ---- lifecycle ----------------------------------------------------------- */
+@@ -3308,4 +3357,5 @@ static u32 eng_color_snapshot(void* user, u32 surface)
+     id<MTLTexture> src = eng_obj(surface);
+-    if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+-        s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
++    if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1)
++        { s_eng_dropped++; return 0; }
++    if (!eng_record_room()) return 0;
+     MTLTextureDescriptor* td =
+@@ -3332,4 +3382,4 @@ static u32 eng_color_region(void* user, u32 surface, u32 w, u32 h)
+     if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+-        !w || !h || w > [src width] || h > [src height] ||
+-        s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
++        !w || !h || w > [src width] || h > [src height]) { s_eng_dropped++; return 0; }
++    if (!eng_record_room()) return 0;
+     MTLTextureDescriptor* td =
+@@ -3371,3 +3421,3 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+     if (!eng_obj(depth) || !s_eng_helper_lib) return 0;
+-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
++    if (!eng_record_room()) return 0;
+     if (!s_eng_depth_pso) {
+@@ -3408,3 +3458,3 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
+         return 0;
+-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
++    if (!eng_record_room()) return 0;
+     static const MTLPixelFormat formats[2] = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatR16Unorm };
+@@ -3782,3 +3832,3 @@ static void eng_set_depth_bias(void* user, float slope, float units, u32 depth_b
+ 
+-/* A draw record over the pending state; the caller has checked the cap.
++/* A draw record over the pending state; the caller has made room for it.
+  * vb_chunk 0: the offsets are in the staging arena. */
+@@ -3805,10 +3855,15 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+     if (!vertex_count || !stride) return;
+-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+-    u32 vb_off = 0, ib_off = 0;
+-    if (!eng_stage_copy(vertices, vertex_count * stride, &vb_off)) return;
+-    if (indices && index_count &&
+-        !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
+-        return;
+-    eng_record_draw(topology, 0, vb_off, vertex_count, stride, ib_off,
+-                    indices ? index_count : 0);
++    if (!eng_record_room()) return;
++    /* One reservation for both: a second one that filled the arena would
++     * submit it and leave the vertices' offset pointing into the next. */
++    const u64 vb_bytes = (u64)vertex_count * stride;
++    const u64 vb_span = (vb_bytes + ENG_ALIGN - 1u) & ~(u64)(ENG_ALIGN - 1u);
++    const u64 ib_bytes = (indices && index_count) ? (u64)index_count * sizeof(u32) : 0;
++    u32 vb_off = 0;
++    if (vb_span + ib_bytes > ENG_STAGE_MAX ||
++        !eng_stage_reserve((u32)(vb_span + ib_bytes), &vb_off)) return;
++    memcpy(s_eng_stage + vb_off, vertices, (size_t)vb_bytes);
++    if (ib_bytes) memcpy(s_eng_stage + vb_off + vb_span, indices, (size_t)ib_bytes);
++    eng_record_draw(topology, 0, vb_off, vertex_count, stride,
++                    ib_bytes ? vb_off + (u32)vb_span : 0, indices ? index_count : 0);
+ }
+@@ -3845,3 +3900,3 @@ static void eng_draw_cached(void* user, rsx_topology topology, u32 chunk,
+         !s_eng_vc_buf[chunk - 1u]) return;
+-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
++    if (!eng_record_room()) return;
+     eng_record_draw(topology, chunk, vb_off, vertex_count, stride, ib_off, index_count);
+@@ -3878,3 +3933,3 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
+                     (u32)(rgba[2] * 255.0f + 0.5f);
+-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
++    if (!eng_record_room()) return;
+     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+@@ -3891,3 +3946,3 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+     (void)user;
+-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
++    if (!eng_record_room()) return;
+     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+@@ -4683,4 +4738,3 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+         if (s_eng_dropped) {
+-            fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
+-                    s_eng_dropped, ENG_MAX_RECORDS);
++            fprintf(stderr, "[rsx engine/metal] dropped %u record(s)\n", s_eng_dropped);
+             s_eng_dropped = 0;
+diff --git a/libs/video/tests/test_metal_independent_clears.m b/libs/video/tests/test_metal_independent_clears.m
+index b9405c63..11dcc3ce 100644
+--- a/libs/video/tests/test_metal_independent_clears.m
++++ b/libs/video/tests/test_metal_independent_clears.m
+@@ -2,2 +2,6 @@
+ #include <assert.h>
++
++/* A full record array submits mid-frame (eng_record_room), which reaches
++ * eng_blit_to_display's gamma; no display here. */
++float cellAvconfExt_display_gamma(void) { return 1.0f; }
+ static id<MTLTexture> depth_texture(unsigned width,unsigned height) {
+diff --git a/libs/video/tests/test_metal_rect_clears.m b/libs/video/tests/test_metal_rect_clears.m
+index 2f2f0768..1b0e66ab 100644
+--- a/libs/video/tests/test_metal_rect_clears.m
++++ b/libs/video/tests/test_metal_rect_clears.m
+@@ -15,2 +15,6 @@
+ 
++/* A full record array submits mid-frame (eng_record_room), which reaches
++ * eng_blit_to_display's gamma; no display here. */
++float cellAvconfExt_display_gamma(void) { return 1.0f; }
++
+ static int g_fail;
+diff --git a/libs/video/tests/test_metal_vertex_cache.m b/libs/video/tests/test_metal_vertex_cache.m
+index 9b239f96..deff4fcf 100644
+--- a/libs/video/tests/test_metal_vertex_cache.m
++++ b/libs/video/tests/test_metal_vertex_cache.m
+@@ -4,3 +4,4 @@
+  * commit_serial announced for it and reports it completed once the GPU is
+- * done -- what keeps a block from being reused while the GPU reads it.
++ * done -- what keeps a block from being reused while the GPU reads it. Also
++ * what a full record array does: it is submitted mid-frame.
+  * Needs a Metal device; no window.
+@@ -17,2 +18,9 @@
+ 
++/* A title whose frames record more defines a larger record cap at build
++ * time; the workflow builds this test a second time with one. */
++#ifdef RSX_TEST_EXPECT_MAX_RECORDS
++_Static_assert(ENG_MAX_RECORDS == RSX_TEST_EXPECT_MAX_RECORDS,
++               "the record cap given at build time is the one the backend uses");
++#endif
++
+ static int g_failures;
+@@ -71,12 +79,4 @@ int main(void)
+ 
+-        /* Past the record cap a cached draw is dropped and counted. */
+-        s_eng_rec_count = ENG_MAX_RECORDS - 1u;
+-        s_eng_dropped = 0;
+-        eng_draw_cached(NULL, RSX_TOPOLOGY_TRIANGLES, chunk, 0, 3, 64, 0, 0);
+-        CHECK(s_eng_rec_count == ENG_MAX_RECORDS && !s_eng_dropped, "the last slot is taken");
+-        eng_draw_cached(NULL, RSX_TOPOLOGY_TRIANGLES, chunk, 0, 3, 64, 0, 0);
+-        CHECK(s_eng_rec_count == ENG_MAX_RECORDS && s_eng_dropped == 1, "past the cap: dropped");
+         /* Not encoded: there are no targets or pipelines here. */
+         s_eng_rec_count = 0;
+-        s_eng_dropped = 0;
+ 
+@@ -96,2 +96,48 @@ int main(void)
+ 
++        /* A full record array is submitted, not dropped: the draw that finds
++         * it full opens the next submission, with the bound constants staged
++         * again in the next arena. The filler is clears of one target, which
++         * encode as a single pass. */
++        const u32 rt = eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, 16, 16, NULL, 0);
++        CHECK(rt != 0, "a colour target");
++        u8 vs_cb[64], ps_cb[32];
++        for (u32 i = 0; i < sizeof vs_cb; i++) vs_cb[i] = (u8)(0xA0u + i);
++        for (u32 i = 0; i < sizeof ps_cb; i++) ps_cb[i] = (u8)(0x10u + i);
++        eng_bind_vs_constants(NULL, vs_cb, sizeof vs_cb);
++        eng_bind_ps_constants(NULL, ps_cb, sizeof ps_cb);
++        const float black[4] = {0, 0, 0, 1};
++        while (s_eng_rec_count < ENG_MAX_RECORDS) eng_clear_color(NULL, rt, black);
++        const u64 before = eng_commit_serial(NULL, &done);
++        s_eng_dropped = 0;
++        eng_draw_cached(NULL, RSX_TOPOLOGY_TRIANGLES, chunk, 512, 3, 64, 0, 0);
++        CHECK(eng_commit_serial(NULL, &done) == before + 1u && done == before,
++              "the full array was submitted (%llu, done %llu)",
++              (unsigned long long)before, (unsigned long long)done);
++        CHECK(s_eng_checked_completed && !s_eng_encoding_failed, "and encoded without a failure");
++        CHECK(s_eng_rec_count == 1 && !s_eng_dropped && s_eng_rec[0].vb_off == 512,
++              "the draw opens the next submission (%u records)", s_eng_rec_count);
++        const EngRecord* d = &s_eng_rec[0];
++        CHECK(d->vs_cb_bytes == sizeof vs_cb && d->ps_cb_bytes == sizeof ps_cb &&
++              (u64)d->vs_cb_off + sizeof vs_cb <= s_eng_stage_used &&
++              (u64)d->ps_cb_off + sizeof ps_cb <= s_eng_stage_used &&
++              !memcmp(s_eng_stage + d->vs_cb_off, vs_cb, sizeof vs_cb) &&
++              !memcmp(s_eng_stage + d->ps_cb_off, ps_cb, sizeof ps_cb),
++              "its constants were staged again in the new arena");
++        /* Not encoded: no pipeline. */
++        s_eng_rec_count = 0;
++        s_eng_stage_used = 0;
++
++        /* A staged draw's vertices and indices share one reservation; the
++         * indices follow the vertices at the next aligned offset. */
++        const u32 idx[3] = {0, 1, 2};
++        const u32 used0 = s_eng_stage_used;
++        eng_draw(NULL, RSX_TOPOLOGY_TRIANGLES, v, 3, 16, idx, 3);
++        const EngRecord* sd = &s_eng_rec[s_eng_rec_count - 1u];
++        CHECK(sd->vb_off >= used0 && sd->ib_off == sd->vb_off + ENG_ALIGN &&
++              !memcmp(s_eng_stage + sd->vb_off, v, sizeof v) &&
++              !memcmp(s_eng_stage + sd->ib_off, idx, sizeof idx),
++              "a staged draw's indices follow its vertices (vb %u, ib %u)", sd->vb_off, sd->ib_off);
++        s_eng_rec_count = 0;
++        s_eng_stage_used = 0;
++
+         eng_vcache_chunk_release(NULL, chunk);
