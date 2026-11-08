@@ -53,7 +53,7 @@ and libs/video/tests/test_metal_vertex_cache.m (chunks are shared buffers, a cac
 engine command buffer takes the announced serial and reports it completed). Added to CMake (vertex_cache) and to the
 macOS/Linux workflow steps.
 
-Upstream: not proposed yet.
+Upstream: PR #718 (rebased onto master without this domain's earlier patches; its Metal test there leaves the record cap to #719).
 ---
 
 diff --git a/.github/workflows/linux.yml b/.github/workflows/linux.yml

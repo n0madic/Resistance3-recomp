@@ -30,7 +30,7 @@ the other backend fixtures have: their clears can now reach the commit path. Wit
 check fails. The macOS workflow builds the test a second time with -DENG_MAX_RECORDS=16384
 -DRSX_TEST_EXPECT_MAX_RECORDS=16384: the test asserts the cap it was built with and the submission happens at 16384.
 
-Upstream: not proposed yet.
+Upstream: PR #719 (standalone on master: its own test, libs/video/tests/test_metal_record_cap.m, instead of the vertex cache test used here).
 ---
 
 diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
