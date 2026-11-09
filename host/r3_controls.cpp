@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <sstream>
 
 #include "cellPad.h"   /* CELL_PAD_CTRL_* */
@@ -47,6 +48,9 @@ constexpr const char* KEY_ALIASES[][2] = {
 };
 
 struct Source { int src, code; };
+
+/* What r3_controls_register gave cellPad (none: it gave nothing, cellPad keeps its own; an empty table unbinds all). */
+std::optional<std::vector<PadBinding>> g_applied;
 
 struct PointerName { const char* name; Source s; };
 constexpr PointerName POINTERS[] = {
@@ -136,10 +140,7 @@ bool parse_source(const std::string& token, Source* out)
 
 std::string source_name(const PadBinding& b)
 {
-    if (b.src == PAD_SRC_KEY) {
-        for (const KeyName& k : KEYS) if (k.code == b.code) return k.name;
-        return "key" + std::to_string(b.code);   /* parse_raw_key reads it back (up to RAW_KEY_MAX) */
-    }
+    if (b.src == PAD_SRC_KEY) return r3::key_name(b.code);
     for (const PointerName& p : POINTERS) if (p.s.src == b.src && p.s.code == b.code) return p.name;
     return "?";
 }
@@ -293,6 +294,20 @@ std::string render_controls(const std::vector<PadBinding>& table)
     return out.str();
 }
 
+std::string key_name(int code)
+{
+    for (const KeyName& k : KEYS) if (k.code == code) return k.name;
+    return "key" + std::to_string(code);   /* parse_raw_key reads it back (up to RAW_KEY_MAX) */
+}
+
+std::vector<PadBinding> controls_table()
+{
+    if (g_applied) return *g_applied;
+    std::vector<PadBinding> table(PAD_BINDINGS_MAX);
+    table.resize((size_t)std::min(cellPad_default_key_bindings(table.data(), PAD_BINDINGS_MAX), PAD_BINDINGS_MAX));
+    return table;
+}
+
 }  // namespace r3
 
 extern "C" void r3_controls_register(void)
@@ -330,5 +345,6 @@ extern "C" void r3_controls_register(void)
     const int changed = r3::apply_controls(text.str(), &table, &problems);
     for (const std::string& p : problems) std::printf("[r3] %s: %s\n", path.c_str(), p.c_str());
     cellPad_set_key_bindings(table.data(), (int)table.size());
+    g_applied = table;
     std::printf("[r3] %s: %d action(s) listed, %zu binding(s)\n", path.c_str(), changed, table.size());
 }

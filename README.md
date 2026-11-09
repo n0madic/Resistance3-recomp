@@ -155,6 +155,9 @@ full screen. `scripts/run_game.sh --help` shows the launcher's own options.
 - `controls.txt` (written next to where you start the game, with the defaults, on the first run) remaps the keys and
   mouse buttons: one line per action, e.g. `jump = Space` or `fire = MouseLeft`. `R3_CONTROLS=<path>` names another file.
   Mistakes are reported in the log with their line number.
+- The game's button prompts (menus, HUD, hints) show the key or mouse button bound to each pad button in
+  `controls.txt`. They are drawn at start-up, so a change to the file shows after a restart. If you play with a game
+  controller, `R3_KEY_GLYPHS=0` brings back the PlayStation icons.
 - `PAD_KEYBOARD_LAYOUT=pad` switches to a pad-shaped layout: arrows, `I` `J` `K` `L` for the camera, `Z` `X` `A` `S`
   for the face buttons.
 

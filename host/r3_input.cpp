@@ -38,8 +38,9 @@
 #include <cstring>
 #include <initializer_list>
 
+#include "r3_guest.h"
+
 extern "C" {
-extern uint8_t* vm_base;
 void cellPad_set_menu_query(int (*in_menu)(void));
 void cellPad_set_mouse_look(int (*look)(double yaw_deg, double pitch_deg));
 }
@@ -88,17 +89,8 @@ Vec3 add(const Vec3& a, const Vec3& b, double k) { return { a.x + b.x * k, a.y +
 Vec3 scale(const Vec3& a, double k) { return { a.x * k, a.y * k, a.z * k }; }
 Vec3 normalized(const Vec3& a) { return scale(a, 1.0 / std::sqrt(dot(a, a))); }
 
-uint32_t load_be32(uint32_t ea)
-{
-    const uint8_t* p = vm_base + ea;
-    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
-}
-
-void store_be32(uint32_t ea, uint32_t v)
-{
-    uint8_t* p = vm_base + ea;
-    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
-}
+using r3::load_be32;
+using r3::store_be32;
 
 Vec3 load_vec3(uint32_t ea)
 {

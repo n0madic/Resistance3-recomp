@@ -24,6 +24,12 @@ int apply_controls(const std::string& text, std::vector<PadBinding>* table, std:
 /* The text of a controls file that says what `table` does, with each action's meaning beside it. */
 std::string render_controls(const std::vector<PadBinding>& table);
 
+/* The name the file uses for a key code ("Space", "Shift", ...; "keyNN" for one without a name). */
+std::string key_name(int code);
+
+/* The table cellPad was given by r3_controls_register, or cellPad's built-in one when it gave none. */
+std::vector<PadBinding> controls_table();
+
 }  // namespace r3
 
 /* Reads the controls file (R3_CONTROLS, else controls.txt in the working directory) and gives cellPad the table; writes

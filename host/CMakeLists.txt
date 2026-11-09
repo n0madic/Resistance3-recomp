@@ -112,6 +112,7 @@ add_executable(${PROJECT_NAME}
     r3_hle.cpp
     r3_input.cpp
     r3_controls.cpp
+    r3_glyphs.cpp
     spurs_lfqueue.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
@@ -160,7 +161,11 @@ endif()
 # The keyboard/mouse glue on its own (see the files): not part of the default build.
 add_executable(test_r3_input EXCLUDE_FROM_ALL tests/test_r3_input.cpp r3_input.cpp)
 add_executable(test_r3_controls EXCLUDE_FROM_ALL tests/test_r3_controls.cpp r3_controls.cpp)
-foreach(t test_r3_input test_r3_controls)
+add_executable(test_r3_glyphs EXCLUDE_FROM_ALL tests/test_r3_glyphs.cpp r3_glyphs.cpp r3_controls.cpp)
+if(APPLE)
+    target_link_libraries(test_r3_glyphs PRIVATE "-framework ApplicationServices")
+endif()
+foreach(t test_r3_input test_r3_controls test_r3_glyphs)
     target_include_directories(${t} PRIVATE "${PS3RECOMP_DIR}/include" "${PS3RECOMP_DIR}/libs/input")
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${t} PRIVATE -Wall -Wextra -Wno-unused-parameter)

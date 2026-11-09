@@ -238,6 +238,21 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     bound. Test: `cmake --build build/host --target test_r3_controls && build/host/test_r3_controls`.
     Not tried with the real keys in the game window: the checks drive the table and the parser (a synthetic Return
     through System Events did not reach the game).
+  - Button prompts show the keys (`host/r3_glyphs.cpp`). All UI is Scaleform; every pad button the game shows is
+    one of its images `img://icon0..17` (0 circle, 1 square, 2 cross, 3 triangle, 4 select, 5 start, 6-9 L1 L2 L3
+    left stick, 10-13 R1 R2 R3 right stick, 14-17 d-pad up down left right). Texts carry them as PUA characters
+    (U+E001+i, and U+E101+i for layout action i through the mapping `func_003317EC` sends with `setIconSubstitution`).
+    The textures are DXT5 in RSX local memory; `*(0x01150610)` points at 0x20-byte descriptors (+0 offset, +4 format,
+    +0x18 w<<16|h, +0x1C pitch), `+4` holds their count (362). The game fills the table (twice, at ~7.5 s and ~21.7 s)
+    and copies each descriptor when it registers the images (~4.6 s after the fill), never reading it again. A host
+    thread polls the table every 20 ms and points icons 0..17 at A8R8G8B8 images drawn with CoreGraphics from the
+    first binding of `r3::controls_table()` (the applied controls.txt), placed at local offset 0x0FC00000 (above the
+    0x0F900000 cellGcm reports, below the PPU stack at 0xD0000000). An image is no wider than the game's icon: the
+    menu button bars place their text by that width (a wider "Space" overlapped the next label); a long label
+    shrinks instead. Space is drawn as the open box ␣ in lines (the font's U+2423 is too thin at 52 px); other
+    lone symbols (arrows, punctuation) are drawn larger and centred by their ink. Off with `R3_KEY_GLYPHS=0`, for the pad layout, and in a scripted run (`PAD_NO_KEYBOARD`) unless
+    `R3_KEY_GLYPHS=1`. Test against a fake guest memory: `cmake --build build/host --target test_r3_glyphs &&
+    build/host/test_r3_glyphs [dir]` (a dir gets the drawn icons as PPM).
 - **Scripted input**: `PAD_FILE=<file>`, where the file holds `mask reports [lx ly rx ry]` (a report is a pad read that
   returned data, #570), e.g. `echo "0x4000 8" > f` presses cross. Add `PAD_NO_KEYBOARD=1` to a scripted run: else
   bringing its window to the front captures the mouse, which turns the camera.
