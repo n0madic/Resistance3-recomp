@@ -1,0 +1,518 @@
+rsx: a vertex program reads SET_TRANSFORM_BRANCH_BITS at run time instead of having them baked in.
+
+BRB and CLB branch on one bit of SET_TRANSFORM_BRANCH_BITS (0x1FF8). Since upstream #485 the decompiler baked the
+outcome into the program text and the draw engine (and rsx_live_draw) keyed the pipeline on the bits, so every value
+of the bits a title set was a program of its own to decompile, translate (glslang + spirv-cross) and compile with
+Metal, synchronously on the RSX thread. Resistance 3's effects uber shader is a 543-slot program (57 KB of HLSL,
+220 KB of MSL) that picks its optional paths with BRB, and the bits change between draws: cache/msl held 70 variants
+of two such programs. One variant measured offline from the cached text: translation ~150 ms, newLibraryWithSource
+215-340 ms. In play they came in bursts (9 new programs within 3 s, 7 within one second, 4 of them the uber shader),
+which is where the game froze for whole seconds in fights and on entering new spans; a 408 ms frame on landing in the
+Haven fight was one RSX drain pass that wrote a new program to cache/msl in the same second. Programs met before cost
+under 1.5 ms (the MSL cache and Metal's own library cache both hold across runs), so the stalls were first meetings,
+and the bits multiplied those.
+
+The bits now travel with the draw: the decompiler emits
+  _pc = (((asuint(vp_posoffset.w) >> N) & 1u) == T) ? target : next;
+for BRB (CLB pushes the return slot the same way), and every writer of the VPConst epilogue puts the bits in
+vp_posoffset.w (rsx_vp_set_epilogue_branch_bits, lane RSX_VP_BRANCH_BITS_LANE): the draw engine, rsx_live_draw, and
+the Metal, D3D12 and Vulkan backends' own paths (which before read whatever bits the last engine decompile had set).
+The shader reads only .xyz of vp_posscale and vp_posoffset, and the lane is outside vp_c, so no guest constant or
+indexed read reaches it. The programs were already a _pc state machine, so the branch is one more uniform test.
+rsx_vp_set_branch_bits and rsx_vp_uses_branch_bits are gone; the bits are no longer pipeline identity.
+
+Tests:
+- libs/video/tests/test_metal_vp_branch_bits.m (new, CMake target, macos.yml step): one BRB program through the
+  engine and the Metal backend on the GPU draws green with bit 5 set, red with every bit but 5 (0xFFFFFFDF, a NaN as a
+  float, reaches the shader as it is) and green again with bits 5 and 31, and the second and third draws compile no
+  shader. On the old code the colours are right and the third check fails (a new vertex function per value).
+- test_engine_program_identity.c (now run by macos.yml): three draws of one BRB program under different bits build
+  one pipeline, and each hands its bits over in the epilogue's last lane; both checks fail on the old code.
+- test_shader_msl.c: the BRB/CLB program emits the run-time tests (bit, polarity, targets) and translates to MSL.
+- rsx_test_programs.h gains rsx_test_vp_branch (was local to test_shader_msl.c).
+
+Upstream: not proposed yet.
+---
+
+diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
+index b0408b44..25d54445 100644
+--- a/.github/workflows/macos.yml
++++ b/.github/workflows/macos.yml
+@@ -430,2 +430,10 @@ jobs:
+ 
++      # SET_TRANSFORM_BRANCH_BITS reaches the GPU at run time: one vertex
++      # program whose BRB picks the colour draws green or red as the bits say,
++      # and no other value of the bits compiles a shader.
++      - name: Run the Metal VP branch bits test
++        run: |
++          test -x build/test_metal_vp_branch_bits
++          ./build/test_metal_vp_branch_bits
++
+       # The depth-bounds test, which Metal lacks, emulated in the fragment
+@@ -511,2 +519,6 @@ jobs:
+           /tmp/test_rsx_draw_engine
++          # Pipeline identity across many programs; a BRB program is one
++          # pipeline whatever SET_TRANSFORM_BRANCH_BITS holds.
++          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_engine_program_identity libs/video/tests/test_engine_program_identity.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
++          /tmp/test_engine_program_identity
+           # The vertex fetch plan's stable ranges against the per-attribute
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f4ab359e..4abb2a4c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -696,2 +696,26 @@ if(UNIX)
+             target_link_options(test_metal_depth_clamp PRIVATE "-Wl,-dead_strip")
++
++            # SET_TRANSFORM_BRANCH_BITS read by the vertex program at run
++            # time, the same way.
++            add_executable(test_metal_vp_branch_bits
++                libs/video/tests/test_metal_vp_branch_bits.m
++                libs/video/rsx_shader_msl.cpp
++                libs/video/rsx_dispatch.c
++                libs/video/rsx_vertex_compact.c
++                libs/video/rsx_texture_layout.c
++                libs/video/rsx_vp_decompiler.c
++                libs/video/rsx_fp_decompiler.c
++                libs/video/rsx_tiling.c
++            )
++            set_source_files_properties(
++                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_vp_branch_bits.m"
++                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
++            target_include_directories(test_metal_vp_branch_bits PRIVATE
++                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
++                "${CMAKE_CURRENT_SOURCE_DIR}/include"
++            )
++            target_link_libraries(test_metal_vp_branch_bits PRIVATE
++                ps3recomp_msl_translation
++                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
++            target_link_options(test_metal_vp_branch_bits PRIVATE "-Wl,-dead_strip")
+         endif()
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 854739e7..fc4e07e2 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -1903,2 +1903,3 @@ static void compile_vp(void)
+ #include "rsx_fp_decompiler.h"
++#include "rsx_vp_decompiler.h"
+ 
+@@ -3603,2 +3604,3 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+     else                { vpx[2] = 1.0f;   vpx[6] = 0.0f;   }
++    rsx_vp_set_epilogue_branch_bits(vpx, st->transform_branch_bits);
+     /* DBG_ZOOM=<k> with DBG_CENTER="cx,cy": a debug camera applied in CLIP space,
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 8fe0bed0..b21deb88 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -2280,6 +2280,2 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+     const u32 vtex_mask = eng_vtex_mask();
+-    /* BRB/CLB outcomes are baked into the program: the branch bits are
+-     * identity only for a program that tests them. */
+-    const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
+-    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+     const u32 ucp = fixed ? 0 : eng_user_clip_key();
+@@ -2349,3 +2345,2 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
+-        if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
+         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+@@ -2398,3 +2393,2 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+     } else {
+-        rsx_vp_set_branch_bits(vp_branch_bits);
+         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
+@@ -3791,2 +3785,3 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     }
++    rsx_vp_set_epilogue_branch_bits(xf, rsx_dsp_reg(&g.rsx, 0x1FF8u));
+     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index be125294..6494bdf3 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4769,7 +4769,2 @@ static ID3D12PipelineState* get_pso(
+     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+-    /* BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). */
+-    const int vp_branch_bits_used = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16);
+-    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+-    if (vp_branch_bits_used)
+-        key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
+     /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
+@@ -4888,3 +4883,2 @@ static ID3D12PipelineState* get_pso(
+     rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
+-    rsx_vp_set_branch_bits(vp_branch_bits);
+     const int vi = masked_layout
+@@ -7758,2 +7752,3 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     }
++    rsx_vp_set_epilogue_branch_bits(xf, rsx_dsp_reg(&g.rsx, 0x1FF8u));
+     u8* cbdst = g.cb_mapped + g.cb_used;
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index 597d79a5..c7c6f779 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -1347,2 +1347,3 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
+     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
++    rsx_vp_set_epilogue_branch_bits(vpx, st->transform_branch_bits);
+ 
+diff --git a/libs/video/rsx_test_programs.h b/libs/video/rsx_test_programs.h
+index 5be78461..ce956bbd 100644
+--- a/libs/video/rsx_test_programs.h
++++ b/libs/video/rsx_test_programs.h
+@@ -106,2 +106,16 @@ static inline void rsx_test_vp_txl_out(u8* p, u32 input, u32 swz, u32 unit,
+ 
++/* A flow-control instruction with no ALU write: scalar opcode `sca_op`
++ * (BRA 0x08, BRI 0x09, CAL 0x0A, CLI 0x0B, RET 0x0C, BRB 0x11, CLB 0x12) to
++ * slot `target`, condition "always". BRB and CLB test branch bit `bit`
++ * (D3[23:27]) against `if_set` (D3[28]). */
++static inline void rsx_test_vp_branch(u8* p, u32 sca_op, u32 target, u32 bit, u32 if_set)
++{
++    const u32 d0 = (0x3Fu << 15) | (7u << 10) | (((target >> 9) & 1u) << 23);
++    const u32 d1 = sca_op << 27;
++    const u32 d2 = (target >> 3) & 0x3Fu;
++    const u32 d3 = (0x3Fu << 7) | (bit << 23) | (if_set << 28) | ((target & 7u) << 29);
++    rsx_test_put_le32(p + 0, d0); rsx_test_put_le32(p + 4, d1);
++    rsx_test_put_le32(p + 8, d2); rsx_test_put_le32(p + 12, d3);
++}
++
+ /* ---- fragment program --------------------------------------------------------
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index ba6c18eb..37821632 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -141,15 +141,2 @@ void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
+ 
+-static u32 s_vp_branch_bits = 0;   /* SET_TRANSFORM_BRANCH_BITS, tested by BRB/CLB */
+-void rsx_vp_set_branch_bits(u32 bits) { s_vp_branch_bits = bits; }
+-
+-int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes)
+-{
+-    if (!ucode) return 0;
+-    for (u32 off = 0; off + 16 <= max_bytes; off += 16) {
+-        const u32 sca_op = (rd_le(ucode + off + 4) >> 27) & 0x1Fu;
+-        if (sca_op == 0x11 || sca_op == 0x12) return 1;   /* BRB, CLB */
+-        if (rd_le(ucode + off + 12) & 1u) break;          /* D3.end */
+-    }
+-    return 0;
+-}
+ 
+@@ -521,13 +508,15 @@ static int rsx_vp_decompile_impl(
+                  * branch bits against D3[28] and ignores the CC condition
+-                 * (RPCS3's GetOptionalBranchCond). The bits are baked in:
+-                 * the caller keys the program on them. */
+-                const u32 bit = (s_vp_branch_bits >> ((d3 >> 23) & 0x1Fu)) & 1u;
+-                const int taken = bit == ((d3 >> 28) & 1u);
+-                if (!taken)
+-                    snprintf(flow_term, sizeof flow_term, "        _pc = %d;\n", next);
+-                else if (sca_op == 0x11)
+-                    snprintf(flow_term, sizeof flow_term, "        _pc = %u;\n", tgt);
++                 * (RPCS3's GetOptionalBranchCond). The bits are read at run
++                 * time from vp_posoffset.w (RSX_VP_BRANCH_BITS_LANE): baked
++                 * in, every combination a title sets was a program of its own
++                 * to translate and compile, ~0.4 s each for a 543-slot one. */
++                char b[96];
++                snprintf(b, sizeof b, "((asuint(vp_posoffset.w) >> %uu) & 1u) == %uu",
++                         (d3 >> 23) & 0x1Fu, (d3 >> 28) & 1u);
++                if (sca_op == 0x11)
++                    snprintf(flow_term, sizeof flow_term, "        _pc = (%s) ? %u : %d;\n", b, tgt, next);
+                 else
+                     snprintf(flow_term, sizeof flow_term,
+-                             "        _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u;\n", next, tgt);
++                             "        if (%s) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d;\n",
++                             b, next, tgt, next);
+             }
+diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
+index 130b1ca4..a616778a 100644
+--- a/libs/video/rsx_vp_decompiler.h
++++ b/libs/video/rsx_vp_decompiler.h
+@@ -59,7 +59,14 @@ void rsx_vp_set_branch_base(u32 start_slot);
+ 
+-/* SET_TRANSFORM_BRANCH_BITS for the next program decompiled. BRB and CLB
+- * branch on one of these bits; the decompiler bakes the outcome in, so a
+- * program that rsx_vp_uses_branch_bits() must be keyed on them too. */
+-void rsx_vp_set_branch_bits(u32 bits);
+-int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
++/* BRB and CLB branch on one of SET_TRANSFORM_BRANCH_BITS (0x1FF8), which the
++ * program reads at run time from vp_posoffset.w, whose bits the caller sets
++ * per draw: the epilogue after vp_c is vp_posscale then vp_posoffset, eight
++ * floats, and the bits go in the last (the shader reads only .xyz of both).
++ * One program then serves every value of the bits. */
++#define RSX_VP_BRANCH_BITS_LANE 7
++static inline void rsx_vp_set_epilogue_branch_bits(float epilogue[8], u32 bits)
++{
++    union { u32 u; float f; } v;
++    v.u = bits;
++    epilogue[RSX_VP_BRANCH_BITS_LANE] = v.f;
++}
+ 
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index f78c66f2..29e21dc8 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -1551,2 +1551,3 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
+     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
++    rsx_vp_set_epilogue_branch_bits(vpx, st->transform_branch_bits);
+     /* PSConstants: inline constants as host-order bit patterns, then fp_alpha. */
+diff --git a/libs/video/tests/test_engine_program_identity.c b/libs/video/tests/test_engine_program_identity.c
+index 3fa187d8..17da128c 100644
+--- a/libs/video/tests/test_engine_program_identity.c
++++ b/libs/video/tests/test_engine_program_identity.c
+@@ -13,2 +13,3 @@
+ #include "rsx_fp_decompiler.h"
++#include "rsx_vp_decompiler.h"
+ 
+@@ -82,2 +83,33 @@ int main(void)
+           "and restoring it finds the old pipeline again");
++
++    /* SET_TRANSFORM_BRANCH_BITS is not program identity: a program with BRB
++     * reads the bits per draw from vp_posoffset.w. Keyed on them, a title
++     * that flips its optional paths between draws compiled one program per
++     * combination (Resistance 3: 70 of one 543-slot program).
++     *   0 MOV o0, v0   1 BRB b5 -> 3   2 MOV o1, v1   3 MOV o2, v2 (END) */
++    {
++        u8 bp[4 * 16];
++        rsx_test_vp_mov_out(bp + 0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
++        rsx_test_vp_branch(bp + 16, 0x11, 3, 5, 1);
++        rsx_test_vp_mov_out(bp + 32, 1, RSX_TEST_VP_SWZ_IDENT, 1, 0);
++        rsx_test_vp_mov_out(bp + 48, 2, RSX_TEST_VP_SWZ_IDENT, 2, 1);
++        m(0x1E9C, 0);
++        for (u32 i = 0; i < 16; i++) { u32 w; memcpy(&w, bp + i * 4, 4); m(0xB80 + i * 4, w); }
++        m(0x1EA0, 0);
++        static const u32 bits[3] = { 0x00000020u, 0x80000001u, 0x00000020u };
++        const int before = stub.n_pipeline_create;
++        u32 first = 0, lane_ok = 1, same_pipeline = 1;
++        for (u32 k = 0; k < 3; k++) {
++            m(0x1FF8, bits[k]);
++            draw_triangle();
++            if (!k) first = stub.bound_pipeline;
++            else if (stub.bound_pipeline != first) same_pipeline = 0;
++            u32 lane; memcpy(&lane, &stub.vp_xf[RSX_VP_BRANCH_BITS_LANE], 4);
++            if (lane != bits[k]) lane_ok = 0;
++        }
++        CHECK(stub.n_pipeline_create == before + 1 && same_pipeline,
++              "a BRB program is one pipeline whatever the branch bits (%d)",
++              stub.n_pipeline_create - before);
++        CHECK(lane_ok, "and each draw hands its bits over in vp_posoffset.w");
++    }
+     engine_down();
+diff --git a/libs/video/tests/test_metal_vp_branch_bits.m b/libs/video/tests/test_metal_vp_branch_bits.m
+new file mode 100644
+index 00000000..15a06cd6
+--- /dev/null
++++ b/libs/video/tests/test_metal_vp_branch_bits.m
+@@ -0,0 +1,124 @@
++/* SET_TRANSFORM_BRANCH_BITS through the real draw engine and the Metal
++ * backend, on the GPU: one vertex program whose BRB picks the colour, drawn
++ * under three values of the bits, the colour read back after each. No title
++ * data.
++ *
++ *   0 MOV o0, v0        position
++ *   1 MOV o1, v1        COLOR0 = green
++ *   2 BRB b5 -> 4       taken when bit 5 is set
++ *   3 MOV o1, v2        COLOR0 = red
++ *   4 MOV o0, v0 (END)
++ *
++ * The program reads the bits at run time (vp_posoffset.w), so all three draws
++ * share one translated and compiled vertex function; when the decompiler
++ * baked them in, each value was a program of its own (Resistance 3: 70 of a
++ * 543-slot program, ~0.4 s each on the RSX thread).
++ *
++ * Built by CMake (build/test_metal_vp_branch_bits) only where glslang and
++ * spirv-cross were found, like test_metal_depth_clamp.
++ */
++#include "rsx_metal_backend.m"
++#define eng_texture_upload test_engine_texture_upload
++#define eng_present test_engine_present
++#include "rsx_draw_engine.c"
++#undef eng_texture_upload
++#undef eng_present
++#include "rsx_test_programs.h"
++
++u8* vm_base; u32 ppu_vm_size;
++u32 cellGcmResolveLocated(int local, u32 offset) { (void)local; return offset; }
++u32 cellGcmResolveIO(u32 offset) { return offset < ppu_vm_size ? offset : 0; }
++void cellGcm_replay_display_buffers_to_engine(void) {}
++float cellAvconfExt_display_gamma(void) { return 1.0f; }
++/* The backend's own (non-engine) draw path, which this test never takes. */
++u32 cellGcmResolveOffset(u32 offset) { return offset; }
++int cellGcmOffsetIsDisplay(u32 offset) { (void)offset; return 0; }
++void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
++{ (void)st; (void)idx; (void)vi; out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f; }
++
++static unsigned checks, failures;
++#define CHECK(x, ...) do { checks++; if (x) { printf("[PASS] " __VA_ARGS__); printf("\n"); } \
++                           else { failures++; printf("[FAIL] " __VA_ARGS__); printf("\n"); } } while (0)
++
++static void method(u32 a, u32 v) { rsx_draw_engine_method(a, v); }
++static void be_float(u8* p, float f) { u32 v; memcpy(&v, &f, 4); p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
++
++/* Draw the full-screen triangle under `bits`; the R, G, B, A bytes of the
++ * centre pixel go to px. */
++static void draw_with_bits(u32 bits, u8 px[4])
++{
++    method(0x1FF8, bits);                       /* SET_TRANSFORM_BRANCH_BITS */
++    method(0x1D90, 0x000000FFu);                /* clear colour: blue */
++    method(0x1D94, 0xF0);                       /* clear RGBA */
++    method(0x1808, RSX_PRIMITIVE_TRIANGLES); method(0x1814, 2u << 24); method(0x1808, 0);
++    s_engine_backend.submit_and_wait(NULL, 0);
++    static u8 pixels[64 * 64 * 4];
++    s_engine_backend.readback(NULL, g.surfaces[0].handle, 0, 0, 64, 64, pixels, 64 * 4);
++    memcpy(px, pixels + (32 * 64 + 32) * 4, 4);
++}
++
++int main(void)
++{
++    @autoreleasepool {
++        s_dev = MTLCreateSystemDefaultDevice();
++        if (!s_dev) { puts("no Metal device: skipped"); return 0; }
++        s_queue = [s_dev newCommandQueue];
++        s_headless = 1; s_guest_shaders = 1;
++        vm_base = calloc(1, 1u << 20); ppu_vm_size = 1u << 20;
++        rsx_draw_engine_set_backend(&s_engine_backend);
++        if (rsx_draw_engine_init(64, 64) != 0) { CHECK(0, "engine init"); return 1; }
++
++        method(0x0194, 0xFEED0000);             /* CONTEXT_DMA_COLOR_A: local */
++        method(0x0210, 0x40000);                /* COLOR_A_OFFSET */
++        method(0x020C, 64 * 4);                 /* COLOR_A_PITCH */
++        method(0x0200, 64u << 16);
++        method(0x0204, 64u << 16);
++        method(0x0208, 8u | (1u << 8));         /* A8R8G8B8, no zeta, linear */
++        /* position, green, red: float32 x4, stride 48, in main memory */
++        method(0x1740, 2u | (4u << 4) | (48u << 8)); method(0x1680, 0x80010000);
++        method(0x1744, 2u | (4u << 4) | (48u << 8)); method(0x1684, 0x80010010);
++        method(0x1748, 2u | (4u << 4) | (48u << 8)); method(0x1688, 0x80010020);
++        const float v[36] = { -1, -1, .5f, 1,  0, 1, 0, 1,  1, 0, 0, 1,
++                               3, -1, .5f, 1,  0, 1, 0, 1,  1, 0, 0, 1,
++                              -1,  3, .5f, 1,  0, 1, 0, 1,  1, 0, 0, 1 };
++        for (u32 i = 0; i < 36; i++) be_float(vm_base + 0x10000 + i * 4, v[i]);
++
++        u8 vp[5 * 16];
++        rsx_test_vp_mov_out(vp + 0 * 16, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
++        rsx_test_vp_mov_out(vp + 1 * 16, 1, RSX_TEST_VP_SWZ_IDENT, 1, 0);
++        rsx_test_vp_branch(vp + 2 * 16, 0x11, 4, 5, 1);
++        rsx_test_vp_mov_out(vp + 3 * 16, 2, RSX_TEST_VP_SWZ_IDENT, 1, 0);
++        rsx_test_vp_mov_out(vp + 4 * 16, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
++        method(0x1E9C, 0);                      /* TRANSFORM_PROGRAM_LOAD */
++        for (u32 i = 0; i < 20; i++) { u32 w; memcpy(&w, vp + i * 4, 4); method(0x0B80 + i * 4, w); }
++        method(0x1EA0, 0);                      /* TRANSFORM_PROGRAM_START */
++        rsx_test_fp_mov_r0_col0(vm_base + 0x60000, RSX_TEST_FP_SWZ_IDENT);
++        method(0x08E4, 0x60002);
++        method(0x1D60, 64);
++
++        static const u8 green[4] = { 0, 255, 0, 255 }, red[4] = { 255, 0, 0, 255 };
++        /* 0xFFFFFFDF is a NaN as a float: the bits must reach the shader as
++         * they are. */
++        u8 px[4];
++        draw_with_bits(0x00000020u, px);
++        CHECK(!memcmp(px, green, 4), "bit 5 set: the branch skips the red write (RGBA %u %u %u %u)",
++              px[0], px[1], px[2], px[3]);
++        const u32 funcs = s_eng_func_count;
++        draw_with_bits(0xFFFFFFDFu, px);
++        CHECK(!memcmp(px, red, 4), "every bit but 5: falls through to red (RGBA %u %u %u %u)",
++              px[0], px[1], px[2], px[3]);
++        draw_with_bits(0x80000020u, px);
++        CHECK(!memcmp(px, green, 4), "bit 5 and bit 31: green again (RGBA %u %u %u %u)",
++              px[0], px[1], px[2], px[3]);
++        CHECK(s_eng_func_count == funcs,
++              "no shader compiled for the other values of the bits (%u, then %u)",
++              funcs, s_eng_func_count);
++        CHECK(s_eng_dropped == 0, "no dropped records");
++
++        rsx_draw_engine_shutdown();
++        rsx_draw_engine_set_backend(NULL);
++        free(vm_base);
++    }
++    printf("%u checks, %u failed\n", checks, failures);
++    return failures ? 1 : 0;
++}
+diff --git a/libs/video/tests/test_shader_msl.c b/libs/video/tests/test_shader_msl.c
+index aff4dcff..bdbb08b8 100644
+--- a/libs/video/tests/test_shader_msl.c
++++ b/libs/video/tests/test_shader_msl.c
+@@ -82,17 +82,3 @@ static char g_hlsl[262144];
+ static char g_msl[262144];
+-static u8 g_long_vp[519 * 16];   /* the 519-slot program; also has no BRB/CLB */
+-
+-/* Flow instruction `sca_op` (0x09 BRI, 0x11 BRB, 0x12 CLB) to VP slot
+- * `target`: cond [10:12] = 7 (TR), the target split over D0[23], D2[0:5] and
+- * D3[29:31]; a boolean branch tests branch bit `bit` (D3[23:27]) for
+- * `if_set` (D3[28]). No ALU writes. */
+-static void vp_branch(u8* p, u32 sca_op, u32 target, u32 bit, u32 if_set)
+-{
+-    const u32 d0 = (0x3Fu << 15) | (7u << 10) | (((target >> 9) & 1u) << 23);
+-    const u32 d1 = sca_op << 27;
+-    const u32 d2 = (target >> 3) & 0x3Fu;
+-    const u32 d3 = (0x3Fu << 7) | (bit << 23) | (if_set << 28) | ((target & 7u) << 29);
+-    rsx_test_put_le32(p + 0, d0); rsx_test_put_le32(p + 4, d1);
+-    rsx_test_put_le32(p + 8, d2); rsx_test_put_le32(p + 12, d3);
+-}
++static u8 g_long_vp[519 * 16];   /* the 519-slot program */
+ static char g_log[4096];
+@@ -290,6 +276,6 @@ int main(int argc, char** argv)
+             rsx_test_vp_mov_out(vp + i * 16, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0 */
+-        vp_branch(vp + 513 * 16, 0x09, 515, 0, 0);
++        rsx_test_vp_branch(vp + 513 * 16, 0x09, 515, 0, 0);
+         rsx_test_vp_mov_out(vp + 514 * 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);      /* skipped */
+         rsx_test_vp_mov_out(vp + 515 * 16, 1, RSX_TEST_VP_SWZ_IDENT, 1, 0);      /* MOV o1, v1 */
+-        vp_branch(vp + 516 * 16, 0x09, 518, 0, 0);
++        rsx_test_vp_branch(vp + 516 * 16, 0x09, 518, 0, 0);
+         rsx_test_vp_mov_out(vp + 517 * 16, 3, RSX_TEST_VP_SWZ_IDENT, 2, 0);      /* skipped */
+@@ -313,3 +299,6 @@ int main(int argc, char** argv)
+      * "BRB !bN"; run straight through, every path was taken and the glows
+-     * came out as red stretched polygons.
++     * came out as red stretched polygons. The bits are read at run time from
++     * vp_posoffset.w: baked into the text, each combination the title set was
++     * a program of its own to translate and compile (Resistance 3: 70 of a
++     * 543-slot one, ~0.4 s each, on the RSX thread).
+      *   0 MOV o0, v0       1 BRB !b3 -> 3     2 MOV o1, v1
+@@ -320,40 +309,24 @@ int main(int argc, char** argv)
+         rsx_test_vp_mov_out(vp + 0 * 16, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+-        vp_branch(vp + 1 * 16, 0x11, 3, 3, 0);
++        rsx_test_vp_branch(vp + 1 * 16, 0x11, 3, 3, 0);
+         rsx_test_vp_mov_out(vp + 2 * 16, 1, RSX_TEST_VP_SWZ_IDENT, 1, 0);
+-        vp_branch(vp + 3 * 16, 0x12, 6, 12, 1);
++        rsx_test_vp_branch(vp + 3 * 16, 0x12, 6, 12, 1);
+         rsx_test_vp_mov_out(vp + 4 * 16, 2, RSX_TEST_VP_SWZ_IDENT, 2, 0);
+-        vp_branch(vp + 5 * 16, 0x09, 8, 0, 0);
++        rsx_test_vp_branch(vp + 5 * 16, 0x09, 8, 0, 0);
+         rsx_test_vp_mov_out(vp + 6 * 16, 3, RSX_TEST_VP_SWZ_IDENT, 3, 0);
+-        vp_branch(vp + 7 * 16, 0x0C, 0, 0, 0);
++        rsx_test_vp_branch(vp + 7 * 16, 0x0C, 0, 0, 0);
+         rsx_test_vp_mov_out(vp + 8 * 16, 4, RSX_TEST_VP_SWZ_IDENT, 4, 1);
+-        if (rsx_vp_uses_branch_bits(vp, sizeof vp) &&
+-            !rsx_vp_uses_branch_bits(g_long_vp, sizeof g_long_vp)) {
+-            printf("[PASS] bool VP -- keyed on the branch bits, the BRI-only program not\n");
+-            g_pass++;
++        rsx_vp_set_branch_base(0);
++        if (rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl) > 0) {
++            check("bool VP HLSL", g_hlsl, "BRB @1 -> 3 cond=7 test=0 swz=xxxx */\n"
++                  "        _pc = (((asuint(vp_posoffset.w) >> 3u) & 1u) == 0u) ? 3 : 2;");
++            check("bool VP HLSL", g_hlsl, "CLB @3 -> 6 cond=7 test=0 swz=xxxx */\n"
++                  "        if (((asuint(vp_posoffset.w) >> 12u) & 1u) == 1u) "
++                  "{ _cs[_csp] = 4; _csp = min(_csp + 1, 7); _pc = 6; } else _pc = 4;");
++            check_absent("bool VP HLSL", g_hlsl, "not modelled");
++            if (translate("bool VP", RSX_SHADER_STAGE_VERTEX) == 0)
++                check("bool VP MSL", g_msl, "vertex ");
+         } else {
+-            printf("[FAIL] bool VP -- rsx_vp_uses_branch_bits\n");
++            printf("[FAIL] bool VP -- decompile failed\n");
+             g_fail++;
+         }
+-        static const struct { u32 bits; const char* brb; const char* clb; } cases[] = {
+-            { 0x0000u, "BRB @1 -> 3 cond=7 test=0 swz=xxxx */\n        _pc = 3;",
+-                       "CLB @3 -> 6 cond=7 test=0 swz=xxxx */\n        _pc = 4;" },
+-            { 0x1008u, "BRB @1 -> 3 cond=7 test=0 swz=xxxx */\n        _pc = 2;",
+-                       "CLB @3 -> 6 cond=7 test=0 swz=xxxx */\n"
+-                       "        _cs[_csp] = 4; _csp = min(_csp + 1, 7); _pc = 6;" },
+-        };
+-        for (u32 i = 0; i < 2; i++) {
+-            rsx_vp_set_branch_base(0);
+-            rsx_vp_set_branch_bits(cases[i].bits);
+-            if (rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl) > 0) {
+-                check("bool VP HLSL", g_hlsl, cases[i].brb);
+-                check("bool VP HLSL", g_hlsl, cases[i].clb);
+-                check_absent("bool VP HLSL", g_hlsl, "not modelled");
+-                if (translate("bool VP", RSX_SHADER_STAGE_VERTEX) == 0)
+-                    check("bool VP MSL", g_msl, "vertex ");
+-            } else {
+-                printf("[FAIL] bool VP -- decompile failed\n");
+-                g_fail++;
+-            }
+-        }
+-        rsx_vp_set_branch_bits(0);
+     }
