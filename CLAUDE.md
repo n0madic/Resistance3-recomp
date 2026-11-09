@@ -201,7 +201,9 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     Cmd+Tab frees it too). The window's close button quits at once (`host/main.cpp`); Cmd+Q and the app menu's Quit item (#613) ask the game to quit
     (upstream `ps3_host_quit`, #544: REQUEST_EXITGAME, then exit after `PS3_QUIT_GRACE_MS`, 3 s); the window resizes
     keeping the aspect ratio and `PS3RECOMP_FULLSCREEN=1` starts it full screen (#614);
-  - left button = R1 (fire), right = L1 (aim), middle or V = R3 (melee), wheel or Q = triangle (weapons);
+  - left button = R1 (fire), right = L1 (aim), middle or V = R3 (melee), wheel or Q = triangle (weapons: a tap swaps to
+    the previous weapon, holding it opens the weapon wheel, which the left stick, i.e. WASD, picks from; the right stick
+    and so the mouse do not);
   - Space = cross (jump), C/Ctrl/Backspace = circle (crouch, back), E/R = square (reload, use);
   - G/F = L2/R2 (grenade, secondary fire), Shift = L3 (sprint);
   - arrows or 1/2/3/4 = d-pad, Tab = select;
