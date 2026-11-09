@@ -185,7 +185,7 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   game stands still meanwhile (met before: under 1.5 ms, `cache/msl` and Metal's library cache hold across runs). The
   effects uber shader (543 slots, ~220 KB of MSL) picks its paths with BRB on SET_TRANSFORM_BRANCH_BITS, which upstream
   #485 baked into the text: 70 variants of it came one by one, in bursts, and froze fights for seconds. The program
-  now reads the bits at run time from `vp_posoffset.w` (`gcm-rsx/0027`), one program for every value of the bits.
+  now reads the bits at run time from `vp_posoffset.w` (`gcm-rsx/0027`, upstream #757), one program for every value of the bits.
   The ~1 s pauses left at the end of a cutscene and on respawn are the game's own wait (main thread on a GCM label
   in `func_0073439C`, RSX, GPU and SPUs idle), not compilation.
   The game times its GPU frame with marker reports (IO 0x20B60 start, 0x20B40 end; `func_0075A38C` keeps the time at

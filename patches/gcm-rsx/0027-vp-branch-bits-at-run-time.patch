@@ -31,7 +31,7 @@ Tests:
 - test_shader_msl.c: the BRB/CLB program emits the run-time tests (bit, polarity, targets) and translates to MSL.
 - rsx_test_programs.h gains rsx_test_vp_branch (was local to test_shader_msl.c).
 
-Upstream: not proposed yet.
+Upstream: PR #757.
 ---
 
 diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
