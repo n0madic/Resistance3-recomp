@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ps3recomp game project -- the host: everything of the port except the lifted game code.
  *
@@ -61,6 +62,8 @@
 #include <timeapi.h>
 #include <direct.h>   /* _mkdir */
 #endif
+
+#include "unself.h"   /* r3::unself_main, r3::selftest_main: subcommands that run before the runtime */
 
 /* ---------------------------------------------------------------------------
  * What the scaffold gives this file
@@ -597,6 +600,10 @@ static void set_default_env(const char* name, const char* value)
 
 int main(int argc, char** argv)
 {
+    /* Subcommands that need none of the runtime: they run before anything is set up. */
+    if (argc >= 2 && strcmp(argv[1], "unself") == 0) return r3::unself_main(argc - 2, argv + 2);
+    if (argc >= 2 && strcmp(argv[1], "selftest") == 0) return r3::selftest_main();
+
 #ifdef R3_MONOLITH
     if (argc < 2) {
         printf("usage: %s <PPU ELF>\n", argv[0]);

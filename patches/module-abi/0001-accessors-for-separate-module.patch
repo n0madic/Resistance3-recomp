@@ -4,9 +4,9 @@ With SPU_MODULE_ACCESSORS the lifted SPU code reaches g_spu_trampoline_fn, g_spu
 the host exports (spu_tramp_slot, spu_pch_arr, spu_pch_n_slot) instead of naming the host's thread-local variables.
 A module built as its own loadable image needs that where the linker rejects a TLS reference into another image (PE).
 On macOS the module binds to the host's TLS when it is loaded, so for Resistance 3 the accessors are the base of
-module-abi/0002, which caches the trampoline slot in the context: build_module.py builds the SPU lift with
+module-abi/0002, which caches the trampoline slot in the context: the launcher's module build (launcher/r3_launcher/module.py) builds the SPU lift with
 SPU_MODULE_ACCESSORS (without it every SPU trampoline store went through _tlv_get_addr, 1.0-1.5% of the SPU threads'
-time in a firefight, against 0.35-0.43% with 0002; build_module.py, 2026-10-26). Without the macro the headers are unchanged.
+time in a firefight, against 0.35-0.43% with 0002; 2026-10-26). Without the macro the headers are unchanged.
 
 The PPU accessor (ppu_tramp_slot, PPU_MODULE_ACCESSORS in the PPU lifter's prologue) and the SPURS job's
 SPURS_JOB_TLS -> SPU_THREAD_LOCAL respelling (the two macros expand the same) were dropped in the move to v0.19.0: the

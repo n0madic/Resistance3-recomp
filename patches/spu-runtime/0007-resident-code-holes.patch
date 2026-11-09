@@ -14,7 +14,7 @@ Test: runtime/spu/tests/test_spu_lifted_start.c test_resident_code_holes, test_v
 case in test_verified_resident_code_regions (6 checks fail without the change). #654's
 runtime/spu/tests/test_spu_overlay_allsize.c expected a partial foreign overwrite to drop the span; it now checks the
 hole instead. Scripted run, together with 0006 and
-the buffer modules of scripts/extract_spu_raw.py: interpreter steps in gameplay about 23M/s -> 13M/s (what is left is
+the buffer modules of launcher/helpers/extract_spu_raw.py: interpreter steps in gameplay about 23M/s -> 13M/s (what is left is
 mostly the position-independent modules); Home level, stick turning, two runs: 24.2 -> 26.6-26.9 fps.
 
 Upstream: not proposed yet (same problem as the code-only spans of PR #444, for spans whose code end is not known).

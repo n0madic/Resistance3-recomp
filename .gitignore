@@ -5,6 +5,13 @@
 !/CLAUDE.md
 !/Makefile
 !/README.md
+!/LICENSE
+!/LICENSE-GPL-2.0.txt
+!/VERSION
+!/r3.py
+!/docs/
+!/launcher/
+!/tests/
 !/host/
 !/patches/
 !/scripts/

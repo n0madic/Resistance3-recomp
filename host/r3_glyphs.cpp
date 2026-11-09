@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Resistance 3 -- button prompts as keys (see r3_glyphs.h).
  *

@@ -5,111 +5,58 @@ Macs with Metal. It is built on [ps3recomp](https://github.com/sp00nznet/ps3reco
 code is translated to C++ ahead of time and compiled into a native library, which a small host program loads together
 with an HLE implementation of the PS3 system libraries (graphics, audio, input, file system, saves, trophies).
 
-This repository contains **only the port's own sources**. It does not contain the game, and nothing derived from the
-game is ever committed: you build the game module yourself, from your own copy of the disc.
+**You bring the game.** Nothing from the game, from Sony's firmware or from anyone's PS3 is in this repository or in the
+release zip. On the first start the launcher takes *your* copy of the disc's `PS3_GAME` folder, translates its code and
+compiles the result on *your* computer. The translated code never leaves it.
 
 ## Status
 
 - **Tested on macOS only** (Apple Silicon, Metal). In principle the game can run anywhere
-  [ps3recomp](https://github.com/sp00nznet/ps3recomp) compiles, but no other platform has been tried: this
-  repository's build and launch scripts target macOS, so elsewhere they would need adapting. The patch set is already
-  organized by platform (`patches/domains.txt`).
+  [ps3recomp](https://github.com/sp00nznet/ps3recomp) compiles, but no other platform has been tried. The patch set is
+  already organized by platform (`patches/domains.txt`).
 - **Single-player campaign only.** Co-op and multiplayer are not supported.
 - Keyboard + mouse and game controllers are supported; the game is playable with either.
 - Most testing has been in the opening chapters (Haven). Expect rough edges further in.
-- Only the EU release (`BCES01118`) has been tested.
+- Only the EU release (`BCES01118`, version 01.00) is supported.
 
-## Requirements
+## What you need
 
-**Hardware / OS**
-
-- An Apple Silicon Mac (arm64) with Metal, running a current macOS. This is the only tested platform (see Status).
-- About 25 GB of free disk space: ~17 GB for the game files, ~1.5 GB for build products, ~3 GB for the saves, the
-  HDD install and the caches the game writes while it runs.
-
-**Tools**
-
-- Xcode Command Line Tools (`xcode-select --install`)
-- `git`, `cmake`, `ninja`, `python3` (3.11 or newer), e.g. `brew install cmake ninja python`
-- Internet access for the first build: it fetches the pinned toolkit and its dependencies from GitHub (SDL2, glslang,
-  SPIRV-Tools, SPIRV-Cross), and the decrypt step downloads one file from RPCS3's repository (see below).
-
-**Game files**
-
-You need your own **decrypted dump of the disc's `PS3_GAME` folder** (EU, `BCES01118`). The port uses these parts of it:
-
-```
-PS3_GAME/PARAM.SFO
-PS3_GAME/USRDIR/EBOOT.BIN
-PS3_GAME/USRDIR/PACKED/GAME/*.PSARC
-PS3_GAME/USRDIR/PACKED/levels/...
-PS3_GAME/USRDIR/built/...             (movies and the rest of the game data)
-```
-
-The multiplayer levels are not needed. Voice packs: English (`GLOBAL_SOUND_US.PSARC`) and Russian
-(`GLOBAL_SOUND_RU.PSARC`) are present in the tested copy; the port can run with either.
-
-## Build
-
-All commands run from the project root.
-
-**1. Put the game files in place.** Copy the `PS3_GAME` folder into the project root, so that
-`PS3_GAME/USRDIR/EBOOT.BIN` exists.
-
-**2. Set up the Python environment** (used by the decrypt step and by the code lifter):
-
-```bash
-python3 -m venv .venv
-```
-
-```bash
-.venv/bin/pip install pycryptodome capstone construct tabulate tqdm
-```
-
-**3. Decrypt the executable:**
-
-```bash
-.venv/bin/python -I tools/unself_app.py PS3_GAME/USRDIR/EBOOT.BIN -o PS3_GAME/USRDIR/EBOOT.elf
-```
-
-The tool keeps no keys of its own. It downloads RPCS3's `key_vault.cpp` at a pinned commit, checks its SHA-256 and reads
-the executable's key from it. For an offline machine, download that file once and pass it with `--key-vault <file>`.
-
-**4. Build the host and the game module:**
-
-```bash
-make
-```
-
-This runs two steps, which can also be run separately:
-
-| Step | Command | What it does |
-|---|---|---|
-| Host | `make host` | Clones the pinned toolkit, applies the patches in `patches/`, builds the static dependencies and `dist/host/r3_host`. Takes a while the first time. Contains nothing from the game. |
-| Module | `make module` | Lifts the decrypted `EBOOT.elf` and compiles `module/game.dylib` (about 6 minutes on the author's machine). |
-
-## Run
-
-```bash
-make run
-```
-
-Options are passed as variables:
-
-```bash
-make run FPS=1 LOG=1 GAME_LANG=ru
-```
-
-| Variable | Effect |
+| | |
 |---|---|
-| `FPS=1` | Print the presented frame rate in the terminal. |
-| `LOG=1` | Write the host output to `logs/run-<time>.log` and `.log.err` instead of the terminal. |
-| `GAME_LANG=ru` / `en` | Game language (voice pack and text). Without it the macOS language is used, falling back to English. |
+| Computer | Apple Silicon Mac with Metal, a current macOS |
+| Python | 3.10 or newer (`brew install python`, or python.org). Only the standard library is used |
+| Compiler | the Xcode command line tools (`xcode-select --install`): Apple's clang builds the game module. A portable compiler is not an option: zig was tried and its linker cannot link the module (see [docs/architecture.md](docs/architecture.md)) |
+| Disk | about 6 GB besides the game: the build, the saves, and the caches the game writes while it runs |
+| Game | your own **decrypted dump of the disc's `PS3_GAME` folder** (EU, `BCES01118`); it stays where it is and is not changed |
 
-Other environment variables are passed through to the host, for example `PS3RECOMP_FULLSCREEN=1 make run` starts in
-full screen. `scripts/run_game.sh --help` shows the launcher's own options.
+The launcher uses these parts of the dump: `PARAM.SFO`, `USRDIR/EBOOT.BIN`, `USRDIR/PACKED/GAME/*.PSARC`,
+`USRDIR/PACKED/levels/`, `USRDIR/built/` (movies and the rest of the game data). The multiplayer levels are not needed.
+Voice packs: English (`GLOBAL_SOUND_US.PSARC`) and Russian (`GLOBAL_SOUND_RU.PSARC`) are present in the tested copy.
 
-**First launch.**
+## Quick start
+
+```sh
+unzip r3-0.1.0-macos-arm64.zip
+cd r3
+xattr -dr com.apple.quarantine .      # only if macOS refuses to open the downloaded program
+
+# first run: point it at the PS3_GAME folder of your dump (or the folder that holds it)
+./r3.py --game "/path/to/PS3_GAME"
+
+# every later run
+./r3.py
+```
+
+The first run takes a few minutes (lifting the game's code, then compiling it into one library, `game.dylib`); later runs
+start the game at once. Nothing is redone unless its inputs change.
+
+1. **game**: decrypts the executable (`r3_host unself`, nothing is downloaded) and lays out the disc in the data directory
+   as links to your files;
+2. **lift**: translates the game's PPU code and its SPU programs to C/C++;
+3. **compile**: builds that into `game.dylib` with all your cores;
+4. **run**.
+
+**First launch of the game.**
 
 1. The first boot, and the first boot after changing the language, shows **"the game will need to install data"**.
    Press **Space** (Cross). Nothing else needs to be done.
@@ -117,6 +64,51 @@ full screen. `scripts/run_game.sh --help` shows the launcher's own options.
 3. On a fresh install the game may also show brightness and screen calibration screens; confirm them with Space.
 4. Expect stutter at first: every shader is translated to Metal the first time it is used. The result is cached in
    `cache/msl`, so later runs are smooth.
+
+## Options
+
+```
+./r3.py [command] [--game PS3_GAME] [--fps] [--log] [--lang CODE] [--window WxH] [--fullscreen] [--sens DEG]
+```
+
+| Option | Meaning |
+|---|---|
+| `--game PS3_GAME` | the PS3_GAME folder of your dump; remembered, so only the first run needs it |
+| `--fps` | print the presented frame rate in the terminal |
+| `--log` | write the host's output to `logs/run-<time>.log` and `.log.err` in the data directory |
+| `--lang CODE` | game language (voice pack and text): `en`, `ru`, ... Without it the macOS language is used, falling back to English |
+| `--window WxH` | initial window size in points, e.g. `1600x900`; the window can be resized, the aspect ratio is kept |
+| `--fullscreen` | start in full screen |
+| `--sens DEG` | mouse speed in degrees per point |
+| `--data DIR` | where everything derived from the game lives (default `./data` next to `r3.py`, or `R3_HOME`) |
+| `--yes` | answer yes: confirm `reset --all` |
+
+| Command | What it does |
+|---|---|
+| `run` (default) | build whatever is stale, then run |
+| `build` | only build |
+| `doctor` | check this machine and the installation, and say what is missing |
+| `kill` | end a stuck host (it ignores a plain `kill`) |
+| `clean-cache` | drop the game's disk cache (`--shaders` also the translated shaders) |
+| `reset` | remove what is derived from the game (lift, module, disc layout); `--all` also the saves and caches |
+
+`./r3.py --help` lists the rest. Other environment variables go to the host, for example `PAD_KEYBOARD_LAYOUT=pad`.
+
+## Where things are
+
+Everything derived from the game is in the data directory (`./data` unless you moved it):
+
+| Path | What |
+|---|---|
+| `game.json` | which `PS3_GAME` folder was set up |
+| `disc/PS3_GAME/` | the game as the host sees the disc: links to your files, plus the decrypted `EBOOT.elf` |
+| `games/BCES01118-01.00/` | the decrypted executable, the lift, and `module/game.dylib` |
+| `gamedata/dev_hdd0/` | **your saves and trophies**, and the game's HDD install |
+| `cache/` | the game's disk cache (`BCES01118`) and the translated shaders (`msl`) |
+| `controls.txt`, `logs/` | your key bindings, and the logs of `--log` runs |
+
+Delete the data directory to start over (keep `gamedata/` if you want your saves). **Do not share the data directory or
+the files in it:** they are derived from the game.
 
 ## Controls
 
@@ -147,12 +139,12 @@ full screen. `scripts/run_game.sh --help` shows the launcher's own options.
 
 ### Tuning
 
-- `PAD_MOUSE_SENS=<value>` sets the mouse speed in degrees per point, e.g. `PAD_MOUSE_SENS=<value> make run`.
+- `--sens <degrees per point>` sets the mouse speed (the environment variable `PAD_MOUSE_SENS` does the same).
 - The mouse is scaled by the field of view, so it covers the same part of the screen zoomed or not. `R3_ZOOM_SENS=0`
   turns that off.
 - The mouse follows the game's **Options > Controls**: Camera Speed and Invert-X / Invert-Y. `R3_GAME_SETTINGS=0` turns
   that off.
-- `controls.txt` (written next to where you start the game, with the defaults, on the first run) remaps the keys and
+- `controls.txt` (written in the data directory, with the defaults, on the first run) remaps the keys and
   mouse buttons: one line per action, e.g. `jump = Space` or `fire = MouseLeft`. `R3_CONTROLS=<path>` names another file.
   Mistakes are reported in the log with their line number.
 - The game's button prompts (menus, HUD, hints) show the key or mouse button bound to each pad button in
@@ -166,40 +158,56 @@ full screen. `scripts/run_game.sh --help` shows the launcher's own options.
 Controllers that SDL2 recognizes as game controllers (PS4/PS5, Xbox, and most others) are read by the toolkit's pad
 layer and can be plugged in at any time. The keyboard and mouse path is the one tested most.
 
+
 ## Troubleshooting
 
 | Symptom | What to do |
 |---|---|
-| `missing dist/host/r3_host` / `missing module/game.dylib` | The corresponding build step has not been run: `make`. |
-| `missing PS3_GAME/USRDIR/EBOOT.elf` | Run the decrypt step (build step 3). |
-| `r3_host is already running` | `make kill`. The host ignores a plain `kill`, so stale instances can survive a crash. |
-| Textures or data stay broken from run to run | The game's disk cache (`cache/BCES01118`) can keep bad data after a data-path bug. `make clean-cache` removes it; the game rebuilds it. |
-| Stutter on the first run | Normal: shaders are being translated. See "First launch". |
-| Start over from scratch | Delete `gamedata/` (**this erases your saves and trophies**); the game installs its data again on the next start. |
-| Something in the build is stale after `git pull` | Run `make` again. If the toolkit pin or the patches changed, the host is rebuilt, and the module then needs rebuilding too: host and module check each other's ABI. |
+| Something does not work | `./r3.py doctor` lists what is missing |
+| `no suitable compiler` | `xcode-select --install` |
+| `... is not a supported game version` | only `BCES01118` 01.00 (EU) is supported |
+| `r3_host is already running` | `./r3.py kill` |
+| Textures or data stay broken from run to run | `./r3.py clean-cache`; the game rebuilds its disk cache |
+| Stutter on the first run | Normal: shaders are being translated. See "First launch" |
+| Start over | `./r3.py reset`, or delete the data directory (`gamedata/` holds your saves and trophies) |
+| After an update of the launcher | run `./r3.py`; a changed host rebuilds the module by itself (host and module check each other's ABI) |
 
 ## How it works
 
-- **Host** (`dist/host/r3_host`): the ps3recomp runtime plus this port's sources in `host/`, with every dependency linked
-  statically. It is the same for everyone and contains nothing from the game.
-- **Module** (`module/game.dylib`): the game's PPU and SPU code translated to C++ from *your* `EBOOT.elf` and compiled
-  locally. The host loads it at start-up.
+- **Host** (`host/r3_host`): the ps3recomp runtime plus this port's sources in `host/`, with every dependency linked
+  statically. It is the same for everyone and contains nothing from the game. It also decrypts the executable
+  (`r3_host unself`).
+- **Module** (`game.dylib`): the game's PPU and SPU code translated to C++ from *your* executable and compiled locally.
+  The host loads it at start-up.
+- **Launcher** (`r3.py`, `launcher/`): Python standard library only. It sets the game up, lifts, compiles and starts the
+  host; every step is skipped while its inputs are unchanged.
 - **Patches** (`patches/`): changes to the pinned ps3recomp revision that this game needs, grouped by subject (SPURS,
   SPU runtime, RSX/GCM, input, file system, ...). Each one names the symptom it fixes. Fixes that apply to other games
   are proposed upstream.
-- **Game data** (`PS3_GAME/`): served to the game as the disc (`/dev_bdvd/PS3_GAME`). What the game writes (HDD install,
-  saves, trophies) goes to `gamedata/`.
 
-```
-host/        port sources: entry point, HLE overrides, input mapping
-patches/     patches on top of the pinned ps3recomp revision
-scripts/     build_host.sh, build_module.py, run_game.sh, SPU extraction, patch checks
-tools/       unself_app.py (executable decryption)
-Makefile     wrapper around the scripts above
+[docs/architecture.md](docs/architecture.md) has the details, [docs/licensing.md](docs/licensing.md) the licenses, and
+[CLAUDE.md](CLAUDE.md) the patch workflow, the test suites and the debugging knobs.
+
+## Building from source
+
+You need git, cmake, ninja, Python 3.10+ and the Xcode command line tools (`brew install cmake ninja python`) and internet
+access for the first build, which fetches the pinned toolkit and its dependencies (SDL2, glslang, SPIRV-Tools, SPIRV-Cross).
+
+```sh
+scripts/build_host.sh     # clones the pinned toolkit, applies patches/, builds the static dependencies and the host -> dist/host
+scripts/package.sh        # dist/r3-<version>-macos-<arch>.zip
+./r3.py --game "/path/to/PS3_GAME"   # in a checkout the launcher builds and runs the host from dist/ itself
 ```
 
-Developers: [CLAUDE.md](CLAUDE.md) documents the architecture, the patch workflow, the test suites and the debugging
-knobs in detail.
+In a checkout `./r3.py` rebuilds the host with `scripts/build_host.sh` when `host/`, `patches/` or the build scripts are
+newer than it (`--no-host-build` skips that). `make` wraps the same steps and uses the checkout itself as the data
+directory (`R3_HOME`), so `make run` keeps its saves in `gamedata/`; `make test` runs the unit tests.
+
+## License
+
+The code in this repository is free software under the **GNU GPL, version 2 or (at your option) any later version**
+([LICENSE-GPL-2.0.txt](LICENSE-GPL-2.0.txt)). The prebuilt host also contains Apache-2.0 licensed parts, so as a whole it
+is distributed under **GPL version 3 or later** ([LICENSE](LICENSE)).
 
 ## Credits and disclaimer
 
@@ -208,9 +216,10 @@ knobs in detail.
 - [SDL2](https://libsdl.org), [glslang](https://github.com/KhronosGroup/glslang),
   [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) and
   [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross): window, input and shader translation.
-- [RPCS3](https://github.com/RPCS3/rpcs3): `tools/unself_app.py` is a port of its executable decryption, and the key is
-  read from its key vault.
+- [RPCS3](https://github.com/RPCS3/rpcs3): `r3_host unself` ports its executable decryption, and the key table is from
+  its key vault.
 - [envytools](https://github.com/envytools/envytools): the RSX memory-tiling address math.
+- The launcher follows the one of the Soulcalibur II HD port.
 
 Resistance 3 is a product of Insomniac Games and Sony Interactive Entertainment. This project is not affiliated with
 or endorsed by either. It ships no game code or assets; you must own the game and supply your own copy.

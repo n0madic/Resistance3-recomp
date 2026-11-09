@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Check the toolkit patches against a toolkit revision.
 #
 #   scripts/check_patches.sh [rev]       rev: a commit or tag of the toolkit clone (default: the pin in build_host.sh)

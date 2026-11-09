@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Build the host of the recompiled Resistance 3 (macOS): the ps3recomp runtime and the port, with every dependency
 # linked in statically, and nothing derived from the game.
 #

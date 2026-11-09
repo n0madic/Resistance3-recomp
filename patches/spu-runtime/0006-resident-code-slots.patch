@@ -2,7 +2,7 @@ SPU: sixteen resident code spans per context instead of four (SPU_RESIDENT_CODE_
 
 spu_context.resident_code records which lifted image owns each streamed code span in local store. Resistance 3's job
 dispatcher keeps modules in up to nine LS buffers at once (0x100, 0x6600, 0xDF00, 0x20680, 0x21600, 0x21F00, 0x23B80,
-0x24D00 and its own code at 0x3F580; scripts/extract_spu_raw.py registers them). With four slots the fifth load found
+0x24D00 and its own code at 0x3F580; launcher/helpers/extract_spu_raw.py registers them). With four slots the fifth load found
 none free ("[spu-ovl] no free resident code span") and that module ran in the interpreter. The count is a named
 constant now; spu_context grows (the module must be rebuilt). The #654 fixture's drop-residency mutant
 (tools/test_spu_overlay_allsize.py --mutants) names the loop by the constant too.

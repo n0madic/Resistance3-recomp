@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Test of host/r3_input.cpp: the mouse look's hook with a fake guest memory (the hero, the camera, the FOV and the
  * player's Options > Controls at the game's addresses).

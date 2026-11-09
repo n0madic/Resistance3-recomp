@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Game-specific hooks: the PRX loading hook main.cpp calls once the lifted function table is registered.
  * Resistance 3 lifts no system PRX; the HLE library and r3_hle.cpp answer those modules.

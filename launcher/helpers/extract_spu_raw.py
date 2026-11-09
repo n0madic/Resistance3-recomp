@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Extracts the SPU code that is not an ELF from EBOOT.elf: SPURS policy modules and WWS job modules.
 
 usage: extract_spu_raw.py <EBOOT.elf> --tools <sdk/tools> --images <dir> --jobmods <dir> --ig-manifest <json>

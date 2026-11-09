@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Test of host/r3_controls.cpp: the controls file's parser and writer, and its registration with cellPad (faked here:
  * the test provides the two cellPad calls the file makes, with a built-in table of its own).

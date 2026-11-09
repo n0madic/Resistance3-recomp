@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Resistance 3 -- controls.txt: the keyboard and mouse bindings the player can change.
  *

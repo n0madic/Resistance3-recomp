@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Resistance 3 -- the host's own reads and writes of guest memory (big-endian words at vm_base + ea).
  *

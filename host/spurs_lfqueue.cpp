@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * The SPURS lock-free queue calls the game makes from the PPU (ported from the Soulcalibur II HD port).
  *

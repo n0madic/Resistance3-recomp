@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Writes the game-independent ppu_recomp.h that the host binary is built against.
 
 usage: make_host_header.py <toolkit dir> <out header>

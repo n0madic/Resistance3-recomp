@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Test of host/r3_glyphs.cpp: which key each of the game's button icons shows, the images, and the patching of the
  * game's icon table in a fake guest memory.

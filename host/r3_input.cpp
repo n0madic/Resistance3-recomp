@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Resistance 3 -- what the keyboard layout needs to know about the game (cellPad's fps layout, patches/input).
  *

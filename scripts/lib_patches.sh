@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Sourced by build_host.sh and check_patches.sh: which toolkit patches apply on this host, in which order.
 #
 # patches/upstream/*.patch are open pull requests of the toolkit, imported as they are (dropped once the pinned revision
