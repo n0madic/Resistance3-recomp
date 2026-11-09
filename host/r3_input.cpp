@@ -22,6 +22,14 @@
  * tan(fov/2) to the hip view's (R3_ZOOM_SENS = 1, matched; 0 = off; 2 = squared), as a PC shooter does, so it covers
  * the same part of the screen zoomed or not. The idea is the Resistance 2 port's (MIT, github.com/
  * miroslavdanutalexandru-alt/Resistance2Port, project/stubs.cpp port_mouselook).
+ *
+ * The mouse also follows the player's Options > Controls (R3_OPTIONS, player 1's block of the game's settings; found by
+ * toggling each row in the menu and diffing memory). Camera Speed (a float 0..1 on a slider in tenths, default 0.5)
+ * scales the stick's turn rate by 0.5 + speed, both ways: measured at full deflection with the settings written live,
+ * 45.7, 68.6, 91.5, 115.4 and 139.6 degrees/s across at 0, 0.25, 0.5, 0.75 and 1, and 32, 48, 65, 82 and 98 up and
+ * down. The mouse takes that factor relative to the default, so 0.5 leaves it as it was. Invert-X and Invert-Y flip
+ * the stick's axis, and the mouse's with it. Camera Acceleration only shapes how the stick ramps up; a mouse has no
+ * ramp, so it is not followed. R3_GAME_SETTINGS=0 turns all of this off.
  */
 
 #include <cmath>
@@ -53,6 +61,12 @@ constexpr uint32_t R3_VIEW_FOV   = 0x0105B5F0u;   /* the view's horizontal field
 
 constexpr double R3_HIP_FOV_DEG  = 74.0;          /* ...when not aiming */
 constexpr double R3_ZOOM_SENS_MAX = 2.0;
+
+constexpr uint32_t R3_OPTIONS         = 0x011CB200u;   /* player 1's Options > Controls */
+constexpr uint32_t R3_OPT_INVERT_X    = R3_OPTIONS + 0x03u;   /* byte, 1 = on */
+constexpr uint32_t R3_OPT_INVERT_Y    = R3_OPTIONS + 0x07u;   /* byte, 1 = on */
+constexpr uint32_t R3_OPT_CAMERA_SPEED = R3_OPTIONS + 0x08u;  /* float 0..1, 0.5 by default */
+constexpr double R3_CAMERA_SPEED_BASE = 0.5;      /* the stick's rate is proportional to this plus the speed */
 
 constexpr double R3_PITCH_LIMIT_DEG = 80.0;       /* inside the game's own clamp */
 /* How far the matrix may be from a rotation (unit rows, right angles, upright, no roll). */
@@ -135,6 +149,23 @@ double r3_zoom_scale()
     return std::pow(std::tan(fov * rad) / std::tan(R3_HIP_FOV_DEG * rad), r3_zoom_strength());
 }
 
+/* What the player's Options > Controls does to a turn: the factor for the yaw and the pitch (the sign is the Invert
+ * rows). 1 and 1 with the settings at their defaults, and when they are not followed (R3_GAME_SETTINGS=0) or do not
+ * read as settings (the speed outside 0..1, also NaN: before the profile is loaded). */
+struct LookFactors { double yaw, pitch; };
+
+LookFactors r3_game_look()
+{
+    static const bool follow = [] {
+        const char* e = std::getenv("R3_GAME_SETTINGS");
+        return !(e && e[0] == '0');
+    }();
+    if (!follow) return { 1.0, 1.0 };
+    const double speed = load_f32(R3_OPT_CAMERA_SPEED);
+    const double k = speed >= 0.0 && speed <= 1.0 ? (R3_CAMERA_SPEED_BASE + speed) / (R3_CAMERA_SPEED_BASE + 0.5) : 1.0;
+    return { vm_base[R3_OPT_INVERT_X] == 1 ? -k : k, vm_base[R3_OPT_INVERT_Y] == 1 ? -k : k };
+}
+
 int r3_in_menu(void)
 {
     return vm_base[R3_UI_MENU_FLAG] != 0 && vm_base[R3_PRESS_START_FLAG] == 0;
@@ -183,8 +214,9 @@ int r3_mouse_look(double yaw_deg, double pitch_deg)
     if (!rows) return 0;
 
     const double zoom = r3_zoom_scale();
-    yaw_deg *= zoom;
-    pitch_deg *= zoom;
+    const LookFactors game = r3_game_look();
+    yaw_deg *= zoom * game.yaw;
+    pitch_deg *= zoom * game.pitch;
 
     const double yaw = -yaw_deg * M_PI / 180.0, cy = std::cos(yaw), sy = std::sin(yaw);
     for (Vec3* v : { &r, &u, &f }) *v = { v->x * cy + v->z * sy, v->y, v->z * cy - v->x * sy };

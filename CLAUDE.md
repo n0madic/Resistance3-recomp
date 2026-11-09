@@ -222,6 +222,11 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     of tan(fov/2) so it covers the same part of the screen zoomed or not (`R3_ZOOM_SENS`: 1 matched, 0 off, 2
     squared; idea from the Resistance 2 port, MIT). The hero object is looked up in two slots: the game zeroes
     the first at the hero's death and does not set it again (`host/r3_input.cpp`).
+    The mouse follows the player's Options > Controls (the game's block at 0x011CB200): Camera Speed scales it by
+    (0.5 + speed) / 1, which is how the stick's turn rate depends on it (measured with the setting written live), and
+    Invert-X / Invert-Y flip it; Camera Acceleration is not followed (a mouse has no ramp). `R3_GAME_SETTINGS=0` turns
+    it off. Test of the hook against a fake guest memory: `cmake --build build/host --target test_r3_input &&
+    build/host/test_r3_input`, then again with `R3_GAME_SETTINGS=0`.
     `PAD_KEYBOARD_LAYOUT=pad` gives the pad-shaped layout (arrows, I/J/K/L camera, Z/X/A/S face buttons).
 - **Scripted input**: `PAD_FILE=<file>`, where the file holds `mask reports [lx ly rx ry]` (a report is a pad read that
   returned data, #570), e.g. `echo "0x4000 8" > f` presses cross. Add `PAD_NO_KEYBOARD=1` to a scripted run: else

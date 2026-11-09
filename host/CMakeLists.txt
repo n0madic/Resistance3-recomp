@@ -155,6 +155,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
+# The keyboard/mouse glue on its own, against a fake guest memory (see the file): not part of the default build.
+add_executable(test_r3_input EXCLUDE_FROM_ALL tests/test_r3_input.cpp r3_input.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(test_r3_input PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
 # ---------------------------------------------------------------------------
 # SDK for the module build
 # ---------------------------------------------------------------------------
