@@ -150,6 +150,11 @@ full screen. `scripts/run_game.sh --help` shows the launcher's own options.
 - `PAD_MOUSE_SENS=<value>` sets the mouse speed in degrees per point, e.g. `PAD_MOUSE_SENS=<value> make run`.
 - The mouse is scaled by the field of view, so it covers the same part of the screen zoomed or not. `R3_ZOOM_SENS=0`
   turns that off.
+- The mouse follows the game's **Options > Controls**: Camera Speed and Invert-X / Invert-Y. `R3_GAME_SETTINGS=0` turns
+  that off.
+- `controls.txt` (written next to where you start the game, with the defaults, on the first run) remaps the keys and
+  mouse buttons: one line per action, e.g. `jump = Space` or `fire = MouseLeft`. `R3_CONTROLS=<path>` names another file.
+  Mistakes are reported in the log with their line number.
 - `PAD_KEYBOARD_LAYOUT=pad` switches to a pad-shaped layout: arrows, `I` `J` `K` `L` for the camera, `Z` `X` `A` `S`
   for the face buttons.
 

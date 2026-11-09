@@ -11,16 +11,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
 
 #include "cellPad.h"   /* CELL_PAD_CTRL_* */
-
-extern "C" {
-int  cellPad_default_key_bindings(PadBinding* out, int max);
-void cellPad_set_key_bindings(const PadBinding* b, int n);
-}
 
 namespace {
 
@@ -37,13 +33,17 @@ constexpr KeyName KEYS[] = {
     {"RightAlt", 61}, {"RightCtrl", 62},
     {"F5", 96}, {"F6", 97}, {"F7", 98}, {"F3", 99}, {"F8", 100}, {"F9", 101}, {"F11", 103}, {"F10", 109},
     {"F12", 111}, {"F4", 118}, {"F2", 120}, {"F1", 122},
-    {"Home", 115}, {"PageUp", 116}, {"Delete", 117}, {"End", 119}, {"PageDown", 121},
+    {"Home", 115}, {"PageUp", 116}, {"ForwardDelete", 117}, {"End", 119}, {"PageDown", 121},
     {"Left", 123}, {"Right", 124}, {"Down", 125}, {"Up", 126},
 };
 
-/* Other spellings of the names above. */
+/* A key without a name above is spelled keyNN (its code); source_name writes it so and parse_raw_key reads it. */
+constexpr int RAW_KEY_MAX = 255;
+
+/* Other spellings of the names above. "Delete" is the Mac's key of that name, the one that backs up (Apple's kVK_Delete). */
 constexpr const char* KEY_ALIASES[][2] = {
     {"enter", "Return"}, {"esc", "Escape"}, {"control", "Ctrl"}, {"option", "Alt"}, {"spacebar", "Space"},
+    {"delete", "Backspace"}, {"del", "ForwardDelete"},
 };
 
 struct Source { int src, code; };
@@ -67,6 +67,8 @@ struct Action {
     unsigned    bits;
     const char* note;    /* what it does in Resistance 3 */
 };
+
+constexpr size_t NOTE_COLUMN = 52;   /* where the note beside an action starts in the written file */
 
 /* The order of the file. */
 constexpr Action ACTIONS[] = {
@@ -109,6 +111,17 @@ std::string trim(const std::string& s)
     return s.substr(a, b - a);
 }
 
+/* "key110": a key by its code (lower case already). */
+bool parse_raw_key(const std::string& t, Source* out)
+{
+    if (t.size() < 4 || t.size() > 6 || t.compare(0, 3, "key") != 0 || t.find_first_not_of("0123456789", 3) != std::string::npos)
+        return false;
+    const int code = std::atoi(t.c_str() + 3);
+    if (code > RAW_KEY_MAX) return false;
+    *out = {PAD_SRC_KEY, code};
+    return true;
+}
+
 bool parse_source(const std::string& token, Source* out)
 {
     std::string t = lower(token);
@@ -118,14 +131,14 @@ bool parse_source(const std::string& token, Source* out)
         if (t == lower(k.name)) { *out = {PAD_SRC_KEY, k.code}; return true; }
     for (const PointerName& p : POINTERS)
         if (t == lower(p.name)) { *out = p.s; return true; }
-    return false;
+    return parse_raw_key(t, out);
 }
 
 std::string source_name(const PadBinding& b)
 {
     if (b.src == PAD_SRC_KEY) {
         for (const KeyName& k : KEYS) if (k.code == b.code) return k.name;
-        return "key" + std::to_string(b.code);   /* not a name we know; never parsed back */
+        return "key" + std::to_string(b.code);   /* parse_raw_key reads it back (up to RAW_KEY_MAX) */
     }
     for (const PointerName& p : POINTERS) if (p.s.src == b.src && p.s.code == b.code) return p.name;
     return "?";
@@ -144,6 +157,17 @@ const Action* action_of(unsigned bits)
     for (const Action& a : ACTIONS) if (a.bits == bits) return &a;
     return nullptr;
 }
+
+/* Two sources are the same input when they are the same key or button, or when one is the wheel either way and the other
+ * is the wheel. */
+bool same_source(const PadBinding& a, const PadBinding& b)
+{
+    if (a.src != b.src) return false;
+    return a.code == b.code || (a.src == PAD_SRC_WHEEL && (a.code == 0 || b.code == 0));
+}
+
+/* What the file says about one action: its keys, and the line that says it. */
+struct Listing { std::vector<Source> keys; int line; };
 
 std::vector<std::string> split_list(const std::string& s)
 {
@@ -170,8 +194,7 @@ int apply_controls(const std::string& text_in, std::vector<PadBinding>* table, s
     std::string text = text_in;
     if (text.compare(0, 3, "\xEF\xBB\xBF") == 0) text.erase(0, 3);   /* a byte order mark */
 
-    std::map<unsigned, std::vector<Source>> listed;   /* action -> its keys, as the file lists them */
-    std::map<unsigned, int> listed_at;
+    std::map<unsigned, Listing> listed;   /* action -> what the file lists for it */
     std::istringstream in(text);
     std::string line;
     int no = 0;
@@ -189,39 +212,51 @@ int apply_controls(const std::string& text_in, std::vector<PadBinding>* table, s
         const std::string name = trim(line.substr(0, eq));
         const Action* a = find_action(name);
         if (!a) { complain(no, "unknown action '" + name + "'"); continue; }
-        if (listed.count(a->bits))
-            complain(no, "'" + name + "' is listed again (first on line " + std::to_string(listed_at[a->bits]) +
-                         "): this line wins");
+        const std::vector<std::string> tokens = split_list(line.substr(eq + 1));
         std::vector<Source> keys;
-        for (const std::string& tok : split_list(line.substr(eq + 1))) {
+        for (const std::string& tok : tokens) {
             Source s;
             if (!parse_source(tok, &s)) { complain(no, "unknown key '" + tok + "'"); continue; }
             if (std::none_of(keys.begin(), keys.end(), [&](const Source& k) { return k.src == s.src && k.code == s.code; }))
                 keys.push_back(s);
         }
-        listed[a->bits] = keys;
-        listed_at[a->bits] = no;
+        /* Only keys it does not know: a slip, not a wish to unbind (an empty list says that). The action keeps its own. */
+        if (!tokens.empty() && keys.empty()) {
+            complain(no, "none of the keys of '" + name + "' is known: it keeps its defaults");
+            continue;
+        }
+        const auto before = listed.find(a->bits);
+        if (before != listed.end())
+            complain(no, "'" + name + "' is listed again (first on line " + std::to_string(before->second.line) +
+                         "): this line wins");
+        listed[a->bits] = { keys, no };
     }
 
-    for (const auto& [bits, keys] : listed) {
+    for (const auto& [bits, listing] : listed) {
         table->erase(std::remove_if(table->begin(), table->end(), [&](const PadBinding& b) { return b.action == bits; }),
                      table->end());
-        for (const Source& s : keys) table->push_back({s.src, s.code, bits});
+        for (const Source& s : listing.keys) table->push_back({s.src, s.code, bits});
     }
 
-    /* A key on two actions is allowed (sprint and crouch on one key is a choice) but is more often a slip. */
-    if (problems && !listed.empty()) {
-        for (size_t i = 0; i < table->size(); i++) {
-            const PadBinding& b = (*table)[i];
-            for (size_t j = i + 1; j < table->size(); j++) {
-                const PadBinding& c = (*table)[j];
-                if (c.src != b.src || c.code != b.code || c.action == b.action) continue;
-                const Action* x = action_of(b.action);
-                const Action* y = action_of(c.action);
-                problems->push_back(source_name(b) + " is bound to both " + (x ? x->name : "?") + " and " +
-                                    (y ? y->name : "?"));
+    if (problems) {
+        /* A key on two actions is allowed (sprint and crouch on one key is a choice) but is more often a slip. */
+        if (!listed.empty()) {
+            for (size_t i = 0; i < table->size(); i++) {
+                const PadBinding& b = (*table)[i];
+                for (size_t j = i + 1; j < table->size(); j++) {
+                    const PadBinding& c = (*table)[j];
+                    if (!same_source(b, c) || c.action == b.action) continue;
+                    const Action* x = action_of(b.action);
+                    const Action* y = action_of(c.action);
+                    problems->push_back(source_name(b) + " is bound to both " + (x ? x->name : "?") + " and " +
+                                        (y ? y->name : "?"));
+                }
             }
         }
+        /* cellPad keeps the first PAD_BINDINGS_MAX; the actions applied last (the menu keys) are the ones that go. */
+        if (table->size() > (size_t)PAD_BINDINGS_MAX)
+            problems->push_back("too many bindings (" + std::to_string(table->size()) + "): cellPad takes the first " +
+                                std::to_string(PAD_BINDINGS_MAX) + ", the rest do nothing");
     }
     return (int)listed.size();
 }
@@ -236,12 +271,13 @@ std::string render_controls(const std::vector<PadBinding>& table)
            "# The mouse turns the view; its speed is PAD_MOUSE_SENS, and the game's Options > Controls (Camera Speed,\n"
            "# Invert-X/Y) apply to it.\n"
            "#\n"
-           "# Keys: A-Z, 0-9, F1-F12, Space, Return, Escape, Tab, Backspace, Shift, Ctrl, Alt, CapsLock, Home, End,\n"
-           "#       PageUp, PageDown, Delete, Up, Down, Left, Right, Minus, Equals, Comma, Period, Slash, Semicolon,\n"
-           "#       Quote, LeftBracket, RightBracket, Backslash, Grave, RightShift, RightCtrl, RightAlt;\n"
+           "# Keys: A-Z, 0-9, F1-F12, Space, Return, Escape, Tab, Backspace (also Delete), Shift, Ctrl, Alt, CapsLock,\n"
+           "#       Home, End, PageUp, PageDown, ForwardDelete, Up, Down, Left, Right, Minus, Equals, Comma, Period,\n"
+           "#       Slash, Semicolon, Quote, LeftBracket, RightBracket, Backslash, Grave, RightShift, RightCtrl,\n"
+           "#       RightAlt, keyNN (a macOS virtual key code, for a key with no name here);\n"
            "#       MouseLeft, MouseRight, MouseMiddle; WheelUp, WheelDown or Wheel (either way).\n"
            "# Actions can also be named after the pad's buttons: cross, circle, square, triangle, r1, l1, l2, r2, l3, r3.\n"
-           "# Written by the game when it is missing; delete it to get this back.\n\n";
+           "# Written by the host when it is missing; delete it to get this back.\n\n";
     size_t width = 0;
     for (const Action& a : ACTIONS) width = std::max(width, std::strlen(a.name));
     for (const Action& a : ACTIONS) {
@@ -252,7 +288,7 @@ std::string render_controls(const std::vector<PadBinding>& table)
             keys += source_name(b);
         }
         std::string left = std::string(a.name) + std::string(width - std::strlen(a.name), ' ') + " = " + keys;
-        out << left << std::string(left.size() < 52 ? 52 - left.size() : 1, ' ') << "# " << a.note << "\n";
+        out << left << std::string(left.size() < NOTE_COLUMN ? NOTE_COLUMN - left.size() : 1, ' ') << "# " << a.note << "\n";
     }
     return out.str();
 }
@@ -262,19 +298,30 @@ std::string render_controls(const std::vector<PadBinding>& table)
 extern "C" void r3_controls_register(void)
 {
     if (std::getenv("PAD_NO_KEYBOARD")) return;
+    /* Only cellPad's fps layout reads the table (the host makes it the default); say so rather than write a file that does nothing. */
+    const char* layout = std::getenv("PAD_KEYBOARD_LAYOUT");
+    if (!layout || std::strcmp(layout, "fps") != 0) {
+        std::printf("[r3] controls.txt is for PAD_KEYBOARD_LAYOUT=fps: not used\n");
+        return;
+    }
     const char* e = std::getenv("R3_CONTROLS");
     const std::string path = e && *e ? e : "controls.txt";
 
     std::vector<PadBinding> table(PAD_BINDINGS_MAX);
     table.resize((size_t)std::min(cellPad_default_key_bindings(table.data(), PAD_BINDINGS_MAX), PAD_BINDINGS_MAX));
 
-    std::ifstream in(path);
-    if (!in) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
         std::ofstream out(path);
         if (out && (out << r3::render_controls(table)))
             std::printf("[r3] wrote %s: the keyboard and mouse controls, edit it to remap\n", path.c_str());
         else
             std::printf("[r3] %s is missing and cannot be written: default controls\n", path.c_str());
+        return;
+    }
+    std::ifstream in(path);
+    if (!in) {   /* there, but not ours to read: leave it, do not write over it */
+        std::printf("[r3] %s cannot be read: default controls\n", path.c_str());
         return;
     }
     std::ostringstream text;

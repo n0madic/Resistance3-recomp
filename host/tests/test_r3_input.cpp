@@ -208,6 +208,14 @@ void test_settings_followed()
     look(10, 0, &yaw, &pitch);
     near(yaw, -10, "a speed above 1 is not a setting");
 
+    reset();   /* a block that is not settings (speed 3) is not trusted for its invert bytes either */
+    put_f32(OPTIONS + 8, 3.0f);
+    vm_base[OPTIONS + 3] = 1;
+    vm_base[OPTIONS + 7] = 1;
+    look(10, 5, &yaw, &pitch);
+    near(yaw, -10, "no settings, no Invert-X");
+    near(pitch, 5, "no settings, no Invert-Y");
+
     reset();   /* all together: aimed, fast, Y inverted */
     put_f32(VIEW_FOV, 60.198f);
     put_f32(OPTIONS + 8, 1.0f);

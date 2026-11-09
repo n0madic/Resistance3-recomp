@@ -150,8 +150,8 @@ double r3_zoom_scale()
 }
 
 /* What the player's Options > Controls does to a turn: the factor for the yaw and the pitch (the sign is the Invert
- * rows). 1 and 1 with the settings at their defaults, and when they are not followed (R3_GAME_SETTINGS=0) or do not
- * read as settings (the speed outside 0..1, also NaN: before the profile is loaded). */
+ * rows). 1 and 1 with the settings at their defaults, and when they are not followed (R3_GAME_SETTINGS=0) or the block
+ * does not read as settings: a speed outside 0..1 (or NaN) means the invert bytes are not to be trusted either. */
 struct LookFactors { double yaw, pitch; };
 
 LookFactors r3_game_look()
@@ -162,7 +162,8 @@ LookFactors r3_game_look()
     }();
     if (!follow) return { 1.0, 1.0 };
     const double speed = load_f32(R3_OPT_CAMERA_SPEED);
-    const double k = speed >= 0.0 && speed <= 1.0 ? (R3_CAMERA_SPEED_BASE + speed) / (R3_CAMERA_SPEED_BASE + 0.5) : 1.0;
+    if (!(speed >= 0.0 && speed <= 1.0)) return { 1.0, 1.0 };   /* also rejects NaN */
+    const double k = (R3_CAMERA_SPEED_BASE + speed) / (R3_CAMERA_SPEED_BASE + 0.5);
     return { vm_base[R3_OPT_INVERT_X] == 1 ? -k : k, vm_base[R3_OPT_INVERT_Y] == 1 ? -k : k };
 }
 

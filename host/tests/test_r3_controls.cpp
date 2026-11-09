@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <tuple>
 #include <unistd.h>
 #include <vector>
@@ -134,6 +135,35 @@ void test_unbind_and_problems()
     check(mentions(problems, "line 4: 'r1' is listed again (first on line 1)"), "...and by the other name");
     check(sources_of(t, CELL_PAD_CTRL_CIRCLE) == std::vector<Src>{{PAD_SRC_KEY, K_X}}, "the last line wins");
     check(sources_of(t, CELL_PAD_CTRL_R1) == std::vector<Src>{{PAD_SRC_KEY, K_D}}, "...for fire too");
+
+    /* A line whose keys are all unknown is a slip, not a request to unbind: the action keeps its defaults. */
+    t = fake_defaults();
+    problems.clear();
+    const int m = r3::apply_controls("jump = Spce\nfire = F\n", &t, &problems);
+    check(m == 1, "a line with only unknown keys does not count as listed");
+    check(mentions(problems, "line 1: none of the keys of 'jump' is known: it keeps its defaults"), "...and says so");
+    check(sources_of(t, CELL_PAD_CTRL_CROSS) == std::vector<Src>{{PAD_SRC_KEY, K_SPACE}}, "...and jump is not left unbound");
+
+    t = fake_defaults();
+    problems.clear();
+    r3::apply_controls("jump = Spce\njump = X\n", &t, &problems);
+    check(!mentions(problems, "listed again"), "a skipped line does not make the next one a repeat");
+    check(sources_of(t, CELL_PAD_CTRL_CROSS) == std::vector<Src>{{PAD_SRC_KEY, K_X}}, "...and the next one binds");
+}
+
+void test_key_names()
+{
+    auto t = fake_defaults();
+    std::vector<std::string> problems;
+    r3::apply_controls("crouch = Delete\njump = ForwardDelete\nuse = key110, KEY7\nmelee = key256, key\n", &t, &problems);
+    check(sources_of(t, CELL_PAD_CTRL_CIRCLE) == std::vector<Src>{{PAD_SRC_KEY, K_BACKSPACE}},
+          "Delete is the Mac's key of that name, which backs up");
+    check(sources_of(t, CELL_PAD_CTRL_CROSS) == std::vector<Src>{{PAD_SRC_KEY, 117}}, "ForwardDelete is the other one");
+    check(sources_of(t, CELL_PAD_CTRL_SQUARE) == (std::vector<Src>{{PAD_SRC_KEY, K_X}, {PAD_SRC_KEY, 110}}),
+          "keyNN is a key by its code, in any case");
+    check(mentions(problems, "unknown key 'key256'") && mentions(problems, "unknown key 'key'"),
+          "a code past what a key has, or no code, is no key");
+    check(sources_of(t, CELL_PAD_CTRL_R3).size() == 2, "...and melee, with nothing known, keeps its defaults");
 }
 
 void test_conflicts()
@@ -148,6 +178,27 @@ void test_conflicts()
     problems.clear();
     r3::apply_controls("weapons = Wheel, WheelUp\n", &t, &problems);
     check(problems.empty(), "wheel entries overlapping each other are not conflicts");
+
+    t = fake_defaults();
+    problems.clear();
+    r3::apply_controls("aim = WheelUp\n", &t, &problems);   /* weapons keeps Wheel, which is either way */
+    check(mentions(problems, "Wheel is bound to both weapons and aim"), "WheelUp overlaps another action's Wheel");
+
+    t = fake_defaults();
+    problems.clear();
+    r3::apply_controls("weapons = Q\naim = WheelUp\ngrenade = WheelDown\n", &t, &problems);
+    check(problems.empty(), "WheelUp and WheelDown on two actions are two inputs");
+}
+
+void test_table_limit()
+{
+    std::vector<PadBinding> t;
+    for (int i = 0; i < PAD_BINDINGS_MAX - 1; i++) t.push_back({PAD_SRC_KEY, 200 + i, CELL_PAD_CTRL_SQUARE});
+    std::vector<std::string> problems;
+    r3::apply_controls("fire = F\n", &t, &problems);         /* exactly PAD_BINDINGS_MAX */
+    check(problems.empty(), "a table that fills cellPad's is not too big");
+    r3::apply_controls("jump = Space\n", &t, &problems);     /* one more */
+    check(mentions(problems, "too many bindings (129)"), "one past it is reported");
 }
 
 void test_render_roundtrip()
@@ -163,6 +214,15 @@ void test_render_roundtrip()
     check(problems.empty(), "the rendered file reads without a problem");
     check(n == 22, "it lists every action");
     check(keys_of(t) == keys_of(base), "and says what the table did");
+
+    auto odd = base;
+    odd.push_back({PAD_SRC_KEY, 110, CELL_PAD_CTRL_SQUARE});   /* a key the file has no name for */
+    const std::string odd_text = r3::render_controls(odd);
+    check(odd_text.find("key110") != std::string::npos, "a key without a name is written by its code");
+    std::vector<PadBinding> t2;
+    problems.clear();
+    r3::apply_controls(odd_text, &t2, &problems);
+    check(problems.empty() && keys_of(t2) == keys_of(odd), "...and read back");
 }
 
 /* The registration: the file is made when missing and loaded when there. */
@@ -176,6 +236,7 @@ void test_register()
     setenv("R3_CONTROLS", path.c_str(), 1);
 
     unsetenv("PAD_NO_KEYBOARD");
+    setenv("PAD_KEYBOARD_LAYOUT", "fps", 1);
     g_set_calls = 0;
     r3_controls_register();
     check(access(path.c_str(), F_OK) == 0, "a missing file is written");
@@ -191,6 +252,24 @@ void test_register()
     check(sources_of(g_set, CELL_PAD_CTRL_R1).size() == 2, "fire has two keys");
     check(sources_of(g_set, CELL_PAD_CTRL_START) == std::vector<Src>{{PAD_SRC_KEY, 35}}, "start has P");
     check(sources_of(g_set, CELL_PAD_CTRL_CROSS).size() == 1, "the rest is as before");
+
+    /* A file that is there but cannot be read is left alone, not written over with the defaults. */
+    const std::string edited = read_all(path);
+    chmod(path.c_str(), 0200);
+    if (access(path.c_str(), R_OK) != 0) {                   /* (as root it would read anyway) */
+        const int calls = g_set_calls;
+        r3_controls_register();
+        check(g_set_calls == calls, "an unreadable file gives cellPad nothing");
+        chmod(path.c_str(), 0600);
+        check(read_all(path) == edited, "...and is not written over");
+    }
+    chmod(path.c_str(), 0600);
+
+    setenv("PAD_KEYBOARD_LAYOUT", "pad", 1);                 /* the pad layout does not read the table */
+    std::remove(path.c_str());
+    r3_controls_register();
+    check(access(path.c_str(), F_OK) != 0 && g_set_calls == 2, "another layout leaves it alone");
+    setenv("PAD_KEYBOARD_LAYOUT", "fps", 1);
 
     setenv("PAD_NO_KEYBOARD", "1", 1);                       /* a scripted run: not touched */
     std::remove(path.c_str());
@@ -221,7 +300,9 @@ int main()
     test_replace_and_keep();
     test_spelling();
     test_unbind_and_problems();
+    test_key_names();
     test_conflicts();
+    test_table_limit();
     test_render_roundtrip();
     test_register();
     std::printf("%d checks, %d failed\n", g_checks, g_failed);
