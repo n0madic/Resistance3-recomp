@@ -1,0 +1,233 @@
+SPURS: a workload's ready count is not spent on admission; SPURS_IDLE_PROBE=0 turns the idle probes off.
+
+Resistance 3's WWS job manager asserts "IsListFinished()" (joblist.cpp 91 and 297, jobarraycontainer.cpp 105), 10-27
+times a run: before it resets a job list it requires the list's workload to report readyCount 0 and contention 0
+(cellSpursGetWorkloadInfo). The PPU asks for the "no name" list's workload with cellSpursReadyCountStore(wid, 1)
+and its policy module stores the count back to 0 once the list is drained. The kernel spent the count on the first
+admission, so the jobs added after that ran only when an idle probe happened to admit the workload: in a 170 s run
+to Haven the probes found work 117763 times, the count 8480. The probes of the two SharedList workloads never found
+work, and a check that caught any probe in progress (contention 1) asserted.
+
+The ready count now stays as the guest wrote it: the workload is admitted while the count exceeds its contention
+(the SPU count it asks for, as the Cell SDK describes cellSpursReadyCountStore). Signal bits and the workload flag are
+still consumed on admission. SPURS_IDLE_PROBE=0 skips the probes (default on, as before); the host sets it.
+With both: no assert in two 230 s runs, Haven loads and plays (with the count kept but no probes before this, the
+level load hung on the "HAVEN, OK" card; without the count kept, the probes are what fed the list).
+
+Test: tools/test_spurs_ready_count.py (new, manufactured policy modules on the real scheduler, probes off): a
+workload with no count is not admitted; one store of 1 serves three admissions until the module clears it, then
+nothing runs it (fails before: one admission); a count of 1 admits one SPU of two, 2 the second.
+test_spurs_scheduler and test_spurs_coordinator_kick pass unchanged.
+
+Upstream: not proposed yet (upstream's kernel consumes the count on purpose, dbff6e08; its comment cites another
+title that kicks with inlined atomics).
+---
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 948125b0..5212f42b 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1962,5 +1962,10 @@ s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
+  * calls an API for it beyond cellSpursReadyCountStore). The kernel thread
+- * polls those real BE fields, consumes one ready unit (decrement / clear the
+- * signal bit, like the real kernel's dispatch), and runs the workload's
+- * policy module to completion via spu_run_policy_module.
++ * polls those real BE fields and runs the workload's policy module to
++ * completion via spu_run_policy_module. A signal bit and the workload flag are
++ * consumed on admission; the ready count is not: it is the number of SPUs the
++ * workload asks for, and the workload stays runnable while it exceeds the
++ * workload's contention. Its own policy module stores it back to zero when it
++ * runs out of work (Resistance 3's WWS job manager does; a count spent on
++ * admission left later jobs to the idle probes and a probe's contention
++ * tripped the game's IsListFinished() checks).
+  * -----------------------------------------------------------------------*/
+@@ -2007,2 +2012,15 @@ static WklPm* spurs_resolve_pm(u32 wid)
+ 
++/* SPURS_IDLE_PROBE=0: no idle probes. Only a ready count above the
++ * workload's contention, a signal bit or the workload flag admits a policy
++ * module, as on the real kernel. */
++static int spurs_idle_probe(void)
++{
++    static int s_on = -1;
++    if (s_on < 0) {
++        const char* e = getenv("SPURS_IDLE_PROBE");
++        s_on = !(e && *e == '0');
++    }
++    return s_on;
++}
++
+ /* SPURS_IDLE_MAX=<n> (default 4, 0..8): cap of the idle back-off, as log2 of
+@@ -2114,10 +2132,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                               vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
+-                int kicked = ready || (signal & wkl_signal_bit(wid)) || flagged;
++                int kicked = ready > si->active[wid] || (signal & wkl_signal_bit(wid)) || flagged;
+                 if (kicked) si->idle[wid] = 0;
+-                if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
++                if (!kicked && (kick_pass || !spurs_idle_probe() ||
++                                (si->pass_no & ((1u << si->idle[wid]) - 1))))
+                     continue;
+                 spu_lockline_lock();
+-                ready = vm_read8(ea + wkl_ready_off(wid));
+                 signal = vm_read16(ea + wkl_signal_off(wid));
+-                if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
+                 if (signal & wkl_signal_bit(wid))
+diff --git a/tests/test_spurs_ready_count.c b/tests/test_spurs_ready_count.c
+new file mode 100644
+index 00000000..4c75e5ae
+--- /dev/null
++++ b/tests/test_spurs_ready_count.c
+@@ -0,0 +1,128 @@
++/* The SPURS kernel does not spend a workload's ready count on admission: the
++ * count is the number of SPUs the workload asks for, it stays runnable while the
++ * count exceeds its contention, and its own policy module stores the count back
++ * to zero when it runs out of work. With SPURS_IDLE_PROBE=0 nothing else admits
++ * it. Manufactured policy modules on the real scheduler; no game code. */
++#define spu_workload_dispatch_async fixture_unbounded_dispatch
++#include "../libs/spurs/cellSpurs.c"
++#undef spu_workload_dispatch_async
++#include <assert.h>
++#include <stdatomic.h>
++
++void spu_indirect_branch(spu_context*);
++uint8_t* vm_base;
++uint32_t ppu_vm_size = 0x20000;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi, g_barrier_sync_watch;
++uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
++unsigned long long ps3_ms_now(void) { LARGE_INTEGER n, f; QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f); return n.QuadPart * 1000 / f.QuadPart; }
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t ts, uint32_t id, uint32_t spu, uint32_t tag)
++{ (void)ls; (void)ts; (void)id; (void)spu; (void)tag; return 0; }
++void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; }
++void ydkj_wake_all_event_flags(void) {}
++void sys_event_queue_cancel_by_id(u32 id) { (void)id; }
++void sys_event_queue_uncancel_by_id(u32 id) { (void)id; }
++int fixture_unbounded_dispatch(const uint8_t* pm, uint32_t size, uint32_t data)
++{ (void)pm; (void)size; (void)data; assert(!"unbounded dispatch"); return 0; }
++
++#define SPURS ((CellSpurs*)0x1000)
++#define SPURS_EA 0x1000u
++#define JOBS_PER_KICK 3u
++
++static atomic_uint runs, held, peak, gate;
++
++static void exit_to_kernel(spu_context* c) { c->pc = SPURS_PM_EXIT_TO_KERNEL_LS; spu_indirect_branch(c); }
++
++/* A job manager with JOBS_PER_KICK jobs, one per run: the run that takes the
++ * last one stores the ready count back to zero, as a drained WWS list does. */
++static void drain_policy(spu_context* c)
++{
++    u32 ea = spu_ls_read32(c, 0x1C4), wid = spu_ls_read32(c, 0x1DC);
++    if (atomic_fetch_add(&runs, 1) + 1 == JOBS_PER_KICK) {
++        spu_lockline_lock();
++        vm_base[ea + wkl_ready_off(wid)] = 0;
++        ef_line_end(ea);
++    }
++    exit_to_kernel(c);
++}
++
++/* Holds its SPU until the gate opens; counts how many run at once. */
++static void held_policy(spu_context* c)
++{
++    unsigned n = atomic_fetch_add(&held, 1) + 1, p = atomic_load(&peak);
++    while (p < n && !atomic_compare_exchange_weak(&peak, &p, n)) {}
++    while (!atomic_load(&gate)) Sleep(1);
++    atomic_fetch_sub(&held, 1);
++    u32 ea = spu_ls_read32(c, 0x1C4), wid = spu_ls_read32(c, 0x1DC);
++    vm_write8(ea + 0x80 + wid, 3);   /* leaves the runnable set */
++    exit_to_kernel(c);
++}
++
++static void wait_for(atomic_uint* v, unsigned want, const char* what)
++{
++    for (unsigned i = 0; i < 3000; i++) { if (atomic_load(v) >= want) return; Sleep(1); }
++    fprintf(stderr, "FAIL: %s (%u < %u)\n", what, atomic_load(v), want);
++    exit(1);
++}
++
++static void finalize(void)
++{
++    for (unsigned i = 0; i < 3000; i++) {
++        s32 rc = cellSpursFinalize(SPURS);
++        if (!rc) return;
++        assert((u32)rc == CELL_SPURS_CORE_ERROR_BUSY);
++        Sleep(1);
++    }
++    assert(!"finalize");
++}
++
++static void register_pm(unsigned ea, unsigned byte, spu_lifted_entry_fn fn, int image)
++{
++    memset(vm_base + ea, byte, 16);
++    spu_workload_register_img(spu_workload_fingerprint(vm_base + ea, 16), fn, image, "ready count fixture");
++}
++
++int main(void)
++{
++    setenv("SPURS_IDLE_PROBE", "0", 1);
++    vm_base = calloc(1, ppu_vm_size);
++    assert(vm_base);
++    register_pm(0x9000, 0x11, drain_policy, 90);
++    register_pm(0x9100, 0x22, held_policy, 91);
++
++    /* No ready count, no signal: never admitted. */
++    assert(cellSpursInitialize(SPURS, 1, 0, 0, 0) == 0);
++    assert(cellSpursAddWorkload(SPURS, (u32*)0x8000, (void*)0x9000, 16, 0, NULL, 1, 1) == 0);
++    Sleep(30);
++    assert(atomic_load(&runs) == 0);
++
++    /* One store of 1 serves every job: the count survives each admission until
++     * the module itself clears it, and then nothing runs it again. */
++    assert(cellSpursReadyCountStore(SPURS, 0, 1) == 0);
++    wait_for(&runs, JOBS_PER_KICK, "ready count spent on the first admission");
++    Sleep(30);
++    assert(atomic_load(&runs) == JOBS_PER_KICK);
++    assert(vm_read8(SPURS_EA + SPURS_WKL_READY1) == 0);
++    assert(vm_read8(SPURS_EA + SPURS_WKL_CURCONT) == 0);
++    vm_write8(SPURS_EA + 0x80, 3);
++    finalize();
++    puts("SPURS ready count persists across admissions until the policy module clears it PASS");
++
++    /* The count caps contention: 1 admits one SPU of two, 2 admits the second. */
++    assert(cellSpursInitialize(SPURS, 2, 0, 0, 0) == 0);
++    assert(cellSpursAddWorkload(SPURS, (u32*)0x8000, (void*)0x9100, 16, 0, NULL, 1, 2) == 0);
++    assert(cellSpursReadyCountStore(SPURS, 0, 1) == 0);
++    wait_for(&held, 1, "first SPU");
++    Sleep(30);
++    assert(atomic_load(&peak) == 1 && vm_read8(SPURS_EA + SPURS_WKL_CURCONT) == 1);
++    assert(vm_read8(SPURS_EA + SPURS_WKL_READY1) == 1);
++    assert(cellSpursReadyCountStore(SPURS, 0, 2) == 0);
++    wait_for(&held, 2, "second SPU");
++    atomic_store(&gate, 1);
++    finalize();
++    puts("SPURS ready count bounds the SPUs a workload gets PASS");
++    free(vm_base);
++    return 0;
++}
+diff --git a/tools/test_spurs_ready_count.py b/tools/test_spurs_ready_count.py
+new file mode 100755
+index 00000000..2153a7a5
+--- /dev/null
++++ b/tools/test_spurs_ready_count.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++"""SPURS ready count: kept across admissions, cleared by the policy module (SPURS_IDLE_PROBE=0)."""
++import os, platform, subprocess, tempfile
++from pathlib import Path
++if os.name == 'nt':
++    print('SKIP: POSIX fixture'); raise SystemExit(0)
++r=Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory(prefix='spurs-ready-count-') as tmp:
++    out=Path(tmp)/'test'
++    units=['spu_channels','spu_drain','spu_lockstep','spu_coherency','spu_workload',
++           'spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap',
++           'spurs_policy_blob_weak','spu_interp']
++    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',
++        '-ffunction-sections','-fdata-sections',
++        '-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections',
++        '-I'+str(r/'include'),'-I'+str(r/'runtime/spu'),'-I'+str(r/'runtime/platform'),
++        str(r/'tests/test_spurs_ready_count.c'),
++        *[str(r/'runtime/spu'/f'{u}.c') for u in units],
++        str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
++    subprocess.run([str(out)],check=True,timeout=15)

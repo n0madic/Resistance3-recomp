@@ -636,6 +636,10 @@ int main(int argc, char** argv)
      * our draw conversion, 31-46 ms a frame in the Haven fight; 0 leaves the walker's drain time out of the stamps
      * (gcm-rsx/0026), as if the RSX's own work cost nothing. */
     set_default_env("PS3RECOMP_GCM_REPORT_BUSY_SCALE", "0");
+    /* Every SPURS workload here is admitted by its ready count (kept across admissions, spurs/0005) or a signal.
+     * The kernel's idle probes found no other work; they only ran the WWS job managers with nothing to do, and a
+     * check of the game's (IsListFinished: contention must be 0) caught one in progress and asserted. */
+    set_default_env("SPURS_IDLE_PROBE", "0");
     /* The toolkit logs every guest wait ("[WAIT] event_queue_receive ...", about 10k lines a minute here) whenever
      * stderr is not a terminal, so a run with --log filled the file with them and paid for the writes on every guest
      * thread. PS3_VERBOSE=1 brings them back for debugging. */

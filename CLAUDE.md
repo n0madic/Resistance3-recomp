@@ -54,7 +54,7 @@ cmake --build <scratch>/build-tests -- -k 0     # keep going past a target that 
 ctest --test-dir <scratch>/build-tests -R gcm_put_jump --output-on-failure   # one test; drop -R for all 40
 ```
 
-Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (145 of them with
+Most toolkit tests are not in ctest: `python3 build/ps3recomp/tools/test_<name>.py` builds and runs one (146 of them with
 the patches; not `-I`: seven import sibling tool modules, which isolated mode cannot find, and fail for that reason alone).
 Some runtime unit tests (e.g. `runtime/spu/tests/test_spu_thread_ls_dma.c`) are built directly with clang from the
 toolkit dir against the runtime sources they need: the "run:" steps of `.github/workflows/macos.yml` give the line
@@ -64,7 +64,7 @@ The Metal ones that translate guest programs
 `-DPS3RECOMP_HAVE_MSL_TRANSLATION=1 -DPS3RECOMP_MSL_TRANSLATOR_ID='"<any 23 chars>"'` and `-I build/deps/prefix/include`
 (+ `/spirv_cross`), and link glslang, SPIRV, SPIRV-Tools(-opt) and the spirv-cross static libraries from
 `build/deps/prefix/lib`; without it the stub reports "translation was not built" and 32 of 37 checks fail (with it,
-133/133 pass). On the pinned v0.19.0 with the patches on, 38 of the 40 ctest tests, all 145 scripts and the 37 workflow
+133/133 pass). On the pinned v0.19.0 with the patches on, 38 of the 40 ctest tests, all 146 scripts and the 37 workflow
 tests pass (`test_metal_frame_rate` needs a usable display); `sys_fs` and `ppu_thread_join` do not link on macOS, on
 plain v0.19.0 either (`_cellGame_get_hdd_title_id`; Windows thread calls), so any other new failure is ours. A patch that moves a symbol or
 changes a code path can break a fixture's link line or stub (the loader fixtures stub `cellGcm_on_put_store`): fix the
@@ -120,6 +120,10 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     header below the PC, it misplaces the data-segment modules, which load over each other. After the 2026-10-25
     census of a long Haven firefight, what still runs interpreted there is `pm_wws`'s stores into its own code, where
     the SMC microstep hands each one to the interpreter.
+  SPURS admits a workload while its ready count exceeds its contention; the count is not spent on admission
+  (`spurs/0005`): the WWS job manager stores it back to 0 when its list is drained, and its `IsListFinished()` check
+  asserts if it finds the workload still running. The host sets `SPURS_IDLE_PROBE=0` (no idle probes of unkicked
+  workloads; with the count spent, the probes were what fed the "no name" job list).
 
   `scripts/extract_spu_raw.py` wraps the non-ELF code as ELFs for lifting. `build_module.py` generates
   `spu/igjob_regions.c`, which registers each Insomniac module's span as resident code (buffer modules as verified
