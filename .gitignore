@@ -3,6 +3,8 @@
 /*
 !/.gitignore
 !/CLAUDE.md
+!/Makefile
+!/README.md
 !/host/
 !/patches/
 !/scripts/
