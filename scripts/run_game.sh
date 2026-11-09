@@ -15,6 +15,7 @@
 # Space jump, C/Ctrl crouch, E/R reload/use, G grenade, F secondary fire, Shift sprint, arrows or 1-4 d-pad,
 # Tab select; Enter/Esc select/back in menus and start/pause elsewhere.
 # PAD_MOUSE_SENS=<degrees per point> sets the mouse speed, PAD_MOUSE_AIM_SCALE=<factor> its share while aiming.
+# controls.txt (written here with the defaults on the first run) remaps the keys: "jump = Space", "fire = MouseLeft".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,7 +33,7 @@ while [ $# -gt 0 ]; do
         --lang)
             [ $# -gt 0 ] || { echo "--lang needs a language code (see --help)" >&2; exit 2; }
             export PS3_LANG="$1"; shift ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
     esac
 done

@@ -111,6 +111,7 @@ add_executable(${PROJECT_NAME}
     stubs.cpp
     r3_hle.cpp
     r3_input.cpp
+    r3_controls.cpp
     spurs_lfqueue.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
@@ -127,6 +128,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     "${PS3RECOMP_DIR}/runtime/prx"
     "${PS3RECOMP_DIR}/runtime/platform"
     "${PS3RECOMP_DIR}/libs/video"
+    "${PS3RECOMP_DIR}/libs/input"              # pad_keymap.h, cellPad.h
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_compile_definitions(${PROJECT_NAME} PRIVATE R3_HOST_ABI="${R3_HOST_ABI}")
@@ -155,11 +157,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
-# The keyboard/mouse glue on its own, against a fake guest memory (see the file): not part of the default build.
+# The keyboard/mouse glue on its own (see the files): not part of the default build.
 add_executable(test_r3_input EXCLUDE_FROM_ALL tests/test_r3_input.cpp r3_input.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(test_r3_input PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
+add_executable(test_r3_controls EXCLUDE_FROM_ALL tests/test_r3_controls.cpp r3_controls.cpp)
+foreach(t test_r3_input test_r3_controls)
+    target_include_directories(${t} PRIVATE "${PS3RECOMP_DIR}/include" "${PS3RECOMP_DIR}/libs/input")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(${t} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+endforeach()
 
 # ---------------------------------------------------------------------------
 # SDK for the module build

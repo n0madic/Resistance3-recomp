@@ -201,7 +201,7 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
 
 ## Running/debugging knobs
 
-- **Keyboard and mouse** (the keyboard fallback is upstream, #612; cellPad's fps layout is `patches/input/0004`; the game never reads cellMouse. In play the
+- **Keyboard and mouse** (the keyboard fallback is upstream, #612; cellPad's fps layout is `patches/input/0004`, its keys a table the host can replace, `patches/input/0008`; the game never reads cellMouse. In play the
   mouse turns the hero's orientation matrix directly, `host/r3_input.cpp` via `patches/input/0006`; in menus and
   cutscenes it moves the right stick, capped at the game's top stick rate):
   - WASD walk, mouse look (cursor captured while the window is in front and no menu is up, `patches/input/0007`;
@@ -227,6 +227,15 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     Invert-X / Invert-Y flip it; Camera Acceleration is not followed (a mouse has no ramp). `R3_GAME_SETTINGS=0` turns
     it off. Test of the hook against a fake guest memory: `cmake --build build/host --target test_r3_input &&
     build/host/test_r3_input`, then again with `R3_GAME_SETTINGS=0`.
+  - `controls.txt` remaps the keys, mouse buttons and wheel: one line `action = key, key` each (`jump = Space`,
+    `fire = MouseLeft`; the pad's names `cross`, `r1`, ... work too). An action it lists gets exactly those keys, an
+    empty list unbinds it, one it leaves out keeps its defaults; mistakes are named with their line in the host log
+    (`[r3] controls.txt: line 3: ...`). The file is in the working directory (`R3_CONTROLS=<path>` for another one),
+    written with the defaults when missing, and not tracked. `host/r3_controls.cpp` (key names are macOS virtual key
+    codes) hands the table to cellPad's `cellPad_set_key_bindings`; the aim scale (`PAD_MOUSE_AIM_SCALE`) follows L1
+    wherever it is bound. Test: `cmake --build build/host --target test_r3_controls && build/host/test_r3_controls`.
+    Not tried with the real keys in the game window: the checks drive the table and the parser (a synthetic Return
+    through System Events did not reach the game).
     `PAD_KEYBOARD_LAYOUT=pad` gives the pad-shaped layout (arrows, I/J/K/L camera, Z/X/A/S face buttons).
 - **Scripted input**: `PAD_FILE=<file>`, where the file holds `mask reports [lx ly rx ry]` (a report is a pad read that
   returned data, #570), e.g. `echo "0x4000 8" > f` presses cross. Add `PAD_NO_KEYBOARD=1` to a scripted run: else

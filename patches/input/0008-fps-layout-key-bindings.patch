@@ -1,0 +1,393 @@
+cellPad: the fps layout reads its keys through a table of bindings the host can replace (pad_keymap.h).
+
+The fps layout's keys, mouse buttons and wheel were a fixed map in pad_keyboard_fps, and a player of Resistance 3 who
+wants crouch on another key, fire on a side button or the movement keys somewhere else has no way to say so. Now the
+layout is a table of bindings: a source (a key, a mouse button, one way of the wheel) that presses an action (a pad
+button, a direction of the left stick, or CONFIRM/BACK, which are CROSS/CIRCLE while a menu is up and START otherwise
+and keep what they got until the key is released). The built-in table is the layout as it was;
+cellPad_default_key_bindings copies it out for a host to start from and cellPad_set_key_bindings replaces it. The
+host's own key names and file are its business (Resistance 3: host/r3_controls.cpp). The mouse's aim scale
+(PAD_MOUSE_AIM_SCALE) follows L1 instead of the right mouse button, so it still means "while aiming" when the aim
+button is bound elsewhere.
+
+Test: libs/input/tests/test_pad_keyboard_fps.c test_bindings (the table copied out, a replacement, entries without a
+source or an action skipped, the cap, CONFIRM/BACK on other keys, a wheel direction of its own, aim on a key); the
+older checks pass unchanged, as do the other pad tests and tools/test_pad_file_reports.py. Only the macOS key codes are
+exercised here; the table holds each host's own key codes as before.
+
+Upstream: not proposed yet.
+---
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index f60049e2..f22f14e7 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -23,2 +23,3 @@
+ #include "pad_mouse.h"
++#include "pad_keymap.h"
+ 
+@@ -505,4 +506,4 @@ void cellPad_set_mouse_look(int (*look)(double yaw_deg, double pitch_deg)) { s_m
+ 
+-/* Mouse motion -> the view: through the host's look hook if it takes it, else the right stick. */
+-static void pad_mouse_view(const PadMouseInput* m, double dt, PadHostState* hs)
++/* Mouse motion -> the view: through the host's look hook if it takes it, else the right stick. `aiming`: L1 is held. */
++static void pad_mouse_view(const PadMouseInput* m, double dt, PadHostState* hs, int aiming)
+ {
+@@ -511,3 +512,3 @@ static void pad_mouse_view(const PadMouseInput* m, double dt, PadHostState* hs)
+     if (s_mouse_look && (m->dx || m->dy)) {
+-        const double deg = pad_mouse_sens() * ((m->buttons & PAD_MOUSE_RIGHT) ? aim_scale : 1.0);
++        const double deg = pad_mouse_sens() * (aiming ? aim_scale : 1.0);
+         if (s_mouse_look(m->dx * deg, -m->dy * deg)) {
+@@ -520,12 +521,71 @@ static void pad_mouse_view(const PadMouseInput* m, double dt, PadHostState* hs)
+ 
++/* The fps layout's bindings (pad_keymap.h). The built-in table is the layout below; a host replaces it with
++ * cellPad_set_key_bindings. */
++static const PadBinding s_default_bindings[] = {
++    { PAD_SRC_KEY, PADKEY_W,         PAD_ACT_MOVE_UP },       { PAD_SRC_KEY, PADKEY_S,      PAD_ACT_MOVE_DOWN },
++    { PAD_SRC_KEY, PADKEY_A,         PAD_ACT_MOVE_LEFT },     { PAD_SRC_KEY, PADKEY_D,      PAD_ACT_MOVE_RIGHT },
++    { PAD_SRC_KEY, PADKEY_SPACE,     CELL_PAD_CTRL_CROSS },
++    { PAD_SRC_KEY, PADKEY_C,         CELL_PAD_CTRL_CIRCLE },  { PAD_SRC_KEY, PADKEY_CTRL,   CELL_PAD_CTRL_CIRCLE },
++    { PAD_SRC_KEY, PADKEY_BACKSPACE, CELL_PAD_CTRL_CIRCLE },
++    { PAD_SRC_KEY, PADKEY_E,         CELL_PAD_CTRL_SQUARE },  { PAD_SRC_KEY, PADKEY_R,      CELL_PAD_CTRL_SQUARE },
++    { PAD_SRC_KEY, PADKEY_Q,         CELL_PAD_CTRL_TRIANGLE },
++    { PAD_SRC_KEY, PADKEY_G,         CELL_PAD_CTRL_L2 },      { PAD_SRC_KEY, PADKEY_F,      CELL_PAD_CTRL_R2 },
++    { PAD_SRC_KEY, PADKEY_SHIFT,     CELL_PAD_CTRL_L3 },      { PAD_SRC_KEY, PADKEY_V,      CELL_PAD_CTRL_R3 },
++    { PAD_SRC_KEY, PADKEY_UP,        CELL_PAD_CTRL_UP },      { PAD_SRC_KEY, PADKEY_1,      CELL_PAD_CTRL_UP },
++    { PAD_SRC_KEY, PADKEY_RIGHT,     CELL_PAD_CTRL_RIGHT },   { PAD_SRC_KEY, PADKEY_2,      CELL_PAD_CTRL_RIGHT },
++    { PAD_SRC_KEY, PADKEY_DOWN,      CELL_PAD_CTRL_DOWN },    { PAD_SRC_KEY, PADKEY_3,      CELL_PAD_CTRL_DOWN },
++    { PAD_SRC_KEY, PADKEY_LEFT,      CELL_PAD_CTRL_LEFT },    { PAD_SRC_KEY, PADKEY_4,      CELL_PAD_CTRL_LEFT },
++    { PAD_SRC_KEY, PADKEY_TAB,       CELL_PAD_CTRL_SELECT },
++    { PAD_SRC_KEY, PADKEY_RETURN,    PAD_ACT_CONFIRM },       { PAD_SRC_KEY, PADKEY_ESCAPE, PAD_ACT_BACK },
++    { PAD_SRC_MOUSE, PAD_MOUSE_LEFT, CELL_PAD_CTRL_R1 },      { PAD_SRC_MOUSE, PAD_MOUSE_RIGHT, CELL_PAD_CTRL_L1 },
++    { PAD_SRC_MOUSE, PAD_MOUSE_MIDDLE, CELL_PAD_CTRL_R3 },
++    { PAD_SRC_WHEEL, 0,              CELL_PAD_CTRL_TRIANGLE },
++};
++#define PAD_DEFAULT_BINDINGS ((int)(sizeof s_default_bindings / sizeof s_default_bindings[0]))
++#define PAD_MOVE_BITS (PAD_ACT_MOVE_LEFT | PAD_ACT_MOVE_RIGHT | PAD_ACT_MOVE_UP | PAD_ACT_MOVE_DOWN)
++
++static PadBinding s_bindings[PAD_BINDINGS_MAX];
++static int        s_bindings_n = -1;                    /* -1: the built-in table */
++static u16        s_ctx_held[PAD_BINDINGS_MAX];         /* the button a CONFIRM/BACK binding's key went down with */
++
++int cellPad_default_key_bindings(PadBinding* out, int max)
++{
++    for (int i = 0; out && i < max && i < PAD_DEFAULT_BINDINGS; i++) out[i] = s_default_bindings[i];
++    return PAD_DEFAULT_BINDINGS;
++}
++
++void cellPad_set_key_bindings(const PadBinding* b, int n)
++{
++    memset(s_ctx_held, 0, sizeof s_ctx_held);
++    if (!b || n < 0) { s_bindings_n = -1; return; }
++    int k = 0;
++    for (int i = 0; i < n && k < PAD_BINDINGS_MAX; i++) {
++        if (b[i].src < PAD_SRC_KEY || b[i].src > PAD_SRC_WHEEL || !b[i].action) continue;
++        s_bindings[k++] = b[i];
++    }
++    s_bindings_n = k;
++}
++
++/* Is the binding's source down: `wheel_until` is when the last wheel click away from the user and the last one toward
++ * it stop counting. */
++static int pad_binding_down(const PadBinding* b, const PadMouseInput* m, const double wheel_until[2], double now)
++{
++    switch (b->src) {
++    case PAD_SRC_KEY:   return pad_key_down(b->code);
++    case PAD_SRC_MOUSE: return (m->buttons & (unsigned)b->code) != 0;
++    case PAD_SRC_WHEEL: return (b->code >= 0 && now < wheel_until[0]) || (b->code <= 0 && now < wheel_until[1]);
++    }
++    return 0;
++}
++
+ /* PAD_KEYBOARD_LAYOUT=fps: a PC shooter's keyboard and mouse in place of the
+- * pad-shaped layout above. WASD = left stick, mouse = the view (see
+- * pad_mouse_view), left/right/middle button = R1/L1/R3, wheel = TRIANGLE,
+- * Space = CROSS, C/Ctrl/Backspace = CIRCLE, E/R = SQUARE, Q = TRIANGLE,
+- * G/F = L2/R2, Shift = L3, V = R3, arrows and 1/2/3/4 = d-pad (up, right,
+- * down, left), Enter/Esc = CROSS/CIRCLE in a menu and START elsewhere,
+- * Tab = SELECT. What a button does is the
+- * title's; this follows the usual shooter one (R1 fires, L1 aims, L3 sprints,
+- * R3 melees). The cursor is captured while the window is in the foreground and
+- * no menu is up (cellPad_set_menu_query): in a menu it is free to reach the
++ * pad-shaped layout above, as a table of bindings (pad_keymap.h). By default:
++ * WASD = left stick, mouse = the view (see pad_mouse_view), left/right/middle
++ * button = R1/L1/R3, wheel = TRIANGLE, Space = CROSS, C/Ctrl/Backspace =
++ * CIRCLE, E/R = SQUARE, Q = TRIANGLE, G/F = L2/R2, Shift = L3, V = R3, arrows
++ * and 1/2/3/4 = d-pad (up, right, down, left), Enter/Esc = CROSS/CIRCLE in a
++ * menu and START elsewhere, Tab = SELECT. What a button does is the title's;
++ * this follows the usual shooter one (R1 fires, L1 aims, L3 sprints, R3
++ * melees). The cursor is captured while the window is in the foreground and no
++ * menu is up (cellPad_set_menu_query): in a menu it is free to reach the
+  * window's close button or another app. */
+@@ -533,36 +593,31 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+ {
+-    static const struct { int vk; u16 btn; } map[] = {
+-        { PADKEY_SPACE,  CELL_PAD_CTRL_CROSS },   { PADKEY_C,      CELL_PAD_CTRL_CIRCLE },
+-        { PADKEY_CTRL,   CELL_PAD_CTRL_CIRCLE },  { PADKEY_BACKSPACE, CELL_PAD_CTRL_CIRCLE },
+-        { PADKEY_E,      CELL_PAD_CTRL_SQUARE },  { PADKEY_R,      CELL_PAD_CTRL_SQUARE },
+-        { PADKEY_Q,      CELL_PAD_CTRL_TRIANGLE },
+-        { PADKEY_G,      CELL_PAD_CTRL_L2 },      { PADKEY_F,      CELL_PAD_CTRL_R2 },
+-        { PADKEY_SHIFT,  CELL_PAD_CTRL_L3 },      { PADKEY_V,      CELL_PAD_CTRL_R3 },
+-        { PADKEY_UP,     CELL_PAD_CTRL_UP },      { PADKEY_1,      CELL_PAD_CTRL_UP },
+-        { PADKEY_RIGHT,  CELL_PAD_CTRL_RIGHT },   { PADKEY_2,      CELL_PAD_CTRL_RIGHT },
+-        { PADKEY_DOWN,   CELL_PAD_CTRL_DOWN },    { PADKEY_3,      CELL_PAD_CTRL_DOWN },
+-        { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_4,      CELL_PAD_CTRL_LEFT },
+-        { PADKEY_TAB,    CELL_PAD_CTRL_SELECT },
+-    };
+-    static double last_s, wheel_until;
+-    u16 btns = 0;
+-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+-        if (pad_key_down(map[i].vk)) btns |= map[i].btn;
+-
+-    /* Enter and Esc confirm and go back in a menu (cellPad_set_menu_query) and press START (start, pause, skip)
+-     * elsewhere. A key keeps the button it got when it went down until it is released: Esc pauses, the pause menu
+-     * opens while the key is still held, and it must not turn into CIRCLE there and close the menu again. */
+-    static const struct { int vk; u16 menu_btn; } ctx_keys[] = {
+-        { PADKEY_RETURN, CELL_PAD_CTRL_CROSS }, { PADKEY_ESCAPE, CELL_PAD_CTRL_CIRCLE },
+-    };
+-    static u16 ctx_held[sizeof ctx_keys / sizeof ctx_keys[0]];
++    static double last_s, wheel_until[2];
+     const int in_menu = s_menu_query && s_menu_query();
+-    for (unsigned i = 0; i < sizeof ctx_keys / sizeof ctx_keys[0]; i++) {
+-        if (!pad_key_down(ctx_keys[i].vk)) ctx_held[i] = 0;
+-        else if (!ctx_held[i]) ctx_held[i] = in_menu ? ctx_keys[i].menu_btn : CELL_PAD_CTRL_START;
+-        btns |= ctx_held[i];
++    PadMouseInput m;
++    pad_mouse_poll(!in_menu, &m);
++    const double now = pad_now_s();
++    if (m.wheel > 0) wheel_until[0] = now + PAD_MOUSE_WHEEL_HOLD_S;
++    if (m.wheel < 0) wheel_until[1] = now + PAD_MOUSE_WHEEL_HOLD_S;
++
++    const PadBinding* bind = s_bindings_n < 0 ? s_default_bindings : s_bindings;
++    const int n = s_bindings_n < 0 ? PAD_DEFAULT_BINDINGS : s_bindings_n;
++    u16 btns = 0;
++    unsigned moves = 0;
++    for (int i = 0; i < n; i++) {
++        const int down = pad_binding_down(&bind[i], &m, wheel_until, now);
++        if (bind[i].action & (PAD_ACT_CONFIRM | PAD_ACT_BACK)) {
++            /* A key keeps the button it got when it went down until it is released (see pad_keymap.h). */
++            if (!down) s_ctx_held[i] = 0;
++            else if (!s_ctx_held[i])
++                s_ctx_held[i] = !in_menu ? CELL_PAD_CTRL_START
++                              : (bind[i].action & PAD_ACT_CONFIRM) ? CELL_PAD_CTRL_CROSS : CELL_PAD_CTRL_CIRCLE;
++            btns |= s_ctx_held[i];
++        } else if (down) {
++            btns |= (u16)bind[i].action;
++            moves |= bind[i].action & PAD_MOVE_BITS;
++        }
+     }
+ 
+-    const int lx = pad_key_down(PADKEY_D) - pad_key_down(PADKEY_A);
+-    const int ly = pad_key_down(PADKEY_S) - pad_key_down(PADKEY_W);
++    const int lx = !!(moves & PAD_ACT_MOVE_RIGHT) - !!(moves & PAD_ACT_MOVE_LEFT);
++    const int ly = !!(moves & PAD_ACT_MOVE_DOWN) - !!(moves & PAD_ACT_MOVE_UP);
+     hs->analog_lx = (u8)(lx < 0 ? 0 : lx > 0 ? 255 : 128);
+@@ -570,12 +625,4 @@ static u16 pad_keyboard_fps(PadHostState* hs)
+ 
+-    PadMouseInput m;
+-    pad_mouse_poll(!in_menu, &m);
+-    const double now = pad_now_s();
+-    pad_mouse_view(&m, last_s ? now - last_s : PAD_MOUSE_MAX_DT_S, hs);
++    pad_mouse_view(&m, last_s ? now - last_s : PAD_MOUSE_MAX_DT_S, hs, (btns & CELL_PAD_CTRL_L1) != 0);
+     last_s = now;
+-    if (m.buttons & PAD_MOUSE_LEFT)   btns |= CELL_PAD_CTRL_R1;
+-    if (m.buttons & PAD_MOUSE_RIGHT)  btns |= CELL_PAD_CTRL_L1;
+-    if (m.buttons & PAD_MOUSE_MIDDLE) btns |= CELL_PAD_CTRL_R3;
+-    if (m.wheel) wheel_until = now + PAD_MOUSE_WHEEL_HOLD_S;
+-    if (now < wheel_until) btns |= CELL_PAD_CTRL_TRIANGLE;
+     return btns;
+diff --git a/libs/input/pad_keymap.h b/libs/input/pad_keymap.h
+new file mode 100644
+index 00000000..9f267f3f
+--- /dev/null
++++ b/libs/input/pad_keymap.h
+@@ -0,0 +1,59 @@
++/*
++ * ps3recomp - the keyboard fallback's shooter layout as a table the host can replace
++ *
++ * PAD_KEYBOARD_LAYOUT=fps (cellPad.c) reads its keys, mouse buttons and wheel through a table of bindings: a source
++ * (a key, a mouse button, one way of the wheel) that presses an action (a pad button, a direction of the left stick, or
++ * a button that depends on whether a menu is up). cellPad.c carries a built-in table, the layout described there. A
++ * host that lets the player remap starts from cellPad_default_key_bindings, changes what it wants and hands the whole
++ * table back with cellPad_set_key_bindings, before the first poll.
++ *
++ * Plain C, no system headers: cellPad.c cannot include them (see the macOS keyboard block there).
++ */
++#ifndef PS3RECOMP_PAD_KEYMAP_H
++#define PS3RECOMP_PAD_KEYMAP_H
++
++#include "pad_mouse.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* What a binding reads (PadBinding.src) and what its code is. */
++#define PAD_SRC_KEY    1   /* a key: the host's key code, the one cellPad.c's pad_key_down takes
++                            * (macOS virtual key codes, SDL scancodes, Windows VK codes) */
++#define PAD_SRC_MOUSE  2   /* a mouse button: PAD_MOUSE_LEFT, PAD_MOUSE_RIGHT or PAD_MOUSE_MIDDLE */
++#define PAD_SRC_WHEEL  3   /* a wheel click, held for a moment so a title polling slowly sees it: +1 away from the
++                            * user, -1 toward, 0 either way */
++
++/* What a binding presses (PadBinding.action): a CELL_PAD_CTRL_* bit (the low 16 bits), or one of these. */
++#define PAD_ACT_MOVE_LEFT   0x00010000u   /* the left stick, to the left ... */
++#define PAD_ACT_MOVE_RIGHT  0x00020000u
++#define PAD_ACT_MOVE_UP     0x00040000u   /* ... and forward */
++#define PAD_ACT_MOVE_DOWN   0x00080000u   /* ... and back; opposite directions cancel */
++#define PAD_ACT_CONFIRM     0x00100000u   /* CROSS while a menu is up (cellPad_set_menu_query), START otherwise */
++#define PAD_ACT_BACK        0x00200000u   /* CIRCLE while a menu is up, START otherwise */
++/* Either of the two keeps the button it got when the key went down until the key is released: Esc pauses, the pause
++ * menu opens while it is still held, and it must not turn into CIRCLE there and close the menu again. */
++
++#define PAD_BINDINGS_MAX 128
++
++typedef struct PadBinding {
++    int      src;      /* PAD_SRC_* */
++    int      code;     /* what it is: see the source */
++    unsigned action;   /* CELL_PAD_CTRL_* or PAD_ACT_* */
++} PadBinding;
++
++/* Copies the built-in table to out[0..max) and returns its size (all of it, even when max is smaller; out may be NULL
++ * to ask only for the size). */
++int cellPad_default_key_bindings(PadBinding* out, int max);
++
++/* Replaces the table with the n bindings of b, copied; at most PAD_BINDINGS_MAX of them are taken, and one with an
++ * unknown source or no action is skipped. NULL or n < 0 goes back to the built-in table. Call before the title polls
++ * the pad: the table is not locked. */
++void cellPad_set_key_bindings(const PadBinding* b, int n);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3RECOMP_PAD_KEYMAP_H */
+diff --git a/libs/input/tests/test_pad_keyboard_fps.c b/libs/input/tests/test_pad_keyboard_fps.c
+index 29a8a31e..795085bb 100644
+--- a/libs/input/tests/test_pad_keyboard_fps.c
++++ b/libs/input/tests/test_pad_keyboard_fps.c
+@@ -3,3 +3,4 @@
+  * right-stick deflection through the title's stick curve (PAD_MOUSE_CURVE_*) or
+- * handed to the host's look hook.
++ * handed to the host's look hook, and the table of bindings the layout reads
++ * (pad_keymap.h) with the host's replacement of it.
+  *
+@@ -226,2 +227,115 @@ static void test_mouse_look_hook(void)
+ 
++/* The table of bindings: the built-in one can be copied out, a host's replaces it whole (skipping entries that name
++ * no source or no action), the aim scale follows L1 wherever it is bound, and NULL brings the built-in one back. */
++static void test_bindings(void)
++{
++    PadHostState hs;
++    memset(&hs, 0, sizeof hs);
++    memset(s_keys, 0, sizeof s_keys);
++
++    PadBinding def[PAD_BINDINGS_MAX];
++    const int nd = cellPad_default_key_bindings(NULL, 0);
++    assert(nd > 20 && nd <= PAD_BINDINGS_MAX);
++    assert(cellPad_default_key_bindings(def, PAD_BINDINGS_MAX) == nd);
++    assert(cellPad_default_key_bindings(def, 3) == nd);                 /* the whole size, 3 copied */
++    int w = 0;
++    for (int i = 0; i < nd; i++)
++        if (def[i].src == PAD_SRC_KEY && def[i].code == PADKEY_W && def[i].action == PAD_ACT_MOVE_UP) w++;
++    assert(w == 1);
++
++    const PadBinding mine[] = {
++        { PAD_SRC_KEY, PADKEY_Z, CELL_PAD_CTRL_CROSS },
++        { PAD_SRC_KEY, PADKEY_I, PAD_ACT_MOVE_UP },    { PAD_SRC_KEY, PADKEY_UP, PAD_ACT_MOVE_UP },   /* two keys */
++        { PAD_SRC_KEY, PADKEY_K, PAD_ACT_MOVE_DOWN },
++        { PAD_SRC_MOUSE, PAD_MOUSE_LEFT, CELL_PAD_CTRL_L2 },
++        { PAD_SRC_WHEEL, 1, CELL_PAD_CTRL_SQUARE },    { PAD_SRC_WHEEL, -1, CELL_PAD_CTRL_TRIANGLE },
++        { PAD_SRC_KEY, PADKEY_X, CELL_PAD_CTRL_L1 },
++        { 0, PADKEY_C, CELL_PAD_CTRL_L3 },                                /* no source: skipped */
++        { PAD_SRC_KEY, PADKEY_V, 0 },                                     /* no action: skipped */
++    };
++    cellPad_set_key_bindings(mine, (int)(sizeof mine / sizeof mine[0]));
++
++    s_keys[PADKEY_SPACE] = s_keys[PADKEY_W] = s_keys[PADKEY_C] = s_keys[PADKEY_V] = 1;   /* none of them is bound */
++    s_mouse.buttons = PAD_MOUSE_RIGHT | PAD_MOUSE_MIDDLE;
++    assert(pad_keyboard_fps(&hs) == 0 && hs.analog_ly == 128);
++    memset(s_keys, 0, sizeof s_keys);
++
++    s_keys[PADKEY_Z] = 1;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CROSS);
++    memset(s_keys, 0, sizeof s_keys);
++    s_keys[PADKEY_UP] = 1;                                              /* a key can be the stick and not the d-pad */
++    assert(pad_keyboard_fps(&hs) == 0 && hs.analog_ly == 0);
++    s_keys[PADKEY_K] = 1;                                               /* forward and back cancel */
++    assert(pad_keyboard_fps(&hs) == 0 && hs.analog_ly == 128);
++    memset(s_keys, 0, sizeof s_keys);
++    s_keys[PADKEY_I] = 1;
++    pad_keyboard_fps(&hs);
++    assert(hs.analog_ly == 0 && hs.analog_lx == 128);
++    memset(s_keys, 0, sizeof s_keys);
++
++    s_mouse.buttons = PAD_MOUSE_LEFT | PAD_MOUSE_RIGHT;                 /* the left button is L2 now, R1 is gone */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_L2);
++    s_mouse.wheel = 1;                                                  /* a wheel direction of its own */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_SQUARE);
++    sleep_s(PAD_MOUSE_WHEEL_HOLD_S + 0.02);
++    s_mouse.wheel = -1;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_TRIANGLE);
++    sleep_s(PAD_MOUSE_WHEEL_HOLD_S + 0.02);
++    assert(pad_keyboard_fps(&hs) == 0);
++
++    /* Aiming is L1, here a key: the look is scaled by PAD_MOUSE_AIM_SCALE although the right button is not down. */
++    cellPad_set_mouse_look(fake_look);
++    s_look_ok = 1;
++    s_look_calls = 0;
++    s_keys[PADKEY_X] = 1;
++    s_mouse.dx = 10;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_L1);
++    assert(s_look_calls == 1 && s_yaw == 1.25);
++    memset(s_keys, 0, sizeof s_keys);
++    s_mouse.dx = 10;
++    s_mouse.buttons = PAD_MOUSE_RIGHT;                                  /* and the right button is not aiming */
++    pad_keyboard_fps(&hs);
++    assert(s_look_calls == 2 && s_yaw == 5);
++    cellPad_set_mouse_look(NULL);
++
++    /* Menu keys follow whichever keys the host gives them, and keep their button while held. */
++    const PadBinding ctx[] = { { PAD_SRC_KEY, PADKEY_X, PAD_ACT_CONFIRM }, { PAD_SRC_KEY, PADKEY_Z, PAD_ACT_BACK } };
++    cellPad_set_key_bindings(ctx, 2);
++    cellPad_set_menu_query(fake_menu);
++    s_menu = 1;
++    s_keys[PADKEY_X] = 1;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CROSS);
++    s_menu = 0;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CROSS);
++    s_keys[PADKEY_X] = 0;
++    s_keys[PADKEY_Z] = 1;                                               /* pressed outside a menu: START */
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_START);
++    memset(s_keys, 0, sizeof s_keys);
++    assert(pad_keyboard_fps(&hs) == 0);                                 /* released: the button is forgotten */
++    s_menu = 1;
++    s_keys[PADKEY_Z] = 1;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CIRCLE);
++    memset(s_keys, 0, sizeof s_keys);
++    pad_keyboard_fps(&hs);
++    cellPad_set_menu_query(NULL);
++
++    /* More than the table holds: the first PAD_BINDINGS_MAX are used, and nothing is written past them. */
++    PadBinding many[PAD_BINDINGS_MAX + 20];
++    for (int i = 0; i < PAD_BINDINGS_MAX + 20; i++) {
++        many[i].src = PAD_SRC_KEY;
++        many[i].code = i < PAD_BINDINGS_MAX ? PADKEY_Z : PADKEY_X;
++        many[i].action = i < PAD_BINDINGS_MAX ? CELL_PAD_CTRL_CROSS : CELL_PAD_CTRL_CIRCLE;
++    }
++    cellPad_set_key_bindings(many, PAD_BINDINGS_MAX + 20);
++    s_keys[PADKEY_Z] = s_keys[PADKEY_X] = 1;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CROSS);
++    memset(s_keys, 0, sizeof s_keys);
++
++    cellPad_set_key_bindings(NULL, -1);                                 /* the built-in table again */
++    s_keys[PADKEY_SPACE] = s_keys[PADKEY_W] = 1;
++    assert(pad_keyboard_fps(&hs) == CELL_PAD_CTRL_CROSS && hs.analog_ly == 0);
++    memset(s_keys, 0, sizeof s_keys);
++    pad_keyboard_fps(&hs);
++}
++
+ /* The whole poll, unfocused (no window here): everything released, the mouse too. */
+@@ -250,2 +364,3 @@ int main(void)
+     test_mouse_look_hook();
++    test_bindings();
+     test_unfocused_releases_mouse();

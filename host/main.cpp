@@ -83,6 +83,7 @@ extern const char* ppu_vfs_root;              /* host dir the PS3 mount points m
 void     cellGame_init_from_paramsfo(const char* sfo_path);   /* title id, CATEGORY, versions */
 const char* cellGame_get_title(void);                       /* PARAM.SFO TITLE, "" without one */
 void     r3_input_register(void);         /* r3_input.cpp: what the keyboard layout asks the game */
+void     r3_controls_register(void);      /* r3_controls.cpp: controls.txt, the player's keys */
 
 /* The status the guest handed to sys_process_exit. A title that exits that way
  * never returns through ppu_run, so this is only read on the path where the
@@ -655,6 +656,7 @@ int main(int argc, char** argv)
     set_default_env("PAD_MOUSE_AIM_SCALE", R3_MOUSE_AIM_SCALE);
     /* Enter/Esc confirm and go back in the game's menus, and press START elsewhere; the mouse turns the hero. */
     r3_input_register();
+    r3_controls_register();
 
     /* Every guest program a scene meets for the first time is translated HLSL -> SPIR-V -> MSL on the thread that
      * walks the FIFO, 20-200 ms each: the opening cutscene stalled for 160-360 ms on the same frames of every run
