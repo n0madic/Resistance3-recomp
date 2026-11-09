@@ -120,10 +120,10 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
     header below the PC, it misplaces the data-segment modules, which load over each other. After the 2026-10-25
     census of a long Haven firefight, what still runs interpreted there is `pm_wws`'s stores into its own code, where
     the SMC microstep hands each one to the interpreter.
-  SPURS admits a workload while its ready count exceeds its contention; the count is not spent on admission
-  (`spurs/0005`): the WWS job manager stores it back to 0 when its list is drained, and its `IsListFinished()` check
-  asserts if it finds the workload still running. The host sets `SPURS_IDLE_PROBE=0` (no idle probes of unkicked
-  workloads; with the count spent, the probes were what fed the "no name" job list).
+  The host sets `SPURS_IDLE_PROBE=0` (`spurs/0005`, upstream #756): SPURS admits a workload while its ready count
+  exceeds its contention, does not spend the count on admission and runs no idle probes. The WWS job manager stores
+  the count back to 0 when its list is drained, and its `IsListFinished()` check asserts if it finds the workload
+  still running (a probe). Without the knob the count is spent and the probes are what feed the "no name" job list.
 
   `scripts/extract_spu_raw.py` wraps the non-ELF code as ELFs for lifting. `build_module.py` generates
   `spu/igjob_regions.c`, which registers each Insomniac module's span as resident code (buffer modules as verified
