@@ -16,10 +16,17 @@
  * by the stick, writes it back each frame and goes on from whatever is there, so turning the rows turns the view,
  * up and down too. The game clamps its own pitch at about 81 degrees. The look is taken only while the matrix is
  * a sane rotation and the camera sits at the hero's eyes (not in a cutscene or a menu); otherwise the stick does it.
+ *
+ * Aiming narrows the view's field of view (R3_VIEW_FOV, horizontal, in degrees: 74 on foot, 74 * 0.8135 = 60.2 with
+ * the Carbine aimed), so the same mouse motion would cross more of the screen. The motion is scaled by the ratio of
+ * tan(fov/2) to the hip view's (R3_ZOOM_SENS = 1, matched; 0 = off; 2 = squared), as a PC shooter does, so it covers
+ * the same part of the screen zoomed or not. The idea is the Resistance 2 port's (MIT, github.com/
+ * miroslavdanutalexandru-alt/Resistance2Port, project/stubs.cpp port_mouselook).
  */
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 
@@ -34,11 +41,18 @@ namespace {
 constexpr uint32_t R3_UI_MENU_FLAG     = 0x00F09020u;
 constexpr uint32_t R3_PRESS_START_FLAG = 0x00F08EBCu;
 
-constexpr uint32_t R3_HERO_PTR   = 0x0112336Cu;   /* the player's hero object */
+/* Where the game keeps the player's hero object. func_0032D788 stores it in the first slot when the level starts and
+ * zeroes it when the hero dies (the object stays and is reused; the slot is not set again, so after the first death
+ * the first slot alone left the mouse on the stick); the second holds it throughout. */
+constexpr uint32_t R3_HERO_SLOTS[] = { 0x0112336Cu, 0x011E0A68u };
 constexpr uint32_t R3_HERO_ROWS  = 0x370u;        /* right, up, forward rows in it */
 constexpr uint32_t R3_ROW_STRIDE = 0x10u;
 constexpr uint32_t R3_CAMERA     = 0x0105B4A0u;   /* camera matrix: right, up, forward, position rows */
 constexpr uint32_t R3_HERO_FEET  = 0x01069950u;   /* copy of the hero's feet position */
+constexpr uint32_t R3_VIEW_FOV   = 0x0105B5F0u;   /* the view's horizontal field of view, degrees (float) */
+
+constexpr double R3_HIP_FOV_DEG  = 74.0;          /* ...when not aiming */
+constexpr double R3_ZOOM_SENS_MAX = 2.0;
 
 constexpr double R3_PITCH_LIMIT_DEG = 80.0;       /* inside the game's own clamp */
 /* How far the matrix may be from a rotation (unit rows, right angles, upright, no roll). */
@@ -92,16 +106,52 @@ void store_vec3(uint32_t ea, const Vec3& v)
     }
 }
 
+float load_f32(uint32_t ea)
+{
+    const uint32_t w = load_be32(ea);
+    float f;
+    std::memcpy(&f, &w, sizeof f);
+    return f;
+}
+
+/* R3_ZOOM_SENS: how much of the zoom the mouse follows, 0 (none) to 2; 1 keeps what the mouse covers on screen. */
+double r3_zoom_strength()
+{
+    static const double v = [] {
+        const char* e = std::getenv("R3_ZOOM_SENS");
+        const double d = e && *e ? std::strtod(e, nullptr) : 1.0;
+        return std::fmax(0.0, std::fmin(R3_ZOOM_SENS_MAX, d));
+    }();
+    return v;
+}
+
+/* The factor for the mouse while the view is zoomed: tan(fov/2) over the hip view's, to the strength. 1 on foot
+ * (also when the field is wider than the hip's) and when the value is not a field of view (loading). */
+double r3_zoom_scale()
+{
+    const double fov = load_f32(R3_VIEW_FOV);
+    if (!(fov > 1.0 && fov < R3_HIP_FOV_DEG - 0.25)) return 1.0;   /* also rejects NaN */
+    const double rad = M_PI / 360.0;
+    return std::pow(std::tan(fov * rad) / std::tan(R3_HIP_FOV_DEG * rad), r3_zoom_strength());
+}
+
 int r3_in_menu(void)
 {
     return vm_base[R3_UI_MENU_FLAG] != 0 && vm_base[R3_PRESS_START_FLAG] == 0;
+}
+
+uint32_t r3_hero()
+{
+    for (const uint32_t slot : R3_HERO_SLOTS)
+        if (const uint32_t hero = load_be32(slot)) return hero;
+    return 0;
 }
 
 /* Reads the hero's matrix; returns where its rows are, or 0 when the view is not the hero's to turn now. */
 uint32_t r3_look_rows(Vec3* r, Vec3* u, Vec3* f)
 {
     if (r3_in_menu()) return 0;
-    const uint32_t hero = load_be32(R3_HERO_PTR);
+    const uint32_t hero = r3_hero();
     if (!hero || hero % 16 || hero > UINT32_MAX - (R3_HERO_ROWS + 3 * R3_ROW_STRIDE)) return 0;
     const uint32_t rows = hero + R3_HERO_ROWS;
     *r = load_vec3(rows);
@@ -131,6 +181,10 @@ int r3_mouse_look(double yaw_deg, double pitch_deg)
     Vec3 r, u, f;
     const uint32_t rows = r3_look_rows(&r, &u, &f);
     if (!rows) return 0;
+
+    const double zoom = r3_zoom_scale();
+    yaw_deg *= zoom;
+    pitch_deg *= zoom;
 
     const double yaw = -yaw_deg * M_PI / 180.0, cy = std::cos(yaw), sy = std::sin(yaw);
     for (Vec3* v : { &r, &u, &f }) *v = { v->x * cy + v->z * sy, v->y, v->z * cy - v->x * sy };

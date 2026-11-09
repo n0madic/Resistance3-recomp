@@ -208,8 +208,12 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   - Enter/Esc = cross/circle (select, back) in menus and start elsewhere (Press START, pause, skip); the host tells
     menus apart by the game's own flags (`host/r3_input.cpp`, `patches/input/0005`);
   - `PAD_MOUSE_SENS` = degrees per point, `PAD_MOUSE_AIM_SCALE` = its factor while aiming (defaults in
-    `host/main.cpp`); `PAD_KEYBOARD_LAYOUT=pad` gives the pad-shaped layout (arrows, I/J/K/L camera, Z/X/A/S face
-    buttons).
+    `host/main.cpp`; the aim scale is 1 because the zoom has its own factor). Aiming narrows the view's field of
+    view (74 degrees on foot, x0.8135 aimed; horizontal, float at 0x0105B5F0), and the mouse is scaled by the ratio
+    of tan(fov/2) so it covers the same part of the screen zoomed or not (`R3_ZOOM_SENS`: 1 matched, 0 off, 2
+    squared; idea from the Resistance 2 port, MIT). The hero object is looked up in two slots: the game zeroes
+    the first at the hero's death and does not set it again (`host/r3_input.cpp`).
+    `PAD_KEYBOARD_LAYOUT=pad` gives the pad-shaped layout (arrows, I/J/K/L camera, Z/X/A/S face buttons).
 - **Scripted input**: `PAD_FILE=<file>`, where the file holds `mask reports [lx ly rx ry]` (a report is a pad read that
   returned data, #570), e.g. `echo "0x4000 8" > f` presses cross. Add `PAD_NO_KEYBOARD=1` to a scripted run: else
   bringing its window to the front captures the mouse, which turns the camera.

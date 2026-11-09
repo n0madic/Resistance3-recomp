@@ -285,7 +285,7 @@ static int rsx_backend_init(uint32_t w, uint32_t h, const char* title)
 #define R3_MOUSE_CURVE_Y "23:0,24:0.14,28:0.75,32:1.45,36:2.24,40:3.09,48:5.01,56:7.16,64:9.53,72:12.06,80:14.58," \
                          "88:17.19,96:20.08,104:29.87,112:36.39,116:39.2,120:53.19,127:60"
 #define R3_MOUSE_SENS    "0.25"  /* degrees per point of mouse motion */
-#define R3_MOUSE_AIM_SCALE "0.5" /* times that while aiming (right button): the zoomed view turns slower */
+#define R3_MOUSE_AIM_SCALE "1"   /* times that while aiming (right button); the zoom's own factor is the field of view's, r3_input.cpp */
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 
