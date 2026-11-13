@@ -210,7 +210,8 @@ directory (`R3_HOME`), so `make run` keeps its saves in `gamedata/`; `make test`
 
 The code in this repository is free software under the **GNU GPL, version 2 or (at your option) any later version**
 ([LICENSE-GPL-2.0.txt](LICENSE-GPL-2.0.txt)). The prebuilt host also contains Apache-2.0 licensed parts, so as a whole it
-is distributed under **GPL version 3 or later** ([LICENSE](LICENSE)).
+is distributed under **GPL version 3 or later** ([LICENSE](LICENSE)). Parts derived from the MIT-licensed ps3recomp toolkit
+(`host/main.cpp`, the patches) keep its notice: [LICENSE-MIT-ps3recomp.txt](LICENSE-MIT-ps3recomp.txt).
 
 ## Credits and disclaimer
 

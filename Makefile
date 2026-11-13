@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Build and run Resistance 3 (macOS) from a source checkout. A thin wrapper over scripts/ and r3.py; see CLAUDE.md.
 #
 #   make              host, then the game module (the module is built against the host's SDK)

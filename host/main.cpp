@@ -1,5 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later AND MIT
 /*
+ * Portions Copyright (c) 2026 Ned Heller / sp00nznet (MIT, see LICENSE-MIT-ps3recomp.txt): this file grew out of the
+ * runner of the ps3recomp toolkit's game-project template. The port's own changes are GPL-2.0-or-later.
+ *
  * ps3recomp game project -- the host: everything of the port except the lifted game code.
  *
  * This is the runner. It boots a lifted title through the toolkit's PPU
