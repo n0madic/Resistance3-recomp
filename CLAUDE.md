@@ -235,6 +235,16 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   game clock 1.000x real time in play, menu 0.39x; play 35.5 fps mean (peaks 56) against 28.8 capped. Not checked:
   physics and scripted sequences past the opening fight at 60. Test: `cmake --build build/host --target test_r3_fps && build/host/test_r3_fps`. Under lldb the host runs
   slower (play stayed at ~28 fps): measure fps without a debugger.
+- **Post effects off**: `--fx-off grain,motion-blur,dof|all` (`R3_FX_OFF`, read once at start by `host/r3_fx.cpp`;
+  the idea is the Windows port's toggles). Each effect function (film grain `func_00744A18`, camera motion blur
+  `func_007424F8`, object motion blur `func_00855A98`, depth of field `func_008557A8`) compares its strength with a
+  threshold it loads from code (`lis r3,hi; addi r3,r3,lo; lfs`) and takes its own return path below it. The profile's
+  patches (`R3_FX_OFF` in `profiles.py`, guards `r3_fx_no_grain`/`_motion_blur`/`_dof`) turn that `addi` into
+  `lis r3,1`: the threshold is then read at 0x10000, the ELF magic of the first segment (0x7F454C46, 2.6e38), and
+  every strength is below it. Checked (scripted run to the Haven fight aiming, 2026-11-13, `all` against none): the
+  scene through the scope is sharp instead of blurred, the sky has no grain, the death fall has no smear. The fps
+  effect is lost in the fight's noise at the 30 cap. Test: `cmake --build build/host --target test_r3_fx &&
+  build/host/test_r3_fx`.
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
   Voice packs present: English and Russian. Switching language makes the game ask once to install data again.
 

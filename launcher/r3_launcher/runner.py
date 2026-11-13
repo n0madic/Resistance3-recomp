@@ -16,6 +16,20 @@ LOG = logging.getLogger("r3.run")
 
 HOST_PROCESS = "r3_host"
 
+# The post effects the host can turn off (R3_FX_OFF, host/r3_fx.cpp; the patches are R3_FX_OFF in profiles.py).
+FX_NAMES = ("grain", "motion-blur", "dof")
+
+
+def parse_fx_off(text: str) -> tuple[str, ...]:
+    """`grain,dof` or `all` -> the names in FX_NAMES order; ValueError names an unknown one."""
+    names = {n.strip().lower() for n in text.split(",") if n.strip()}
+    if "all" in names:
+        names = set(FX_NAMES) | (names - {"all"})
+    unknown = sorted(names - set(FX_NAMES))
+    if unknown:
+        raise ValueError(f"--fx-off: unknown effect {', '.join(unknown)} (known: {', '.join(FX_NAMES)}, all)")
+    return tuple(n for n in FX_NAMES if n in names)
+
 
 @dataclass(frozen=True)
 class RunOptions:
@@ -26,6 +40,7 @@ class RunOptions:
     fullscreen: bool = False
     mouse_sens: float | None = None    # degrees per point
     unlock_fps: bool = False           # 60 fps where the game clock follows real time (host/r3_fps.cpp)
+    fx_off: tuple[str, ...] = ()       # post effects turned off, names of FX_NAMES (host/r3_fx.cpp)
 
 
 def run_environment(home: Home, game: GameFolder, vfs_root: Path, opts: RunOptions) -> dict[str, str]:
@@ -53,6 +68,8 @@ def run_environment(home: Home, game: GameFolder, vfs_root: Path, opts: RunOptio
         env["PAD_MOUSE_SENS"] = repr(opts.mouse_sens)
     if opts.unlock_fps:
         env["R3_UNLOCK_FPS"] = "1"
+    if opts.fx_off:
+        env["R3_FX_OFF"] = ",".join(opts.fx_off)
     return env
 
 

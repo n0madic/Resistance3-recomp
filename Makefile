@@ -5,7 +5,7 @@
 #   make host-quick   rebuild only host/*.cpp edits and copy r3_host into dist/host
 #   make module       lift + compile the game module (steps whose inputs did not change are skipped)
 #   make run          run the game       (FPS=1 prints the frame rate, FPS60=1 unlocks 60 fps, LOG=1 writes logs/,
-#                                         GAME_LANG=ru|en)
+#                                         GAME_LANG=ru|en, FX_OFF=grain,motion-blur,dof|all turns post effects off)
 #   make test         the launcher's and the host's unit tests
 #   make package      dist/r3-<version>-macos-<arch>.zip for users
 #   make kill         kill stale r3_host instances
@@ -18,12 +18,13 @@ GAME      ?= $(CURDIR)/PS3_GAME
 GAME_LANG ?=
 FPS       ?=
 FPS60     ?=
+FX_OFF    ?=
 LOG       ?=
 
 export R3_HOME ?= $(CURDIR)
 
 R3 = ./r3.py --game "$(GAME)"
-RUN_ARGS = $(if $(FPS),--fps) $(if $(FPS60),--unlock-fps) $(if $(LOG),--log) $(if $(GAME_LANG),--lang $(GAME_LANG))
+RUN_ARGS = $(if $(FPS),--fps) $(if $(FPS60),--unlock-fps) $(if $(FX_OFF),--fx-off $(FX_OFF)) $(if $(LOG),--log) $(if $(GAME_LANG),--lang $(GAME_LANG))
 
 .PHONY: all build host host-quick module run kill clean-cache test package
 
@@ -51,7 +52,7 @@ clean-cache:
 
 test:
 	python3 tests/test_launcher.py
-	cmake --build build/host --target test_r3_unself test_r3_controls test_r3_input test_r3_glyphs test_r3_fps
+	cmake --build build/host --target test_r3_unself test_r3_controls test_r3_input test_r3_glyphs test_r3_fps test_r3_fx
 	build/host/r3_host selftest
 	build/host/test_r3_unself
 	build/host/test_r3_controls
@@ -59,6 +60,7 @@ test:
 	R3_GAME_SETTINGS=0 build/host/test_r3_input
 	build/host/test_r3_glyphs
 	build/host/test_r3_fps
+	build/host/test_r3_fx
 
 package:
 	scripts/package.sh

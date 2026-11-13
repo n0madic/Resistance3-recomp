@@ -58,7 +58,7 @@ algorithm follows RPCS3's `unself.cpp`. `r3_host selftest` runs the crypto vecto
 |---|---|
 | `cli.py` | commands and options, the stages, `reset` / `clean-cache` |
 | `game.py` | the data directory's layout (`Home`), reads `PARAM.SFO`, checks the PS3_GAME folder, decrypts the executable, links `disc/` |
-| `profiles.py` | the supported versions: where the code ends, the extra SPU entries, the instruction patches (60 fps) |
+| `profiles.py` | the supported versions: where the code ends, the extra SPU entries, the instruction patches (60 fps, post effects off) |
 | `lift.py` | runs the SDK's lifter and the SPU helper; the lift stamp (ELF, ABI, profile, helper) |
 | `module.py` | compiles the translation units in parallel (cached per unit by source, command and ABI), links `game.dylib` |
 | `toolchain.py` | finds Apple's clang (C++20, musttail) |

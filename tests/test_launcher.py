@@ -60,11 +60,22 @@ class ProfilesTest(unittest.TestCase):
 
     def test_unlock_fps_patches(self):
         p = profiles.find_profile("BCES01118", "01.00")
-        self.assertEqual({(x.addr, x.orig, x.new) for x in p.insn_patches},
+        fps = [x for x in p.insn_patches if x.guard == "r3_unlock_fps"]   # host/r3_fps.cpp defines it
+        self.assertEqual({(x.addr, x.orig, x.new) for x in fps},
                          {(0x00736C60, 0xEC2107F2, 0xFC200818), (0x00736CF0, 0xEC2107F2, 0xFC200818),
                           (0x007EEAC8, 0xC03F0004, 0xFC210828)})
-        self.assertEqual({x.guard for x in p.insn_patches}, {"r3_unlock_fps"})   # host/r3_fps.cpp defines it
         self.assertEqual(p.insn_patches[0].to_json()["addr"], "0x00736c60")
+
+    def test_fx_off_patches(self):
+        p = profiles.find_profile("BCES01118", "01.00")
+        fx = {x.addr: x for x in p.insn_patches if x.guard.startswith("r3_fx_")}   # host/r3_fx.cpp defines them
+        self.assertEqual({a: x.guard for a, x in fx.items()},
+                         {0x00744AC8: "r3_fx_no_grain", 0x007426E8: "r3_fx_no_motion_blur",
+                          0x00855AF0: "r3_fx_no_motion_blur", 0x00855830: "r3_fx_no_dof"})
+        for x in fx.values():
+            self.assertEqual(x.orig >> 16, 0x3863, hex(x.addr))   # addi r3,r3,lo: the threshold's address
+            self.assertEqual(x.new, 0x3C600001)                   # lis r3,1: the ELF magic at 0x10000
+        self.assertEqual(len({x.addr for x in p.insn_patches}), len(p.insn_patches))
 
     def test_unknown_version(self):
         self.assertIsNone(profiles.find_profile("BCES01118", "01.01"))
@@ -201,13 +212,15 @@ class RunnerTest(TmpTest):
         self.assertEqual(env["PS3RECOMP_MSL_CACHE"], str(self.home.msl_cache))
         self.assertEqual(env["R3_CONTROLS"], str(self.home.controls))
         for name in ("R3_FPS", "PS3_LANG", "PS3RECOMP_METAL_WINDOW", "PS3RECOMP_FULLSCREEN", "PAD_MOUSE_SENS",
-                     "R3_UNLOCK_FPS"):
+                     "R3_UNLOCK_FPS", "R3_FX_OFF"):
             self.assertNotIn(name, env)
 
     def test_options(self):
-        env = self.env(fps=True, lang="ru", window="1600x900", fullscreen=True, mouse_sens=0.3, unlock_fps=True)
+        env = self.env(fps=True, lang="ru", window="1600x900", fullscreen=True, mouse_sens=0.3, unlock_fps=True,
+                       fx_off=("grain", "dof"))
         self.assertEqual((env["R3_FPS"], env["PS3_LANG"], env["PS3RECOMP_METAL_WINDOW"], env["PS3RECOMP_FULLSCREEN"],
-                          env["PAD_MOUSE_SENS"], env["R3_UNLOCK_FPS"]), ("1", "ru", "1600x900", "1", "0.3", "1"))
+                          env["PAD_MOUSE_SENS"], env["R3_UNLOCK_FPS"], env["R3_FX_OFF"]),
+                         ("1", "ru", "1600x900", "1", "0.3", "1", "grain,dof"))
 
     def test_refuses_a_second_host(self):
         with mock.patch.object(runner, "running_pids", return_value=[123]):
@@ -223,13 +236,17 @@ class RunnerTest(TmpTest):
 class CliTest(TmpTest):
     def test_flags(self):
         a = cli.parse_args(["--fps", "--log", "--lang", "ru", "--window", "1600x900", "--fullscreen", "--sens", "0.2",
-                            "--unlock-fps"])
+                            "--unlock-fps", "--fx-off", "dof, Grain"])
         self.assertEqual(a.command, "run")
-        self.assertEqual(cli.run_options(a), runner.RunOptions(True, True, "ru", "1600x900", True, 0.2, True))
+        self.assertEqual(cli.run_options(a),
+                         runner.RunOptions(True, True, "ru", "1600x900", True, 0.2, True, ("grain", "dof")))
+        self.assertEqual(cli.parse_args(["--fx-off", "all"]).fx_off, ("grain", "motion-blur", "dof"))
+        self.assertEqual(cli.parse_args([]).fx_off, ())
         self.assertEqual(cli.parse_args(["build"]).command, "build")
 
     def test_bad_flags(self):
-        for argv in (["--window", "big"], ["--window", "0x5"], ["--sens", "0"], ["--jobs", "0"], ["nonsense"]):
+        for argv in (["--window", "big"], ["--window", "0x5"], ["--sens", "0"], ["--jobs", "0"], ["nonsense"],
+                     ["--fx-off", "bloom"]):
             with self.subTest(argv=argv), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
                 cli.parse_args(argv)
 

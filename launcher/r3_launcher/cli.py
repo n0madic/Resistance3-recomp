@@ -133,7 +133,7 @@ def build(ctx: Context, args: argparse.Namespace, stages: Stages) -> Path:
 def run_options(args: argparse.Namespace) -> runner.RunOptions:
     return runner.RunOptions(fps=args.fps, log=args.log, lang=args.lang, window=args.window,
                              fullscreen=args.fullscreen, mouse_sens=args.sens,
-                             unlock_fps=args.unlock_fps)
+                             unlock_fps=args.unlock_fps, fx_off=args.fx_off)
 
 
 def clean_cache(home: Home, shaders: bool) -> int:
@@ -190,6 +190,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--sens", type=float, metavar="DEG", help="mouse speed in degrees per point (default: the host's)")
     g.add_argument("--unlock-fps", action="store_true",
                    help="60 fps in play and cutscenes (the game's own limit is 30); menus stay at 30")
+    g.add_argument("--fx-off", metavar="LIST", default="",
+                   help=f"turn post effects off: a comma-separated list of {', '.join(runner.FX_NAMES)}, or all")
     c = ap.add_argument_group("clean-cache and reset")
     c.add_argument("--shaders", action="store_true", help="clean-cache: also drop the translated shaders (cache/msl)")
     c.add_argument("--all", action="store_true", help="reset: also erase the saves, caches and controls.txt")
@@ -198,6 +200,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         ap.error("--window expects WIDTHxHEIGHT, e.g. 1600x900")
     if args.sens is not None and args.sens <= 0:
         ap.error("--sens expects a positive number")
+    try:
+        args.fx_off = runner.parse_fx_off(args.fx_off)
+    except ValueError as e:
+        ap.error(str(e))
     if args.jobs < 1:
         ap.error("--jobs expects a positive number")
     return args

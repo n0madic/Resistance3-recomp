@@ -69,7 +69,7 @@ start the game at once. Nothing is redone unless its inputs change.
 
 ```
 ./r3.py [command] [--game PS3_GAME] [--fps] [--log] [--lang CODE] [--window WxH] [--fullscreen] [--sens DEG]
-         [--unlock-fps]
+         [--unlock-fps] [--fx-off LIST]
 ```
 
 | Option | Meaning |
@@ -82,6 +82,7 @@ start the game at once. Nothing is redone unless its inputs change.
 | `--fullscreen` | start in full screen |
 | `--sens DEG` | mouse speed in degrees per point |
 | `--unlock-fps` | up to 60 fps in play and cutscenes (the game's own cap is 30); the main menu stays at 30 |
+| `--fx-off LIST` | turn post effects off: a comma-separated list of `grain` (film grain), `motion-blur` (camera and objects), `dof` (depth of field), or `all` |
 | `--data DIR` | where everything derived from the game lives (default `./data` next to `r3.py`, or `R3_HOME`) |
 | `--yes` | answer yes: confirm `reset --all` |
 

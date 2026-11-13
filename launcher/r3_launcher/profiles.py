@@ -35,6 +35,23 @@ R3_UNLOCK_FPS = (
               "game clock: lfs f1,4(r31) (the step's lower bound) -> fsub f1,f1,f1 (0)"),
 )
 
+# Post effects the player may turn off (host/r3_fx.cpp), from the Windows port's post-effect toggles
+# (github.com/miroslavdanutalexandru-alt/Resistance3Port, MIT). Each effect function compares its strength with a
+# threshold constant it loads from code (`lis r3,hi; addi r3,r3,lo; lfs fT,0(r3)`) and returns when the strength is
+# below it, the game's own "effect off" path. The patch makes that address 0x10000 (`lis r3,1`), where the image's first
+# segment starts with the ELF magic, 0x7F454C46 = 2.6e38 as a float: every strength is below it.
+FX_ELF_MAGIC_THRESHOLD = 0x3C600001   # lis r3,1
+R3_FX_OFF = (
+    InsnPatch(0x00744AC8, 0x386349F0, FX_ELF_MAGIC_THRESHOLD, "r3_fx_no_grain",
+              "film grain (func_00744A18): threshold of the grain intensity p+0x08 (0.0 at 0x7449F0)"),
+    InsnPatch(0x007426E8, 0x386324A0, FX_ELF_MAGIC_THRESHOLD, "r3_fx_no_motion_blur",
+              "camera motion blur (func_007424F8): threshold of p+0x14 (0.0 at 0x7424A0)"),
+    InsnPatch(0x00855AF0, 0x38634560, FX_ELF_MAGIC_THRESHOLD, "r3_fx_no_motion_blur",
+              "object motion blur (func_00855A98): threshold of the sample scale p+0x0C (at 0x174560)"),
+    InsnPatch(0x00855830, 0x38635780, FX_ELF_MAGIC_THRESHOLD, "r3_fx_no_dof",
+              "depth of field (func_008557A8): threshold of the near/far blur p+0x28/p+0x38 (at 0x855780)"),
+)
+
 
 @dataclass(frozen=True)
 class Profile:
@@ -63,7 +80,7 @@ PROFILES: dict[tuple[str, str], Profile] = {
         "BCES01118", "01.00", code_end=0xC9DA84,
         elf_sha256="d12fc5283e9f036ccd4e888a0fe4cfc76c0e136c4817128e529c1b4d762f00aa",
         wws_job_extra_entries={"8f987d5458b2": (0x5318,)},
-        insn_patches=R3_UNLOCK_FPS),
+        insn_patches=R3_UNLOCK_FPS + R3_FX_OFF),
 }
 
 
