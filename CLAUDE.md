@@ -220,6 +220,21 @@ All runtime/lifter changes live as patches on top of the pinned toolkit revision
   conditional rendering (method 0x1E98), which the toolkit ignores: everything is drawn.
   `host/main.cpp` sets env defaults (`set_default_env`: `GCM_SUBCH1_2D=1`, `PAD_KEYBOARD_LAYOUT=fps`,
   `PS3_HDD0_ROOT`, `SPU_INTERP_UNLIFTED=1`, …) and `ppu_hle_inject_base=0x5F000000` (the game's 256 MB mmapper heap lands at 0x20000000); the runtime looks most switches up once per name (`ps3_env_once`, #515), so a variable set after start-up is not seen.
+- **Frame rate**: the game caps itself at 30. Its limiter (`func_00736BAC`/`func_00736BB0`) sleeps
+  (`sys_timer_usleep(50)`) to a deadline at 0x00F1F878 that moves by f1 (2 vblanks, from every caller) x the float at
+  0x012B1F40 (1/60 s; the global the quality controller also lives in: not touched). The game clock (`func_007EEA44`,
+  object 0x012DAD68: +4 floor, +8 ceiling of a step, clocks at +0x10 real and +0x40 game, ticks at +0x18 of each)
+  steps by the real dt clamped to [floor, ceiling]: boot logos 1/75..1000, main menu 1/75..1/75 (fixed step, 0.39x
+  real time at 30 fps, as on the PS3), from the level load on 1/30..0.2 (real time at 5-30 fps; measured with lldb).
+  `--unlock-fps` (`R3_UNLOCK_FPS=1`) uses three instruction patches of the profile, lifted with the toolkit's
+  `--insn-patches` as `if (r3_unlock_fps) {new} else {orig}` (from RPCS3's "Unlock FPS" for this game, Whatcookie and
+  boma, reworked): the limiter's `fmuls f1,f1,f31` at 0x736C60/0x736CF0 becomes `frsp f1,f1` (one vblank: the game
+  still paces itself), the clock's floor load at 0x7EEAC8 becomes `fsub f1,f1,f1` (0: with 1/30 a 60 fps frame would
+  run the game twice as fast). `host/r3_fps.cpp` watches the clock every 10 ms and sets `r3_unlock_fps` only while
+  floor < ceiling, so the menu keeps 30 fps and its PS3 pace. Checked (scripted run to the Haven fight, 2026-11-13):
+  game clock 1.000x real time in play, menu 0.39x; play 35.5 fps mean (peaks 56) against 28.8 capped. Not checked:
+  physics and scripted sequences past the opening fight at 60. Test: `cmake --build build/host --target test_r3_fps && build/host/test_r3_fps`. Under lldb the host runs
+  slower (play stayed at ~28 fps): measure fps without a debugger.
 - **Language**: `PS3_LANG` (`ru`, `en` or a number). Otherwise the host locale is used, falling back to English.
   Voice packs present: English and Russian. Switching language makes the game ask once to install data again.
 

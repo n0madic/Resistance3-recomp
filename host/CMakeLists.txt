@@ -113,6 +113,7 @@ add_executable(${PROJECT_NAME}
     r3_input.cpp
     r3_controls.cpp
     r3_glyphs.cpp
+    r3_fps.cpp
     spurs_lfqueue.cpp
     crypto.cpp
     unself.cpp
@@ -164,11 +165,12 @@ endif()
 add_executable(test_r3_input EXCLUDE_FROM_ALL tests/test_r3_input.cpp r3_input.cpp)
 add_executable(test_r3_controls EXCLUDE_FROM_ALL tests/test_r3_controls.cpp r3_controls.cpp)
 add_executable(test_r3_glyphs EXCLUDE_FROM_ALL tests/test_r3_glyphs.cpp r3_glyphs.cpp r3_controls.cpp)
+add_executable(test_r3_fps EXCLUDE_FROM_ALL tests/test_r3_fps.cpp r3_fps.cpp)
 add_executable(test_r3_unself EXCLUDE_FROM_ALL tests/test_r3_unself.cpp unself.cpp crypto.cpp)
 if(APPLE)
     target_link_libraries(test_r3_glyphs PRIVATE "-framework ApplicationServices")
 endif()
-foreach(t test_r3_input test_r3_controls test_r3_glyphs test_r3_unself)
+foreach(t test_r3_input test_r3_controls test_r3_glyphs test_r3_fps test_r3_unself)
     target_include_directories(${t} PRIVATE "${PS3RECOMP_DIR}/include" "${PS3RECOMP_DIR}/libs/input")
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${t} PRIVATE -Wall -Wextra -Wno-unused-parameter)

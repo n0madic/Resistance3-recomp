@@ -132,7 +132,8 @@ def build(ctx: Context, args: argparse.Namespace, stages: Stages) -> Path:
 
 def run_options(args: argparse.Namespace) -> runner.RunOptions:
     return runner.RunOptions(fps=args.fps, log=args.log, lang=args.lang, window=args.window,
-                             fullscreen=args.fullscreen, mouse_sens=args.sens)
+                             fullscreen=args.fullscreen, mouse_sens=args.sens,
+                             unlock_fps=args.unlock_fps)
 
 
 def clean_cache(home: Home, shaders: bool) -> int:
@@ -187,6 +188,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--window", metavar="WxH", help="initial window size in points, e.g. 1600x900")
     g.add_argument("--fullscreen", action="store_true", help="start in full screen")
     g.add_argument("--sens", type=float, metavar="DEG", help="mouse speed in degrees per point (default: the host's)")
+    g.add_argument("--unlock-fps", action="store_true",
+                   help="60 fps in play and cutscenes (the game's own limit is 30); menus stay at 30")
     c = ap.add_argument_group("clean-cache and reset")
     c.add_argument("--shaders", action="store_true", help="clean-cache: also drop the translated shaders (cache/msl)")
     c.add_argument("--all", action="store_true", help="reset: also erase the saves, caches and controls.txt")

@@ -67,9 +67,14 @@ def lift_game(sdk: Path, elf: Path, work: Path, profile: Profile) -> LiftResult:
     step("loading the image")
     _tool(tools / "ppu_loader.py", elf, "-o", f"{loader_out}/", log_file=logs / "ppu_loader.log")
     step("lifting PPU code")
+    patches: list[str | Path] = []
+    if profile.insn_patches:
+        spec = loader_out / "insn_patches.json"
+        spec.write_text(json.dumps({"patches": [p.to_json() for p in profile.insn_patches]}, indent=1))
+        patches = ["--insn-patches", spec]
     _tool(tools / "ppu_lifter.py", elf,
           "--functions", loader_out / "EBOOT.functions.json", "--hle-stubs", loader_out / "EBOOT.imports.json",
-          "--code-end", hex(profile.code_end), "--chunk-lines", profile.chunk_lines, "-o", ppu,
+          "--code-end", hex(profile.code_end), "--chunk-lines", profile.chunk_lines, *patches, "-o", ppu,
           log_file=logs / "ppu_lift.log")
 
     step("lifting SPU images")
@@ -146,6 +151,7 @@ def lift_key(sdk: Path, elf: Path, profile: Profile) -> str:
         "elf": sha256_file(elf), "abi": (sdk / "ABI").read_text().strip(),
         "code_end": profile.code_end, "chunk_lines": profile.chunk_lines,
         "wws": {k: list(v) for k, v in sorted(profile.wws_job_extra_entries.items())},
+        "insn_patches": [p.to_json() for p in profile.insn_patches],
         "extra_env": os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", ""),
         "helper": hashlib.sha256((HELPERS / "extract_spu_raw.py").read_bytes()).hexdigest(),
     }, sort_keys=True)

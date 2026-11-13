@@ -88,6 +88,7 @@ const char* cellGame_get_title(void);                       /* PARAM.SFO TITLE, 
 void     r3_input_register(void);         /* r3_input.cpp: what the keyboard layout asks the game */
 void     r3_controls_register(void);      /* r3_controls.cpp: controls.txt, the player's keys */
 void     r3_glyphs_register(void);        /* r3_glyphs.cpp: the game's button icons drawn as those keys */
+void     r3_fps_register(void);           /* r3_fps.cpp: 60 fps where the game clock follows real time */
 
 /* The status the guest handed to sys_process_exit. A title that exits that way
  * never returns through ppu_run, so this is only read on the path where the
@@ -666,6 +667,7 @@ int main(int argc, char** argv)
     r3_input_register();
     r3_controls_register();
     r3_glyphs_register();
+    r3_fps_register();
 
     /* Every guest program a scene meets for the first time is translated HLSL -> SPIR-V -> MSL on the thread that
      * walks the FIFO, 20-200 ms each: the opening cutscene stalled for 160-360 ms on the same frames of every run

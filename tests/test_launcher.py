@@ -2,6 +2,7 @@
 """Unit tests of the launcher: python3 tests/test_launcher.py"""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import struct
@@ -56,6 +57,14 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(p.work_name, "BCES01118-01.00")
         self.assertEqual(p.code_end, 0xC9DA84)
         self.assertEqual(p.wws_job_extra_entries, {"8f987d5458b2": (0x5318,)})
+
+    def test_unlock_fps_patches(self):
+        p = profiles.find_profile("BCES01118", "01.00")
+        self.assertEqual({(x.addr, x.orig, x.new) for x in p.insn_patches},
+                         {(0x00736C60, 0xEC2107F2, 0xFC200818), (0x00736CF0, 0xEC2107F2, 0xFC200818),
+                          (0x007EEAC8, 0xC03F0004, 0xFC210828)})
+        self.assertEqual({x.guard for x in p.insn_patches}, {"r3_unlock_fps"})   # host/r3_fps.cpp defines it
+        self.assertEqual(p.insn_patches[0].to_json()["addr"], "0x00736c60")
 
     def test_unknown_version(self):
         self.assertIsNone(profiles.find_profile("BCES01118", "01.01"))
@@ -191,13 +200,14 @@ class RunnerTest(TmpTest):
         self.assertEqual(env["PS3_HDD1_ROOT"], str(self.home.root))
         self.assertEqual(env["PS3RECOMP_MSL_CACHE"], str(self.home.msl_cache))
         self.assertEqual(env["R3_CONTROLS"], str(self.home.controls))
-        for name in ("R3_FPS", "PS3_LANG", "PS3RECOMP_METAL_WINDOW", "PS3RECOMP_FULLSCREEN", "PAD_MOUSE_SENS"):
+        for name in ("R3_FPS", "PS3_LANG", "PS3RECOMP_METAL_WINDOW", "PS3RECOMP_FULLSCREEN", "PAD_MOUSE_SENS",
+                     "R3_UNLOCK_FPS"):
             self.assertNotIn(name, env)
 
     def test_options(self):
-        env = self.env(fps=True, lang="ru", window="1600x900", fullscreen=True, mouse_sens=0.3)
+        env = self.env(fps=True, lang="ru", window="1600x900", fullscreen=True, mouse_sens=0.3, unlock_fps=True)
         self.assertEqual((env["R3_FPS"], env["PS3_LANG"], env["PS3RECOMP_METAL_WINDOW"], env["PS3RECOMP_FULLSCREEN"],
-                          env["PAD_MOUSE_SENS"]), ("1", "ru", "1600x900", "1", "0.3"))
+                          env["PAD_MOUSE_SENS"], env["R3_UNLOCK_FPS"]), ("1", "ru", "1600x900", "1", "0.3", "1"))
 
     def test_refuses_a_second_host(self):
         with mock.patch.object(runner, "running_pids", return_value=[123]):
@@ -212,9 +222,10 @@ class RunnerTest(TmpTest):
 
 class CliTest(TmpTest):
     def test_flags(self):
-        a = cli.parse_args(["--fps", "--log", "--lang", "ru", "--window", "1600x900", "--fullscreen", "--sens", "0.2"])
+        a = cli.parse_args(["--fps", "--log", "--lang", "ru", "--window", "1600x900", "--fullscreen", "--sens", "0.2",
+                            "--unlock-fps"])
         self.assertEqual(a.command, "run")
-        self.assertEqual(cli.run_options(a), runner.RunOptions(True, True, "ru", "1600x900", True, 0.2))
+        self.assertEqual(cli.run_options(a), runner.RunOptions(True, True, "ru", "1600x900", True, 0.2, True))
         self.assertEqual(cli.parse_args(["build"]).command, "build")
 
     def test_bad_flags(self):
@@ -358,6 +369,26 @@ class LiftTest(TmpTest):
             elf.write_bytes(b"\x7fELF two")
             self.assertTrue(lift.lift_stage(sdk, elf, work, profile)[1])
             self.assertEqual(m.call_count, 3)
+            other = dataclasses.replace(profile, insn_patches=profile.insn_patches[:1])   # another patch set
+            self.assertTrue(lift.lift_stage(sdk, elf, work, other)[1])
+
+    def test_insn_patches_reach_the_lifter(self):
+        sdk, elf, work = self.sdk(), self.tmp / "EBOOT.elf", self.tmp / "work"
+        elf.write_bytes(b"\x7fELF")
+        profile = profiles.find_profile("BCES01118", "01.00")
+        calls = []
+
+        def fake_tool(script, *args, log_file, env=None):
+            calls.append((script.name, [str(a) for a in args]))
+            if script.name == "ppu_lifter.py":
+                raise lift.LiftError("stop after the PPU lift")
+
+        with mock.patch.object(lift, "_tool", side_effect=fake_tool), self.assertRaises(lift.LiftError):
+            lift.lift_game(sdk, elf, work, profile)
+        args = dict(calls)["ppu_lifter.py"]
+        spec = Path(args[args.index("--insn-patches") + 1])
+        self.assertEqual(json.loads(spec.read_text()),
+                         {"patches": [p.to_json() for p in profile.insn_patches]})
 
     def test_ig_regions(self):
         spu = self.tmp / "spu"

@@ -25,6 +25,7 @@ class RunOptions:
     window: str | None = None          # WxH, initial window size in points
     fullscreen: bool = False
     mouse_sens: float | None = None    # degrees per point
+    unlock_fps: bool = False           # 60 fps where the game clock follows real time (host/r3_fps.cpp)
 
 
 def run_environment(home: Home, game: GameFolder, vfs_root: Path, opts: RunOptions) -> dict[str, str]:
@@ -50,6 +51,8 @@ def run_environment(home: Home, game: GameFolder, vfs_root: Path, opts: RunOptio
         env["PS3RECOMP_FULLSCREEN"] = "1"
     if opts.mouse_sens is not None:
         env["PAD_MOUSE_SENS"] = repr(opts.mouse_sens)
+    if opts.unlock_fps:
+        env["R3_UNLOCK_FPS"] = "1"
     return env
 
 
