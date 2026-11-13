@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 cmake_minimum_required(VERSION 3.20)
 project(r3_host
-    VERSION 0.2.0
+    VERSION 0.1.0
     LANGUAGES C CXX
     DESCRIPTION "Host of the recompiled Resistance 3 (PS3): the runtime and the port, without any game code"
 )

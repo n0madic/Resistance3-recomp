@@ -1,4 +1,4 @@
-# Resistance 3 for macOS
+# Resistance 3 recompilation
 
 A static recompilation of **Resistance 3** (PlayStation 3, EU release `BCES01118`) that runs natively on Apple Silicon
 Macs with Metal. It is built on [ps3recomp](https://github.com/sp00nznet/ps3recomp): the game's PowerPC and Cell SPU
@@ -93,7 +93,7 @@ start the game at once. Nothing is redone unless its inputs change.
 | `doctor` | check this machine and the installation, and say what is missing |
 | `kill` | end a stuck host (it ignores a plain `kill`) |
 | `clean-cache` | drop the game's disk cache (`--shaders` also the translated shaders) |
-| `reset` | remove what is derived from the game (lift, module, disc layout); `--all` also the saves and caches |
+| `reset` | remove what is derived from the game (lift, module, disc layout); `--all` also the saves, caches, logs and `controls.txt` |
 
 `./r3.py --help` lists the rest. Other environment variables go to the host, for example `PAD_KEYBOARD_LAYOUT=pad`.
 
